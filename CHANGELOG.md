@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.61
+
+- Added an optional customer-message prompt immediately after a Pirate Ship tracking number is captured.
+- Added selectable Marketplace Messenger, WhatsApp Web, Instagram Direct, eBay Messages, Etsy Messages, and Custom website integrations.
+- Kept automatic first-name matching and sending for Messenger; other providers open their inbox and copy the prepared message for reliable pasting.
+- Added editable unpaid-balance and tracking-update message templates with customer, balance, order, and tracking placeholders.
+
 ## 0.7.60
 
 - Pinned the order action buttons below the scrolling order editor so they remain visible when the window is made shorter.

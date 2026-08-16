@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.60"
+VERSION = "0.7.61"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2104,6 +2104,11 @@ class App(tk.Tk):
                                       (tracking,new_status,"Pirate Ship: "+(data.get("pirateship_status") or "Label purchased"),stamp,stamp,order_id))
                         self.status_flash(f"Pirate Ship synced • {tracking} • {new_status}")
                         if self.current_page=="orders": self.show_orders(order_id)
+                        template=self.db.get_setting("tracking_message_template", "Hi {first_name}, your order has shipped! Your tracking number is {tracking_number}. You can track it here: {tracking_url}")
+                        message=self._format_customer_message(template,row,tracking_no=tracking)
+                        provider=self._message_provider()
+                        if messagebox.askyesno("Send tracking to customer",f"Tracking number {tracking} was captured.\n\nSend this update to {row['buyer_name']} using {provider}?\n\n{message}",parent=self):
+                            self._send_customer_message(order_id,message,"tracking update")
         except Exception:
             pass
         finally:
@@ -6348,6 +6353,70 @@ class App(tk.Tk):
                 pass
         return self.db.order(order_id)
 
+    def _message_provider(self):
+        return (self.db.get_setting("message_provider", "Marketplace Messenger") or "Marketplace Messenger").strip()
+
+    def _message_provider_url(self, provider=None):
+        provider=provider or self._message_provider()
+        urls={
+            "Marketplace Messenger": MARKETPLACE_MESSENGER_URL,
+            "WhatsApp Web": "https://web.whatsapp.com/",
+            "Instagram Direct": "https://www.instagram.com/direct/inbox/",
+            "eBay Messages": "https://www.ebay.com/mys/messages",
+            "Etsy Messages": "https://www.etsy.com/your/conversations",
+        }
+        if provider=="Custom website":
+            return (self.db.get_setting("message_custom_url", "") or "").strip()
+        return urls.get(provider,MARKETPLACE_MESSENGER_URL)
+
+    def _format_customer_message(self, template, row, tracking_no="", balance=0.0):
+        buyer=(row["buyer_name"] or "Customer").strip()
+        first=buyer.split()[0] if buyer.split() else buyer
+        tracking=(tracking_no or row["tracking_no"] or "").strip()
+        values={
+            "first_name":first,
+            "full_name":buyer,
+            "balance":self.money(balance),
+            "tracking_number":tracking,
+            "tracking_url":self._carrier_tracking_url(tracking) if tracking else "",
+            "order_number":row["order_no"] or "",
+        }
+        message=str(template or "")
+        for key,value in values.items(): message=message.replace("{"+key+"}",str(value))
+        return message.strip()
+
+    def _send_customer_message(self, order_id, message, purpose="message", balance=0.0):
+        row=self.db.order(order_id)
+        if not row:return False
+        provider=self._message_provider()
+        buyer=(row["buyer_name"] or "the buyer").strip()
+        first=buyer.split()[0] if buyer.split() else buyer
+        if provider=="Marketplace Messenger":
+            request={"request_id":uuid.uuid4().hex,"created_at":datetime.now().isoformat(timespec="seconds"),
+                     "order_id":int(order_id),"order_no":row["order_no"],"buyer_name":buyer,
+                     "buyer_first_name":first,"balance":round(float(balance or 0),2),"message":message,
+                     "purpose":purpose,"status":"armed"}
+            try:
+                tmp=Path(tempfile.gettempdir())/f"printflow-message-{os.getpid()}.json"
+                tmp.write_text(json.dumps(request,ensure_ascii=False),encoding="utf-8")
+                tmp.replace(MESSENGER_PAYMENT_REQUEST_FILE)
+            except Exception as exc:
+                messagebox.showerror("Customer message",f"Could not prepare the Messenger message.\n\n{exc}",parent=self);return False
+            self.open_messenger_capture_browser()
+            self.status_flash(f"{purpose.title()} armed for {first} in Messenger")
+            return True
+        url=self._message_provider_url(provider)
+        if not url:
+            messagebox.showwarning("Messaging integration","Add the Custom website URL in Settings first.",parent=self);return False
+        try:
+            self.clipboard_clear();self.clipboard_append(message);self.update_idletasks()
+            webbrowser.open(url)
+            messagebox.showinfo("Message copied",f"{provider} opened and the {purpose} was copied to your clipboard.\n\nOpen {first}'s conversation and paste the message with Ctrl+V.",parent=self)
+            self.status_flash(f"{purpose.title()} copied • {provider} opened")
+            return True
+        except Exception as exc:
+            messagebox.showerror("Messaging integration",str(exc),parent=self);return False
+
     def prepare_shipping_label(self, order_id):
         if self.current_order_id == order_id:
             self.flush_order_autosave()
@@ -6361,39 +6430,18 @@ class App(tk.Tk):
         if balance > 0.005:
             buyer = (row["buyer_name"] or "the buyer").strip()
             first_name = buyer.split()[0] if buyer.split() else buyer
-            message = (
-                f"Hi {first_name}, your remaining balance of {self.money(balance)} needs to be paid in full "
-                "before I can ship your order. Thank you!"
-            )
+            template=self.db.get_setting("balance_message_template", "Hi {first_name}, your remaining balance of {balance} needs to be paid in full before I can ship your order. Thank you!")
+            message=self._format_customer_message(template,row,balance=balance)
+            provider=self._message_provider()
             send_reminder = messagebox.askyesno(
                 "Payment required before shipping",
                 f"This order still has a balance of {self.money(balance)}.\n\n"
-                f"PrintFlow will open Marketplace Messenger. Click {first_name}'s conversation and the reminder below "
-                f"will be sent automatically:\n\n{message}\n\n"
+                f"PrintFlow will use {provider} for the reminder below:\n\n{message}\n\n"
                 "Choose Yes to send the reminder. Choose No to bypass it and continue to the shipping label.",
                 parent=self,
             )
             if send_reminder:
-                request = {
-                    "request_id": uuid.uuid4().hex,
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "order_id": int(order_id),
-                    "order_no": row["order_no"],
-                    "buyer_name": buyer,
-                    "buyer_first_name": first_name,
-                    "balance": round(balance, 2),
-                    "message": message,
-                    "status": "armed",
-                }
-                try:
-                    tmp = Path(tempfile.gettempdir()) / f"printflow-payment-{os.getpid()}.json"
-                    tmp.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
-                    tmp.replace(MESSENGER_PAYMENT_REQUEST_FILE)
-                except Exception as exc:
-                    messagebox.showerror("Payment reminder", f"Could not prepare the Messenger reminder.\n\n{exc}", parent=self)
-                    return
-                self.open_messenger_capture_browser()
-                self.status_flash(f"Payment reminder armed for {first_name} • {self.money(balance)} due")
+                self._send_customer_message(order_id,message,"payment reminder",balance=balance)
                 return
             self.status_flash(f"Payment reminder bypassed • {self.money(balance)} still due")
         try:
@@ -6794,6 +6842,30 @@ class App(tk.Tk):
         ttk.Button(pkgb,text="Save Packaging Settings",style="Accent.TButton",command=self.save_packaging_settings).pack(side="left")
         self.shipping_location_status=ttk.Label(pkg,text="",style="Card.TLabel"); self.shipping_location_status.grid(row=5,column=0,columnspan=3,sticky="w",pady=(7,0))
         pkg.columnconfigure(1,weight=1)
+
+        messaging = self.card(settings_inner, 12)
+        messaging.pack(fill="x", pady=(0, 9))
+        ttk.Label(messaging,text="Customer Messaging Integrations",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,8))
+        ttk.Label(messaging,text="Choose where PrintFlow opens payment reminders and captured-tracking updates. Messenger supports the automatic first-name match and send flow. Other providers open their inbox and copy the prepared message for you to paste, which keeps them usable if their website layout changes.",style="Card.TLabel",wraplength=780,justify="left").grid(row=1,column=0,columnspan=3,sticky="w",pady=(0,7))
+        self.message_provider_var=tk.StringVar(value=self._message_provider())
+        self.message_custom_url_var=tk.StringVar(value=self.db.get_setting("message_custom_url", "") or "")
+        ttk.Label(messaging,text="Messaging provider",style="Card.TLabel").grid(row=2,column=0,sticky="w",pady=4)
+        ttk.Combobox(messaging,textvariable=self.message_provider_var,state="readonly",width=30,values=["Marketplace Messenger","WhatsApp Web","Instagram Direct","eBay Messages","Etsy Messages","Custom website"]).grid(row=2,column=1,sticky="w",padx=10,pady=4)
+        ttk.Label(messaging,text="Custom website URL",style="Card.TLabel").grid(row=3,column=0,sticky="w",pady=4)
+        ttk.Entry(messaging,textvariable=self.message_custom_url_var,width=60).grid(row=3,column=1,columnspan=2,sticky="ew",padx=10,pady=4)
+        ttk.Label(messaging,text="Unpaid-balance message",style="Card.TLabel").grid(row=4,column=0,sticky="nw",pady=4)
+        self.balance_message_text=tk.Text(messaging,height=3,wrap="word",bg=self.INPUT,fg=self.TEXT,insertbackground=self.TEXT,relief="solid",bd=1,font=("Segoe UI",9))
+        self.balance_message_text.grid(row=4,column=1,columnspan=2,sticky="ew",padx=10,pady=4)
+        self.balance_message_text.insert("1.0",self.db.get_setting("balance_message_template", "Hi {first_name}, your remaining balance of {balance} needs to be paid in full before I can ship your order. Thank you!"))
+        ttk.Label(messaging,text="Tracking-captured message",style="Card.TLabel").grid(row=5,column=0,sticky="nw",pady=4)
+        self.tracking_message_text=tk.Text(messaging,height=3,wrap="word",bg=self.INPUT,fg=self.TEXT,insertbackground=self.TEXT,relief="solid",bd=1,font=("Segoe UI",9))
+        self.tracking_message_text.grid(row=5,column=1,columnspan=2,sticky="ew",padx=10,pady=4)
+        self.tracking_message_text.insert("1.0",self.db.get_setting("tracking_message_template", "Hi {first_name}, your order has shipped! Your tracking number is {tracking_number}. You can track it here: {tracking_url}"))
+        ttk.Label(messaging,text="Available fields: {first_name}, {full_name}, {balance}, {tracking_number}, {tracking_url}, {order_number}",style="Card.TLabel").grid(row=6,column=0,columnspan=3,sticky="w",pady=(3,7))
+        ttk.Button(messaging,text="Save Messaging Settings",style="Accent.TButton",command=self.save_messaging_settings).grid(row=7,column=0,columnspan=3,sticky="w")
+        self.messaging_settings_status=ttk.Label(messaging,text="",style="Card.TLabel")
+        self.messaging_settings_status.grid(row=8,column=0,columnspan=3,sticky="w",pady=(7,0))
+        messaging.columnconfigure(1,weight=1)
 
         tracking = self.card(settings_inner, 12)
         tracking.pack(fill="x", pady=(0, 9))
@@ -7510,6 +7582,17 @@ finally:
             self.db.set_setting("shipping_location_mode",self.shipping_location_mode_var.get().strip() or "Automatic (IP-based)")
             self.db.set_setting("shipping_manual_location",self.shipping_manual_location_var.get().strip())
         self.settings_status.configure(text="Settings saved.")
+
+    def save_messaging_settings(self):
+        provider=self.message_provider_var.get().strip() or "Marketplace Messenger"
+        custom=self.message_custom_url_var.get().strip()
+        if provider=="Custom website" and custom and not re.match(r"^https?://",custom,re.I):
+            messagebox.showwarning("Messaging settings","Custom website URL must begin with http:// or https://",parent=self);return
+        self.db.set_setting("message_provider",provider)
+        self.db.set_setting("message_custom_url",custom)
+        self.db.set_setting("balance_message_template",self.balance_message_text.get("1.0","end-1c").strip())
+        self.db.set_setting("tracking_message_template",self.tracking_message_text.get("1.0","end-1c").strip())
+        self.messaging_settings_status.configure(text=f"Saved. Customer messages will use {provider}.")
 
     def _restore_saved_maximized_state(self):
         try:
