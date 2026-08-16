@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.49
+
+- Improved the Print Preflight orientation viewer frame rate with cached geometry, interaction-level detail, and throttled redraws.
+- Corrected the initial 3D camera so world Z and the top of the P2S build plate consistently point upward.
+- Added a selectable Bambu build-plate type in Settings and directly in Print Preflight.
+- Passed the selected plate type to BambuBuddy for every automatic slice to prevent printer plate-mismatch warnings.
+
 ## 0.7.48
 
 - Added Ctrl/Shift multi-selection to a customer's print-file list.

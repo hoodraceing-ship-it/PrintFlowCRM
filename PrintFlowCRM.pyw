@@ -25,8 +25,17 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.48"
+VERSION = "0.7.49"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
+BUILD_PLATE_TYPES = (
+    "Textured PEI Plate",
+    "Smooth PEI Plate",
+    "High Temp Plate",
+    "Engineering Plate",
+    "Cool Plate",
+    "Cool Plate (SuperTack)",
+    "Supertack Plate",
+)
 
 
 def app_data_dir() -> Path:
@@ -3489,6 +3498,7 @@ class App(tk.Tk):
             "export_3mf": True,
             "auto_arrange": True,
             "auto_orient": bool(use_auto_orient),
+            "bed_type": self.db.get_setting("slicer_bed_type", "Textured PEI Plate") or "Textured PEI Plate",
         }
 
         def run_slice(slice_payload):
@@ -4424,7 +4434,7 @@ class App(tk.Tk):
 
         state = {
             "yaw": math.radians(-38.0),
-            "pitch": math.radians(58.0),
+            "pitch": math.radians(-58.0),
             "zoom": 1.0,
             "drag": None,
             "motion": False,
@@ -4613,11 +4623,11 @@ class App(tk.Tk):
             if name == "Top":
                 state["yaw"], state["pitch"] = 0.0, 0.0
             elif name == "Front":
-                state["yaw"], state["pitch"] = 0.0, math.radians(90)
+                state["yaw"], state["pitch"] = 0.0, math.radians(-90)
             elif name == "Right":
-                state["yaw"], state["pitch"] = math.radians(-90), math.radians(90)
+                state["yaw"], state["pitch"] = math.radians(-90), math.radians(-90)
             else:
-                state["yaw"], state["pitch"] = math.radians(-38), math.radians(58)
+                state["yaw"], state["pitch"] = math.radians(-38), math.radians(-58)
             state["zoom"] = 1.0
             render()
 
@@ -4681,6 +4691,12 @@ class App(tk.Tk):
 
         original = mesh.copy()
         current = mesh.copy()
+        preview_original = original
+        if len(original.faces) > 12000:
+            try:
+                preview_original = original.simplify_quadric_decimation(face_count=12000)
+            except Exception:
+                preview_original = original
         transform = np.eye(4)
         result = {"ok": False, "mesh": None, "auto": False, "changed": False}
 
@@ -4705,8 +4721,13 @@ class App(tk.Tk):
         canvas.pack(fill="both", expand=True)
         info_var = tk.StringVar(value="")
         choice_var = tk.StringVar(value="Original orientation")
+        plate_var = tk.StringVar(value=self.db.get_setting("slicer_bed_type", "Textured PEI Plate") or "Textured PEI Plate")
 
-        view = {"yaw": math.radians(-38), "pitch": math.radians(58), "zoom": 1.0, "drag": None}
+        # Negative pitch is a camera-above-the-bed view in this projection: world Z
+        # rises toward the top of the screen and the printable face starts upward.
+        view = {"yaw": math.radians(-38), "pitch": math.radians(-58), "zoom": 1.0,
+                "drag": None, "last_motion_render": 0.0, "full_render_job": None}
+        geometry = {}
 
         def rot_view():
             yaw,pitch=view["yaw"],view["pitch"]
@@ -4737,26 +4758,32 @@ class App(tk.Tk):
             if not fits: score += 100000
             return ext, fits, support_area, contact, score
 
-        def render():
+        def render(motion=False, rebuild=False):
             nonlocal current
-            current=oriented_mesh()
-            ext,fits,sup,contact,score=estimate(current)
-            info_var.set(f"Size: {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm   •   "
-                         f"{'Fits P2S' if fits else 'Needs split'}   •   Estimated support burden: {sup:.0f} mm²   •   "
-                         f"Bed contact: {contact:.0f} mm²")
+            if rebuild or not geometry:
+                current=oriented_mesh()
+                ext,fits,sup,contact,score=estimate(current)
+                pm=preview_original.copy(); pm.apply_transform(transform)
+                pm.apply_translation((0,0,-float(pm.bounds[0][2])))
+                verts=np.asarray(pm.vertices,float).copy()
+                c=(pm.bounds[0]+pm.bounds[1])/2.0
+                verts[:,0]-=c[0]; verts[:,1]-=c[1]
+                faces=np.asarray(pm.faces,int)
+                if len(faces)>1800:
+                    idx=np.linspace(0,len(faces)-1,1800,dtype=int)
+                    motion_faces=faces[idx]
+                else:
+                    motion_faces=faces
+                geometry.clear()
+                geometry.update(ext=ext,fits=fits,sup=sup,contact=contact,score=score,
+                                verts=verts,faces=faces,motion_faces=motion_faces)
+                info_var.set(f"Size: {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm   •   "
+                             f"{'Fits P2S' if fits else 'Needs split'}   •   Estimated support burden: {sup:.0f} mm²   •   "
+                             f"Bed contact: {contact:.0f} mm²")
+            ext=geometry["ext"]; verts=geometry["verts"]
+            faces=geometry["motion_faces"] if motion else geometry["faces"]
             canvas.delete("all")
             w=max(350,canvas.winfo_width()); h=max(300,canvas.winfo_height()); cx=w/2; cy=h/2+18
-            verts=np.asarray(current.vertices,float).copy()
-            # center XY for display only
-            c=(current.bounds[0]+current.bounds[1])/2.0
-            verts[:,0]-=c[0]; verts[:,1]-=c[1]
-            faces=np.asarray(current.faces,int)
-            if len(faces)>18000:
-                try:
-                    simp=current.simplify_quadric_decimation(face_count=18000)
-                    verts=np.asarray(simp.vertices,float).copy(); c2=(simp.bounds[0]+simp.bounds[1])/2.0
-                    verts[:,0]-=c2[0]; verts[:,1]-=c2[1]; faces=np.asarray(simp.faces,int)
-                except Exception: pass
             R=rot_view(); span=max(256.0,float(ext[0]),float(ext[1]),float(ext[2])*0.75)
             scale=min((w-70)/span,(h-70)/max(180.0,float(ext[2])+80))*view["zoom"]*0.9
             def proj(v):
@@ -4786,12 +4813,12 @@ class App(tk.Tk):
             transform=r@transform
             result["changed"]=True; result["auto"]=False
             choice_var.set(f"Manual orientation • {axis} {deg:+d}°")
-            render()
+            render(rebuild=True)
 
         def reset_model():
             nonlocal transform
             transform=np.eye(4); result["changed"]=False; result["auto"]=False
-            choice_var.set("Original orientation"); render()
+            choice_var.set("Original orientation"); render(rebuild=True)
 
         def auto_orient():
             nonlocal transform
@@ -4816,17 +4843,27 @@ class App(tk.Tk):
             transform=best[1]
             result["changed"]=not np.allclose(transform,np.eye(4)); result["auto"]=True
             choice_var.set("Auto Orient • fastest-quality estimate")
-            render()
+            render(rebuild=True)
 
         def start_drag(e): view["drag"]=(e.x,e.y,view["yaw"],view["pitch"])
         def drag(e):
             if not view["drag"]: return
-            x,y,yaw,pitch=view["drag"]; view["yaw"]=yaw+(e.x-x)*.01; view["pitch"]=max(math.radians(-88),min(math.radians(88),pitch+(e.y-y)*.01)); render()
-        def end_drag(e=None): view["drag"]=None
+            x,y,yaw,pitch=view["drag"]; view["yaw"]=yaw+(e.x-x)*.01; view["pitch"]=max(math.radians(-88),min(math.radians(88),pitch+(e.y-y)*.01))
+            now=time.monotonic()
+            if now-view["last_motion_render"] >= .033:
+                view["last_motion_render"]=now; render(motion=True)
+            schedule_full_render()
+        def schedule_full_render(delay=110):
+            if view.get("full_render_job"):
+                try: win.after_cancel(view["full_render_job"])
+                except Exception: pass
+            view["full_render_job"]=win.after(delay,lambda:(view.__setitem__("full_render_job",None),render()))
+        def end_drag(e=None): view["drag"]=None; schedule_full_render(70)
         def wheel(e):
-            view["zoom"]=min(3.5,view["zoom"]*1.12) if e.delta>0 else max(.35,view["zoom"]/1.12); render(); return "break"
+            view["zoom"]=min(3.5,view["zoom"]*1.12) if e.delta>0 else max(.35,view["zoom"]/1.12)
+            render(motion=True); schedule_full_render(80); return "break"
         canvas.bind("<ButtonPress-1>",start_drag); canvas.bind("<B1-Motion>",drag); canvas.bind("<ButtonRelease-1>",end_drag)
-        canvas.bind("<MouseWheel>",wheel); canvas.bind("<Configure>",lambda e: render())
+        canvas.bind("<MouseWheel>",wheel); canvas.bind("<Configure>",lambda e: schedule_full_render(70))
 
         controls=tk.Frame(outer,bg="#0f1722"); controls.pack(fill="x",pady=(8,0))
         tk.Button(controls,text="Auto Orient",width=14,command=auto_orient).pack(side="left")
@@ -4834,12 +4871,18 @@ class App(tk.Tk):
         for axis in ("X","Y","Z"):
             tk.Button(controls,text=f"{axis} -90°",width=8,command=lambda a=axis:apply_axis(a,-90)).pack(side="left",padx=2)
             tk.Button(controls,text=f"{axis} +90°",width=8,command=lambda a=axis:apply_axis(a,90)).pack(side="left",padx=2)
+        plate_row=tk.Frame(outer,bg="#0f1722"); plate_row.pack(fill="x",pady=(8,0))
+        tk.Label(plate_row,text="Build plate installed:",bg="#0f1722",fg="#dce6f2",font=("Segoe UI",9)).pack(side="left")
+        plate_combo=ttk.Combobox(plate_row,textvariable=plate_var,state="readonly",values=BUILD_PLATE_TYPES,width=28)
+        plate_combo.pack(side="left",padx=(8,0))
         tk.Label(outer,textvariable=info_var,bg="#0f1722",fg="#dce6f2",font=("Segoe UI",9)).pack(anchor="w",pady=(9,6))
 
         buttons=tk.Frame(outer,bg="#0f1722"); buttons.pack(fill="x")
         def choose(ok):
             result["ok"]=ok
-            if ok: result["mesh"]=oriented_mesh()
+            if ok:
+                result["mesh"]=oriented_mesh()
+                self.db.set_setting("slicer_bed_type",plate_var.get().strip() or "Textured PEI Plate")
             win.destroy()
         tk.Button(buttons,text="Cancel",width=13,command=lambda:choose(False)).pack(side="right")
         tk.Button(buttons,text="Continue to Print",width=18,command=lambda:choose(True)).pack(side="right",padx=8)
@@ -4849,7 +4892,7 @@ class App(tk.Tk):
             x=self.winfo_rootx()+max(0,(self.winfo_width()-ww)//2); y=self.winfo_rooty()+max(0,(self.winfo_height()-wh)//2)
             win.geometry(f"{ww}x{wh}+{x}+{y}")
         except Exception: pass
-        win.after(60,render); self.wait_window(win)
+        win.after(60,lambda:render(rebuild=True)); self.wait_window(win)
         return result
 
     def _prepare_preflight_attachment(self, order_id, attachment, path, display_name):
@@ -6208,25 +6251,29 @@ class App(tk.Tk):
         ttk.Label(c, text="Auto-slice quality", style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=4)
         ttk.Combobox(c, textvariable=self.slicer_quality_var, state="normal", width=52,
                      values=["0.12mm Fine","0.16mm Optimal","0.20mm Standard","0.24mm Draft","0.28mm Extra Draft"]).grid(row=4,column=1,sticky="ew",padx=10,pady=4)
+        self.slicer_bed_type_var = tk.StringVar(value=self.db.get_setting("slicer_bed_type", "Textured PEI Plate") or "Textured PEI Plate")
+        ttk.Label(c, text="Build plate installed", style="Card.TLabel").grid(row=5,column=0,sticky="w",pady=4)
+        ttk.Combobox(c, textvariable=self.slicer_bed_type_var, state="readonly", width=52,
+                     values=BUILD_PLATE_TYPES).grid(row=5,column=1,sticky="ew",padx=10,pady=4)
         self.slicer_auto_supports_var = tk.BooleanVar(value=self.db.get_setting("slicer_auto_supports", "1") != "0")
         self.slicer_smart_recs_var = tk.BooleanVar(value=self.db.get_setting("slicer_smart_recommendations", "1") != "0")
         self.slicer_orientation_mode_var = tk.StringVar(value=self.db.get_setting("slicer_orientation_mode", "Smart (recommended)") or "Smart (recommended)")
-        ttk.Checkbutton(c, text="Prefer an automatic-support process preset when the STL appears to need supports", variable=self.slicer_auto_supports_var).grid(row=5,column=0,columnspan=2,sticky="w",pady=(5,2))
-        ttk.Checkbutton(c, text="Recommend faster compatible process presets and let me save them per material", variable=self.slicer_smart_recs_var).grid(row=6,column=0,columnspan=2,sticky="w",pady=2)
-        ttk.Label(c, text="Auto orientation", style="Card.TLabel").grid(row=7,column=0,sticky="w",pady=4)
+        ttk.Checkbutton(c, text="Prefer an automatic-support process preset when the STL appears to need supports", variable=self.slicer_auto_supports_var).grid(row=6,column=0,columnspan=2,sticky="w",pady=(5,2))
+        ttk.Checkbutton(c, text="Recommend faster compatible process presets and let me save them per material", variable=self.slicer_smart_recs_var).grid(row=7,column=0,columnspan=2,sticky="w",pady=2)
+        ttk.Label(c, text="Auto orientation", style="Card.TLabel").grid(row=8,column=0,sticky="w",pady=4)
         ttk.Combobox(c, textvariable=self.slicer_orientation_mode_var, state="readonly", width=52,
-                     values=["Smart (recommended)", "Always auto-orient", "Preserve model orientation"]).grid(row=7,column=1,sticky="ew",padx=10,pady=4)
+                     values=["Smart (recommended)", "Always auto-orient", "Preserve model orientation"]).grid(row=8,column=1,sticky="ew",padx=10,pady=4)
         ttk.Label(c, text="Smart orientation asks Bambu Studio to choose the best printable orientation for STL files and Auto-Split halves before slicing, while preserving deliberate 3MF layouts. If Bambu Studio's orientation pass fails, PrintFlow automatically retries once in the saved orientation instead of losing the job. Speed recommendations remain separate and never change a process preset silently — accepting one saves that preset for the material for future jobs.",
-                  style="Card.TLabel", wraplength=780, justify="left").grid(row=8,column=0,columnspan=2,sticky="w",pady=(3,6))
+                  style="Card.TLabel", wraplength=780, justify="left").grid(row=9,column=0,columnspan=2,sticky="w",pady=(3,6))
         c.columnconfigure(1, weight=1)
         bf = ttk.Frame(c, style="Card.TFrame")
-        bf.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        bf.grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Button(bf, text="Test / Load Printers", command=self.test_bambuddy).pack(side="left", padx=(0, 7))
         ttk.Button(bf, text="Test Auto Slicer", command=self.test_auto_slicer).pack(side="left", padx=(0, 7))
         ttk.Button(bf, text="Install / Repair Mesh Dependencies", command=lambda:self._install_autosplit_dependencies_async(force=True)).pack(side="left", padx=(0, 7))
         ttk.Button(bf, text="Save Settings", style="Accent.TButton", command=self.save_settings).pack(side="left")
         self.settings_status = ttk.Label(c, text="", style="Card.TLabel")
-        self.settings_status.grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.settings_status.grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         rn = self.card(settings_inner, 12)
         rn.pack(fill="x", pady=(0, 9))
@@ -6848,6 +6895,8 @@ finally:
         self.db.set_setting("bambuddy_url", self.bb_url.get().strip().rstrip("/"))
         self.db.set_setting("bambuddy_api_key", self.bb_key.get().strip())
         self.db.set_setting("slicer_process_hint", self.slicer_quality_var.get().strip() or "0.20mm Standard")
+        if hasattr(self, "slicer_bed_type_var"):
+            self.db.set_setting("slicer_bed_type", self.slicer_bed_type_var.get().strip() or "Textured PEI Plate")
         if hasattr(self, "slicer_auto_supports_var"):
             self.db.set_setting("slicer_auto_supports", "1" if self.slicer_auto_supports_var.get() else "0")
             self.db.set_setting("slicer_smart_recommendations", "1" if self.slicer_smart_recs_var.get() else "0")
