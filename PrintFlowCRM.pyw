@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.59"
+VERSION = "0.7.60"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2486,8 +2486,13 @@ class App(tk.Tk):
 
         # The complete order editor lives inside a scrollable canvas so smaller windows
         # can reach every field/action with either the visible scrollbar or mouse wheel.
+        # Keep the primary actions pinned below the scrolling editor.  This makes
+        # them reachable at every window height instead of letting the canvas
+        # scroll them beyond the bottom edge on compact windows.
+        editor_footer = ttk.Frame(parent, style="Card.TFrame")
+        editor_footer.pack(side="bottom", fill="x", pady=(8, 0))
         editor_host = ttk.Frame(parent, style="Card.TFrame")
-        editor_host.pack(fill="both", expand=True)
+        editor_host.pack(side="top", fill="both", expand=True)
         editor_canvas = tk.Canvas(editor_host, bg=self.CARD, highlightthickness=0, borderwidth=0)
         editor_scroll = ttk.Scrollbar(editor_host, orient="vertical", command=editor_canvas.yview)
         editor_canvas.configure(yscrollcommand=editor_scroll.set)
@@ -2627,8 +2632,7 @@ class App(tk.Tk):
         ], min_button_width=110)
         payline.columnconfigure(0,weight=1)
 
-        buttons = ttk.Frame(form,style="Card.TFrame")
-        buttons.grid(row=13,column=0,columnspan=4,sticky="ew",pady=(6,0))
+        buttons = editor_footer
         ttk.Label(buttons,text="Changes save automatically",style="Card.TLabel").grid(row=0,column=0,sticky="w",pady=(0,6))
         action_bar = ttk.Frame(buttons, style="Card.TFrame")
         action_bar.grid(row=1,column=0,sticky="ew")

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.60
+
+- Pinned the order action buttons below the scrolling order editor so they remain visible when the window is made shorter.
+- Kept responsive wrapping enabled so the pinned actions also fit narrower order panes.
+- Clarified the shipping workflow: Pirate Ship Ready to Ship remains Packed until the carrier reports In Transit, then PrintFlow changes it to Shipped.
+
 ## 0.7.59
 
 - Added Capture from Pirate Ship to every PrintFlow order for existing labels and manual recovery.
