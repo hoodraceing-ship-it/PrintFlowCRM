@@ -25,8 +25,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.52"
+VERSION = "0.7.53"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
+PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
     "Textured PEI Plate",
     "Smooth PEI Plate",
@@ -372,6 +373,9 @@ class Database:
                 ("primary_color", "TEXT DEFAULT ''"),
                 ("secondary_color", "TEXT DEFAULT ''"),
                 ("material", "TEXT NOT NULL DEFAULT 'PLA'"),
+                ("tracking_registered_no", "TEXT DEFAULT ''"),
+                ("tracking_last_status", "TEXT DEFAULT ''"),
+                ("tracking_checked_at", "TEXT DEFAULT ''"),
             ]:
                 if col not in order_columns:
                     c.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
@@ -494,7 +498,7 @@ class Database:
                FROM orders o JOIN buyers b ON b.id=o.buyer_id"""
         params = []
         if active_only:
-            q += " WHERE o.status NOT IN ('Complete','Shipped','Cancelled')"
+            q += " WHERE o.status NOT IN ('Complete','Shipped','Delivered','Cancelled')"
         q += " ORDER BY o.queue_position ASC, o.id DESC"
         with self.connect() as c:
             return c.execute(q, params).fetchall()
@@ -552,6 +556,19 @@ class Database:
                     data["height_in"], data["tracking_no"], data.get("source", "Manual"), data.get("messenger_url", ""),
                     data.get("primary_color", ""), data.get("secondary_color", ""), data.get("material", "PLA") or "PLA", now, order_id,
                 ),
+            )
+
+    def set_order_status(self, order_id, status):
+        with self.connect() as c:
+            c.execute("UPDATE orders SET status=?, updated_at=? WHERE id=?",
+                      (status, datetime.now().isoformat(timespec="seconds"), order_id))
+
+    def update_tracking_sync(self, order_id, registered_no, carrier_status):
+        with self.connect() as c:
+            c.execute(
+                "UPDATE orders SET tracking_registered_no=?, tracking_last_status=?, tracking_checked_at=?, updated_at=? WHERE id=?",
+                (registered_no or "", carrier_status or "", datetime.now().isoformat(timespec="seconds"),
+                 datetime.now().isoformat(timespec="seconds"), order_id),
             )
 
     def order_files(self, order_id):
@@ -667,7 +684,7 @@ class Database:
 
     def dashboard_stats(self):
         with self.connect() as c:
-            open_orders = c.execute("SELECT COUNT(*) FROM orders WHERE status NOT IN ('Complete','Shipped','Cancelled')").fetchone()[0]
+            open_orders = c.execute("SELECT COUNT(*) FROM orders WHERE status NOT IN ('Complete','Shipped','Delivered','Cancelled')").fetchone()[0]
             printing = c.execute("SELECT COUNT(*) FROM orders WHERE status='Printing'").fetchone()[0]
             due = c.execute("SELECT COALESCE(SUM(total_price-amount_paid),0) FROM orders WHERE total_price>amount_paid").fetchone()[0]
             revenue = c.execute("SELECT COALESCE(SUM(amount_paid),0) FROM orders").fetchone()[0]
@@ -1466,6 +1483,7 @@ class App(tk.Tk):
         self.after(350, self._launch_remote_network_app_on_startup)
         # Keep file-level queue/printing/completion states synchronized with BambuBuddy.
         self.after(1800, self._schedule_print_status_sync)
+        self.after(5000, self._schedule_tracking_status_sync)
         # v0.7.45 beta: optionally check a configured GitHub Releases feed after the UI is usable.
         # Manual update installation remains available at all times as the rollback path.
         self.after(2600, self._schedule_update_check)
@@ -1826,7 +1844,7 @@ class App(tk.Tk):
         two-part models correctly report a four-print order.
         """
         fallback = str(saved_status or "Order Received")
-        if fallback.strip().lower() in {"packed", "shipped", "cancelled", "canceled", "refunded"}:
+        if fallback.strip().lower() in {"packed", "shipped", "delivered", "cancelled", "canceled", "refunded"}:
             return fallback
         try:
             rows = list(self.db.order_files(int(order_id)))
@@ -1867,7 +1885,7 @@ class App(tk.Tk):
                 current = min(total, completed + 1)
                 return f"Printing {current} out of {total}"
             if completed >= total:
-                return "Complete"
+                return "Done Printing"
             return fallback
         except Exception:
             return fallback
@@ -2442,7 +2460,7 @@ class App(tk.Tk):
             ttk.Label(form,text=label,style="Card.TLabel").grid(row=r,column=c,sticky="w",pady=5)
             widget.grid(row=r,column=c+1,columnspan=span,sticky="ew",padx=(8,14),pady=5)
         add("Buyer", ttk.Combobox(form,textvariable=vars["buyer"],values=list(buyer_map),state="readonly"),0,0)
-        add("Status", ttk.Combobox(form,textvariable=vars["status"],values=["Order Received","File Ready","Queued","Printing","Packed","Shipped","Complete","On Hold","Cancelled"],state="readonly"),0,2)
+        add("Status", ttk.Combobox(form,textvariable=vars["status"],values=["Order Received","File Ready","Queued","Printing","Done Printing","Packed","Shipped","Delivered","Complete","On Hold","Cancelled"],state="readonly"),0,2)
         add("Item", ttk.Entry(form,textvariable=vars["item"]),1,0)
         add("Quantity", ttk.Spinbox(form,textvariable=vars["quantity"],from_=1,to=999,width=8),1,2)
         add("Total price", ttk.Entry(form,textvariable=vars["total_price"]),2,0)
@@ -3042,7 +3060,117 @@ class App(tk.Tk):
                         self.db.set_order_file_print_status(int(sibling["id"]), new_status, qid, queue_library_file_id=resolved_lib)
                 changed_orders.add(int(row["order_id"]))
         if changed_orders:
+            for order_id in changed_orders:
+                row = self.db.order(order_id)
+                if not row:
+                    continue
+                saved = str(row["status"] or "")
+                if saved.lower() not in {"packed", "shipped", "delivered", "complete", "cancelled", "canceled"}:
+                    if self._order_live_print_status(order_id, saved) == "Done Printing":
+                        self.db.set_order_status(order_id, "Done Printing")
             self.after(0, lambda orders=changed_orders: self._refresh_live_file_status_ui(orders))
+
+    @staticmethod
+    def _carrier_status_from_17track(item):
+        try:
+            latest = ((item.get("track_info") or {}).get("latest_status") or {})
+            return str(latest.get("status") or latest.get("sub_status") or "").strip()
+        except Exception:
+            return ""
+
+    def _17track_request(self, endpoint, records, api_key):
+        req = urllib.request.Request(
+            f"https://api.17track.net/track/v2.4/{endpoint}",
+            data=json.dumps(records).encode("utf-8"),
+            headers={"17token": api_key, "Content-Type": "application/json", "User-Agent": f"PrintFlowCRM/{VERSION}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if int(payload.get("code", -1)) != 0:
+            raise RuntimeError(payload.get("message") or f"17TRACK returned code {payload.get('code')}")
+        return payload.get("data") or {}
+
+    def _sync_tracking_statuses_once(self):
+        api_key = unprotect_secret(self.db.get_setting("tracking_17track_api_key_enc", "")).strip()
+        if not api_key:
+            return set()
+        rows = [r for r in self.db.orders() if (r["tracking_no"] or "").strip() and
+                str(r["status"] or "").lower() not in {"delivered", "complete", "cancelled", "canceled"}]
+        changed = set()
+        for row in rows:
+            tracking_no = (row["tracking_no"] or "").strip()
+            try:
+                if (row["tracking_registered_no"] or "").strip() != tracking_no:
+                    self._17track_request("register", [{"number": tracking_no, "tag": row["order_no"]}], api_key)
+                    self.db.update_tracking_sync(int(row["id"]), tracking_no, "Registered")
+                data = self._17track_request("gettrackinfo", [{"number": tracking_no}], api_key)
+                accepted = data.get("accepted") or []
+                carrier_status = self._carrier_status_from_17track(accepted[0]) if accepted else ""
+                if not carrier_status:
+                    self.db.update_tracking_sync(int(row["id"]), tracking_no, row["tracking_last_status"] or "Awaiting carrier scan")
+                    continue
+                normalized = carrier_status.lower()
+                new_order_status = None
+                if normalized.startswith("delivered"):
+                    new_order_status = "Delivered"
+                elif normalized.startswith(("intransit", "outfordelivery", "availableforpickup")):
+                    new_order_status = "Shipped"
+                if new_order_status and new_order_status != row["status"]:
+                    self.db.set_order_status(int(row["id"]), new_order_status)
+                    changed.add(int(row["id"]))
+                self.db.update_tracking_sync(int(row["id"]), tracking_no, carrier_status)
+            except Exception as exc:
+                self.db.update_tracking_sync(int(row["id"]), row["tracking_registered_no"] or "", f"Sync error: {exc}")
+        return changed
+
+    def _schedule_tracking_status_sync(self):
+        def worker():
+            try:
+                changed = self._sync_tracking_statuses_once()
+                if changed:
+                    self.after(0, lambda orders=changed: self._refresh_live_file_status_ui(orders))
+            finally:
+                try:
+                    self.after(0, lambda: self.after(30 * 60 * 1000, self._schedule_tracking_status_sync))
+                except Exception:
+                    pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def test_tracking_sync(self):
+        key = self.tracking_api_key_var.get().strip()
+        if not key:
+            messagebox.showwarning("Shipment tracking", "Enter a 17TRACK API key first.", parent=self)
+            return
+        self.db.set_setting("tracking_17track_api_key_enc", protect_secret(key))
+        self.tracking_settings_status.configure(text="Checking tracked orders…")
+        def worker():
+            try:
+                changed = self._sync_tracking_statuses_once()
+                msg = f"Tracking connection works. Updated {len(changed)} order status(es)."
+            except Exception as exc:
+                msg = f"Tracking test failed: {exc}"
+            self.after(0, lambda: self.tracking_settings_status.configure(text=msg))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def save_tracking_settings(self):
+        self.db.set_setting("tracking_17track_api_key_enc", protect_secret(self.tracking_api_key_var.get().strip()))
+        self.tracking_settings_status.configure(text="Shipment tracking settings saved.")
+
+    def submit_feedback(self):
+        kind = self.feedback_type_var.get().strip() or "Idea"
+        subject = self.feedback_subject_var.get().strip()
+        details = self.feedback_details.get("1.0", "end").strip()
+        if not subject or not details:
+            messagebox.showwarning("Send feedback", "Add a short subject and details first.", parent=self)
+            return
+        title = f"[{kind}] {subject}"
+        body = f"**Feedback type:** {kind}\n**PrintFlow version:** {VERSION}\n\n## Details\n{details}\n"
+        if kind == "Bug":
+            body += "\n## Steps to reproduce\n1. \n2. \n3. \n"
+        url = PRINTFLOW_REPO_URL + "/issues/new?" + urllib.parse.urlencode({"title": title, "body": body})
+        webbrowser.open(url)
+        self.feedback_status.configure(text="Your report is ready in GitHub. Review it, then click Submit new issue.")
 
     def _refresh_live_file_status_ui(self, changed_orders):
         if self.current_page == "orders":
@@ -6059,11 +6187,12 @@ class App(tk.Tk):
         except Exception:
             pass
         webbrowser.open("https://ship.pirateship.com/")
-        self.status_flash("Paid in full • shipping label ready")
+        self.db.set_order_status(order_id, "Packed")
+        self.status_flash("Paid in full • package marked Packed • shipping label ready")
         if self.current_page == "orders":
             self.show_orders(order_id)
         messagebox.showinfo("Ready to ship",
-                            f"{row['order_no']} is Paid in Full.\n\nPirate Ship has been opened and the CSV is ready here:\n{path}",
+                            f"{row['order_no']} is Paid in Full and is now marked Packed.\n\nPirate Ship has been opened and the CSV is ready here:\n{path}",
                             parent=self)
 
     def export_pirateship(self, order_id):
@@ -6302,7 +6431,7 @@ class App(tk.Tk):
             return
         self.current_page = "settings"
         self.clear_main()
-        self.page_header("Settings", "AI search, BambuBuddy, updates, backups and desktop behavior")
+        self.page_header("Settings", "Connections, shipment tracking, feedback, updates, backups and desktop behavior")
 
         settings_container=ttk.Frame(self.main)
         settings_container.pack(fill="both",expand=True)
@@ -6444,6 +6573,39 @@ class App(tk.Tk):
         ttk.Button(pkgb,text="Save Packaging Settings",style="Accent.TButton",command=self.save_packaging_settings).pack(side="left")
         self.shipping_location_status=ttk.Label(pkg,text="",style="Card.TLabel"); self.shipping_location_status.grid(row=5,column=0,columnspan=3,sticky="w",pady=(7,0))
         pkg.columnconfigure(1,weight=1)
+
+        tracking = self.card(settings_inner, 12)
+        tracking.pack(fill="x", pady=(0, 9))
+        ttk.Label(tracking, text="Automatic Shipment Tracking", style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,8))
+        self.tracking_api_key_var=tk.StringVar(value=unprotect_secret(self.db.get_setting("tracking_17track_api_key_enc", "")))
+        ttk.Label(tracking,text="17TRACK API key",style="Card.TLabel").grid(row=1,column=0,sticky="w",pady=4)
+        ttk.Entry(tracking,textvariable=self.tracking_api_key_var,show="•",width=55).grid(row=1,column=1,sticky="ew",padx=10,pady=4)
+        ttk.Label(tracking,text="When an order has a tracking number, PrintFlow checks carrier scans every 30 minutes. A pickup or in-transit scan changes Packed to Shipped; carrier-confirmed delivery changes it to Delivered. The key stays encrypted on this computer.",style="Card.TLabel",wraplength=780,justify="left").grid(row=2,column=0,columnspan=3,sticky="w",pady=(4,7))
+        tracking_buttons=ttk.Frame(tracking,style="Card.TFrame"); tracking_buttons.grid(row=3,column=0,columnspan=3,sticky="w")
+        ttk.Button(tracking_buttons,text="Save Tracking Settings",style="Accent.TButton",command=self.save_tracking_settings).pack(side="left",padx=(0,7))
+        ttk.Button(tracking_buttons,text="Test / Sync Now",command=self.test_tracking_sync).pack(side="left",padx=(0,7))
+        ttk.Button(tracking_buttons,text="Get 17TRACK API Key",command=lambda:webbrowser.open("https://api.17track.net/en")).pack(side="left")
+        self.tracking_settings_status=ttk.Label(tracking,text="",style="Card.TLabel",wraplength=780,justify="left")
+        self.tracking_settings_status.grid(row=4,column=0,columnspan=3,sticky="w",pady=(7,0))
+        tracking.columnconfigure(1,weight=1)
+
+        feedback = self.card(settings_inner, 12)
+        feedback.pack(fill="x", pady=(0, 9))
+        ttk.Label(feedback,text="Send Feedback to the Developer",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,8))
+        ttk.Label(feedback,text="Report a bug, request a fix, or send an idea directly to the PrintFlow project.",style="Card.TLabel",wraplength=780,justify="left").grid(row=1,column=0,columnspan=3,sticky="w",pady=(0,7))
+        self.feedback_type_var=tk.StringVar(value="Bug")
+        self.feedback_subject_var=tk.StringVar()
+        ttk.Label(feedback,text="Type",style="Card.TLabel").grid(row=2,column=0,sticky="w",pady=4)
+        ttk.Combobox(feedback,textvariable=self.feedback_type_var,state="readonly",values=["Bug","Fix request","Idea"],width=18).grid(row=2,column=1,sticky="w",padx=10,pady=4)
+        ttk.Label(feedback,text="Subject",style="Card.TLabel").grid(row=3,column=0,sticky="w",pady=4)
+        ttk.Entry(feedback,textvariable=self.feedback_subject_var,width=60).grid(row=3,column=1,columnspan=2,sticky="ew",padx=10,pady=4)
+        ttk.Label(feedback,text="Details",style="Card.TLabel").grid(row=4,column=0,sticky="nw",pady=4)
+        self.feedback_details=tk.Text(feedback,height=6,wrap="word",bg="#0f1722",fg="#e5edf7",insertbackground="#ffffff",relief="flat",highlightthickness=1,highlightbackground="#334155",font=("Segoe UI",10),padx=8,pady=7)
+        self.feedback_details.grid(row=4,column=1,columnspan=2,sticky="ew",padx=10,pady=4)
+        ttk.Button(feedback,text="Send Feedback",style="Accent.TButton",command=self.submit_feedback).grid(row=5,column=1,sticky="w",padx=10,pady=(5,0))
+        self.feedback_status=ttk.Label(feedback,text="",style="Card.TLabel",wraplength=780,justify="left")
+        self.feedback_status.grid(row=6,column=0,columnspan=3,sticky="w",pady=(7,0))
+        feedback.columnconfigure(1,weight=1)
 
         u = self.card(settings_inner, 12)
         u.pack(fill="x", pady=(0, 9))

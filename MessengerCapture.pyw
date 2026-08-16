@@ -284,25 +284,44 @@ INJECT = r'''
     };
 
     const fillAndSend = async () => {
-      if (sending) return;
+      const requestId = String(payment.request_id || '');
+      if (sending || window.__PRINTFLOW_SENDING_REQUEST_ID__ === requestId) return;
       sending = true;
+      window.__PRINTFLOW_SENDING_REQUEST_ID__ = requestId;
       setStatus('Opening conversation and preparing reminder…');
       await new Promise(resolve => setTimeout(resolve, 1200));
       const composer = findComposer();
-      if (!composer) { sending=false; setStatus('Message box not found. Click the buyer conversation again.', '#fca5a5'); return; }
+      if (!composer) { sending=false; window.__PRINTFLOW_SENDING_REQUEST_ID__=''; setStatus('Message box not found. Click the buyer conversation again.', '#fca5a5'); return; }
       composer.focus();
       try {
+        const message = String(payment.message || '');
         if (composer.isContentEditable) {
-          document.execCommand('selectAll', false, null);
-          document.execCommand('insertText', false, String(payment.message || ''));
+          // Scope the selection to the composer. document.execCommand('selectAll')
+          // can select Messenger's surrounding document, and manually dispatching
+          // an insertText InputEvent makes Lexical apply the same text a second time.
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(composer);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          document.execCommand('delete', false, null);
+          document.execCommand('insertText', false, message);
         } else {
-          composer.value = String(payment.message || '');
+          composer.value = message;
+          composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:null}));
         }
-        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:String(payment.message || '')}));
       } catch (_) {
-        sending=false; setStatus('Could not fill the message box. Click the conversation again.', '#fca5a5'); return;
+        sending=false; window.__PRINTFLOW_SENDING_REQUEST_ID__=''; setStatus('Could not fill the message box. Click the conversation again.', '#fca5a5'); return;
       }
       await new Promise(resolve => setTimeout(resolve, 450));
+      const expectedMessage = String(payment.message || '').replace(/\s+/g, ' ').trim();
+      const composedMessage = String(composer.isContentEditable ? composer.innerText : composer.value).replace(/\s+/g, ' ').trim();
+      if (composedMessage !== expectedMessage) {
+        sending=false;
+        window.__PRINTFLOW_SENDING_REQUEST_ID__='';
+        setStatus('The reminder did not fill exactly once. It was not sent; click the buyer again to retry.', '#fca5a5');
+        return;
+      }
       const buttons = [...document.querySelectorAll('button,[role="button"]')];
       const send = buttons.find(el => {
         const r=visibleRect(el); if(!r) return false;
@@ -311,6 +330,7 @@ INJECT = r'''
       });
       if (!send) {
         sending=false;
+        window.__PRINTFLOW_SENDING_REQUEST_ID__='';
         setStatus('Reminder filled in. Review it and press Send.', '#fbbf24');
         return;
       }

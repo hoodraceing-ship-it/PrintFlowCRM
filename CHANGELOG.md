@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.53
+
+- Added a Settings feedback form for bug reports, fix requests, and ideas, prefilled with the running PrintFlow version and sent directly to the public project issue tracker.
+- Changed fully successful multi-job orders to Done Printing after every physical print completes.
+- Changed orders to Packed when Prepare Shipping Label creates the Pirate Ship CSV and opens Pirate Ship.
+- Added optional encrypted 17TRACK API settings and automatic 30-minute carrier-status synchronization.
+- Changed tracked orders to Shipped after a carrier pickup/in-transit scan and Delivered after carrier-confirmed delivery.
+- Added Done Printing and Delivered to the order status selector and excluded delivered orders from active-order counts.
+- Fixed Marketplace payment reminders being inserted twice by removing the duplicate Lexical input event, scoping composer replacement, verifying the exact outgoing text, and locking each armed request during send.
+
 ## 0.7.52
 
 - Added a persistent app-wide update banner above every screen when a newer GitHub release is available.
