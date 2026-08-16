@@ -22,6 +22,7 @@ def data_dir():
 
 
 CAPTURE_FILE = Path(sys.argv[1]) if len(sys.argv) > 1 else data_dir() / "messenger_capture.json"
+PAYMENT_REQUEST_FILE = data_dir() / "messenger_payment_request.json"
 STORAGE_DIR = data_dir() / "messenger_browser"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -75,6 +76,22 @@ class Bridge:
         tmp.replace(CAPTURE_FILE)
         return "Captured to PrintFlow ✓"
 
+    def payment_sent(self, request_id):
+        try:
+            if not PAYMENT_REQUEST_FILE.exists():
+                return False
+            payload = json.loads(PAYMENT_REQUEST_FILE.read_text(encoding="utf-8"))
+            if str(payload.get("request_id") or "") != str(request_id or ""):
+                return False
+            payload["status"] = "sent"
+            payload["sent_at"] = datetime.now().isoformat(timespec="seconds")
+            tmp = Path(tempfile.gettempdir()) / ("printflow-payment-sent-" + str(os.getpid()) + ".json")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(PAYMENT_REQUEST_FILE)
+            return True
+        except Exception:
+            return False
+
 
 bridge = Bridge()
 window = webview.create_window(
@@ -102,7 +119,13 @@ INJECT = r'''
     document.documentElement.appendChild(style);
   }
 
-  if (document.getElementById('printflow-capture-chat')) return;
+  const existingCapture = document.getElementById('printflow-capture-chat');
+  const pendingPayment = window.__PRINTFLOW_PAYMENT_REQUEST__;
+  if (existingCapture && (!pendingPayment || document.getElementById('printflow-payment-reminder'))) return;
+  // A newly armed reminder may arrive while this single browser window is
+  // already open. Recreate only the capture button so the payment panel can
+  // be injected without opening a second Messenger window.
+  if (existingCapture) existingCapture.remove();
 
   const btn = document.createElement('button');
   btn.id = 'printflow-capture-chat';
@@ -223,6 +246,85 @@ INJECT = r'''
   };
 
   document.documentElement.appendChild(btn);
+
+  const payment = window.__PRINTFLOW_PAYMENT_REQUEST__;
+  if (payment && payment.status === 'armed' && !document.getElementById('printflow-payment-reminder')) {
+    const panel = document.createElement('div');
+    panel.id = 'printflow-payment-reminder';
+    Object.assign(panel.style, {
+      position:'fixed', top:'66px', right:'16px', zIndex:'2147483647', width:'360px',
+      background:'#111827', color:'#fff', border:'2px solid #f59e0b', borderRadius:'10px',
+      padding:'12px 14px', font:'14px Segoe UI,Arial,sans-serif', boxShadow:'0 8px 26px rgba(0,0,0,.45)'
+    });
+    panel.innerHTML = `<div style="font-weight:700;color:#fbbf24;margin-bottom:6px">Payment reminder armed</div>
+      <div>Click <b>${String(payment.buyer_name || 'the buyer')}</b> in the conversation list.</div>
+      <div style="font-size:12px;color:#cbd5e1;margin-top:7px">${String(payment.message || '')}</div>
+      <div id="printflow-payment-status" style="font-size:12px;color:#93c5fd;margin-top:8px">Waiting for the matching conversation…</div>`;
+    document.documentElement.appendChild(panel);
+
+    const normalize = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    const expected = normalize(payment.buyer_name);
+    let sending = false;
+
+    const setStatus = (text, color='#93c5fd') => {
+      const el = document.getElementById('printflow-payment-status');
+      if (el) { el.textContent = text; el.style.color = color; }
+    };
+
+    const fillAndSend = async () => {
+      if (sending) return;
+      sending = true;
+      setStatus('Opening conversation and preparing reminder…');
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      const composer = findComposer();
+      if (!composer) { sending=false; setStatus('Message box not found. Click the buyer conversation again.', '#fca5a5'); return; }
+      composer.focus();
+      try {
+        if (composer.isContentEditable) {
+          document.execCommand('selectAll', false, null);
+          document.execCommand('insertText', false, String(payment.message || ''));
+        } else {
+          composer.value = String(payment.message || '');
+        }
+        composer.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:String(payment.message || '')}));
+      } catch (_) {
+        sending=false; setStatus('Could not fill the message box. Click the conversation again.', '#fca5a5'); return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 450));
+      const buttons = [...document.querySelectorAll('button,[role="button"]')];
+      const send = buttons.find(el => {
+        const r=visibleRect(el); if(!r) return false;
+        const label=((el.getAttribute('aria-label')||'')+' '+(el.title||'')+' '+(el.innerText||'')).trim();
+        return /^(send|press enter to send)$/i.test(label) || /send message/i.test(label);
+      });
+      if (!send) {
+        sending=false;
+        setStatus('Reminder filled in. Review it and press Send.', '#fbbf24');
+        return;
+      }
+      send.click();
+      setStatus('Payment reminder sent ✓', '#86efac');
+      try { await window.pywebview.api.payment_sent(payment.request_id); } catch (_) {}
+      setTimeout(() => panel.remove(), 4500);
+    };
+
+    document.addEventListener('click', event => {
+      if (sending || !window.__PRINTFLOW_PAYMENT_REQUEST__ || event.clientX > innerWidth * .42) return;
+      let el=event.target, text='';
+      for(let i=0; el && i<6; i++,el=el.parentElement) {
+        const r=visibleRect(el); const candidate=(el.innerText||el.textContent||'').trim();
+        if(r && candidate && candidate.length<500) text += ' ' + candidate;
+      }
+      const clicked=normalize(text);
+      const words=expected.split(' ').filter(x=>x.length>1);
+      if (!expected || !words.every(word=>clicked.includes(word))) {
+        setStatus(`That does not look like ${payment.buyer_name}. Reminder not sent.`, '#fca5a5');
+        return;
+      }
+      setStatus(`Matched ${payment.buyer_name}. Sending…`);
+      fillAndSend();
+    }, true);
+  }
 })();
 '''
 
@@ -232,6 +334,15 @@ def keep_button_alive(win):
     while True:
         time.sleep(2.5)
         try:
+            payment = None
+            try:
+                if PAYMENT_REQUEST_FILE.exists():
+                    candidate = json.loads(PAYMENT_REQUEST_FILE.read_text(encoding="utf-8"))
+                    if candidate.get("status") == "armed":
+                        payment = candidate
+            except Exception:
+                payment = None
+            win.run_js("window.__PRINTFLOW_PAYMENT_REQUEST__ = " + json.dumps(payment, ensure_ascii=False) + ";")
             win.run_js(INJECT)
         except Exception:
             try:

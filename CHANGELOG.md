@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.50
+
+- Prevented Prepare Shipping Label from falsely marking unpaid orders as Paid in Full.
+- Added a balance-due gate before Pirate Ship opens.
+- Added an in-app Marketplace payment reminder with the buyer name and exact remaining balance.
+- Added guarded conversation matching: the reminder only auto-sends after the clicked Marketplace conversation matches the order's buyer name.
+- Added a safe fallback that fills the reminder for manual review when Messenger's Send control cannot be identified.
+
 ## 0.7.49
 
 - Improved the Print Preflight orientation viewer frame rate with cached geometry, interaction-level detail, and throttled redraws.

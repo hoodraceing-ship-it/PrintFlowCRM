@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.49"
+VERSION = "0.7.50"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 BUILD_PLATE_TYPES = (
     "Textured PEI Plate",
@@ -117,6 +117,7 @@ BACKUP_DIR = DATA_DIR / "backups"
 THUMB_CACHE_DIR = DATA_DIR / "thumb_cache"
 APP_DIR = DATA_DIR / "App"
 MESSENGER_CAPTURE_FILE = DATA_DIR / "messenger_capture.json"
+MESSENGER_PAYMENT_REQUEST_FILE = DATA_DIR / "messenger_payment_request.json"
 PYTHON_PACKAGES_DIR = DATA_DIR / "python_packages"
 PYTHON_PACKAGES_STAGING_DIR = DATA_DIR / "python_packages_staging"
 PYTHON_PACKAGES_BACKUP_DIR = DATA_DIR / "python_packages_previous"
@@ -5913,10 +5914,49 @@ class App(tk.Tk):
         return self.db.order(order_id)
 
     def prepare_shipping_label(self, order_id):
-        try:
-            row = self._mark_order_paid_full_for_shipping(order_id)
-            if not row:
+        if self.current_order_id == order_id:
+            self.flush_order_autosave()
+        row = self.db.order(order_id)
+        if not row:
+            return
+        total = max(0.0, float(row["total_price"] or 0))
+        paid = max(0.0, float(row["amount_paid"] or 0))
+        balance = max(0.0, total - paid)
+        if balance > 0.005:
+            buyer = (row["buyer_name"] or "the buyer").strip()
+            message = (
+                f"Hi {buyer}, your remaining balance of {self.money(balance)} needs to be paid in full "
+                "before I can ship your order. Thank you!"
+            )
+            if not messagebox.askyesno(
+                "Payment required before shipping",
+                f"This order still has a balance of {self.money(balance)}.\n\n"
+                f"PrintFlow will open Marketplace Messenger. Click {buyer}'s conversation and the reminder below "
+                f"will be sent automatically:\n\n{message}\n\nOpen Messenger and arm this reminder?",
+                parent=self,
+            ):
                 return
+            request = {
+                "request_id": uuid.uuid4().hex,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "order_id": int(order_id),
+                "order_no": row["order_no"],
+                "buyer_name": buyer,
+                "balance": round(balance, 2),
+                "message": message,
+                "status": "armed",
+            }
+            try:
+                tmp = Path(tempfile.gettempdir()) / f"printflow-payment-{os.getpid()}.json"
+                tmp.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(MESSENGER_PAYMENT_REQUEST_FILE)
+            except Exception as exc:
+                messagebox.showerror("Payment reminder", f"Could not prepare the Messenger reminder.\n\n{exc}", parent=self)
+                return
+            self.open_messenger_capture_browser()
+            self.status_flash(f"Payment reminder armed for {buyer} • {self.money(balance)} due")
+            return
+        try:
             row = self._ensure_package_dimensions_for_pirateship(order_id) or row
             path = self._write_pirateship_csv(row)
         except ValueError as e:
@@ -5933,7 +5973,7 @@ class App(tk.Tk):
         if self.current_page == "orders":
             self.show_orders(order_id)
         messagebox.showinfo("Ready to ship",
-                            f"{row['order_no']} is now Paid in Full.\n\nPirate Ship has been opened and the CSV is ready here:\n{path}",
+                            f"{row['order_no']} is Paid in Full.\n\nPirate Ship has been opened and the CSV is ready here:\n{path}",
                             parent=self)
 
     def export_pirateship(self, order_id):
