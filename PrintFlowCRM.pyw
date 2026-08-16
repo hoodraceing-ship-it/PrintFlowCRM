@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.51"
+VERSION = "0.7.52"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 BUILD_PLATE_TYPES = (
     "Textured PEI Plate",
@@ -1468,7 +1468,7 @@ class App(tk.Tk):
         self.after(1800, self._schedule_print_status_sync)
         # v0.7.45 beta: optionally check a configured GitHub Releases feed after the UI is usable.
         # Manual update installation remains available at all times as the rollback path.
-        self.after(2600, self._startup_update_check)
+        self.after(2600, self._schedule_update_check)
 
     def _remote_network_provider(self):
         return (self.db.get_setting("remote_network_provider", "Tailscale") or "Tailscale").strip()
@@ -1731,8 +1731,25 @@ class App(tk.Tk):
                        selectcolor="#1a2634", font=("Segoe UI", 9)).pack(anchor="w", padx=15, pady=6)
         tk.Label(self.nav, text=f"v{VERSION}", bg=self.NAV, fg="#718096", font=("Segoe UI", 8)).pack(side="bottom", anchor="w", padx=16, pady=14)
 
-        self.main = ttk.Frame(self, padding=(22,18))
-        self.main.pack(side="left", fill="both", expand=True)
+        # The content shell survives page changes. The update banner belongs here,
+        # above self.main, so clear_main() cannot remove it on navigation.
+        self.content_shell = tk.Frame(self, bg=self.BG)
+        self.content_shell.pack(side="left", fill="both", expand=True)
+        self.update_banner = tk.Frame(self.content_shell, bg="#7c4a03", highlightthickness=1,
+                                      highlightbackground="#f59e0b", padx=14, pady=9)
+        self.update_banner_message = tk.Label(self.update_banner, text="", bg="#7c4a03", fg="#fff7d6",
+                                              font=("Segoe UI Semibold", 10), anchor="w")
+        self.update_banner_message.pack(side="left", fill="x", expand=True)
+        self.update_banner_button = tk.Button(
+            self.update_banner, text="Update Now", command=self._install_available_update,
+            bg="#f59e0b", fg="#111827", activebackground="#fbbf24", activeforeground="#111827",
+            relief="flat", font=("Segoe UI Semibold", 9), padx=14, pady=5, cursor="hand2"
+        )
+        self.update_banner_button.pack(side="right", padx=(12,0))
+        self._available_update_info = None
+
+        self.main = ttk.Frame(self.content_shell, padding=(22,18))
+        self.main.pack(fill="both", expand=True)
 
     def _restore_topmost(self):
         top = self.db.get_setting("always_top", "0") == "1"
@@ -1752,7 +1769,7 @@ class App(tk.Tk):
             self.minsize(430, 600)
             self.show_queue(compact=True)
         else:
-            self.nav.pack(side="left", fill="y", before=self.main)
+            self.nav.pack(side="left", fill="y", before=self.content_shell)
             self.nav.pack_propagate(False)
             self.geometry(self.db.get_setting("full_geometry", "1180x760"))
             self.minsize(900, 620)
@@ -1801,6 +1818,60 @@ class App(tk.Tk):
             return "Half Paid"
         return "Partial"
 
+    def _order_live_print_status(self, order_id, saved_status="Queued"):
+        """Summarize physical BambuBuddy jobs for an order.
+
+        Generated source/G-code siblings share queue IDs and count once. Auto Split
+        parts have distinct queue IDs and each count as a physical print, so two
+        two-part models correctly report a four-print order.
+        """
+        fallback = str(saved_status or "Order Received")
+        if fallback.strip().lower() in {"packed", "shipped", "cancelled", "canceled", "refunded"}:
+            return fallback
+        try:
+            rows = list(self.db.order_files(int(order_id)))
+            groups = self._group_order_files_for_display(rows)
+            expected = 0
+            for _main, _helpers, members in groups:
+                parts = set()
+                for f in members:
+                    name = f["original_name"] or Path(f["stored_path"]).name
+                    match = re.search(r"_AUTO_SPLIT_[XYZ]_PART_(\d+)", name, flags=re.I)
+                    if match:
+                        parts.add(int(match.group(1)))
+                expected += len(parts) if parts else 1
+
+            jobs = {}
+            for f in rows:
+                status = self._display_print_status(f["print_status"] or "Not queued")
+                qid = f["bambuddy_queue_id"]
+                qlib = f["bambuddy_queue_library_file_id"]
+                lib = f["bambuddy_library_file_id"]
+                if qid is not None:
+                    key = ("queue", int(qid))
+                elif qlib is not None:
+                    key = ("queue-library", int(qlib))
+                elif lib is not None and status != "Not Queued":
+                    key = ("library", int(lib))
+                else:
+                    continue
+                jobs[key] = status
+
+            total = max(expected, len(jobs))
+            if total <= 0:
+                return fallback
+            statuses = list(jobs.values())
+            completed = sum(1 for status in statuses if status == "Complete")
+            printing = sum(1 for status in statuses if status == "Printing")
+            if printing:
+                current = min(total, completed + 1)
+                return f"Printing {current} out of {total}"
+            if completed >= total:
+                return "Complete"
+            return fallback
+        except Exception:
+            return fallback
+
     def show_dashboard(self):
         self.current_page = "dashboard"
         self.clear_main()
@@ -1819,10 +1890,10 @@ class App(tk.Tk):
         recent.pack(fill="both", expand=True)
         ttk.Label(recent, text="Recent / Active Orders", style="CardTitle.TLabel").pack(anchor="w", pady=(0,10))
         tree = ttk.Treeview(recent, columns=("order","buyer","item","status","paid","queue"), show="headings")
-        for col,text,width in [("order","Order",120),("buyer","Buyer",160),("item","Item",220),("status","Status",120),("paid","Payment",110),("queue","Print #",70)]:
+        for col,text,width in [("order","Order",120),("buyer","Buyer",160),("item","Item",220),("status","Status",155),("paid","Payment",110),("queue","Print #",70)]:
             tree.heading(col,text=text); tree.column(col,width=width,anchor="w")
         for r in self.db.orders(active_only=True)[:15]:
-            tree.insert("","end",iid=str(r["id"]),values=(r["order_no"],r["buyer_name"],r["item"],r["status"],self.payment_status(r["total_price"],r["amount_paid"]),r["queue_position"]))
+            tree.insert("","end",iid=str(r["id"]),values=(r["order_no"],r["buyer_name"],r["item"],self._order_live_print_status(r["id"],r["status"]),self.payment_status(r["total_price"],r["amount_paid"]),r["queue_position"]))
         tree.pack(fill="both", expand=True)
         tree.bind("<Double-1>", lambda e: self._open_order_from_tree(tree))
 
@@ -1967,12 +2038,12 @@ class App(tk.Tk):
         ttk.Button(tb,text="Import Latest Capture",style="Accent.TButton",command=self.import_latest_messenger_capture).pack(pady=(0,5),fill="x")
         ttk.Button(tb,text="Open in Normal Browser",command=lambda:webbrowser.open(MARKETPLACE_MESSENGER_URL)).pack(fill="x")
         tree=ttk.Treeview(c,columns=("order","buyer","item","colors","price","paid","status"),show="headings")
-        for col,text,width in [("order","Order",115),("buyer","Buyer",145),("item","Item",220),("colors","Colors",135),("price","Price",80),("paid","Payment",105),("status","Status",110)]:
+        for col,text,width in [("order","Order",115),("buyer","Buyer",145),("item","Item",220),("colors","Colors",135),("price","Price",80),("paid","Payment",105),("status","Status",155)]:
             tree.heading(col,text=text); tree.column(col,width=width,anchor="w")
         for r in self.db.marketplace_orders():
             colors=(r["primary_color"] or "") + ((" / "+r["secondary_color"]) if (r["secondary_color"] or "") else "")
             tree.insert("","end",iid=str(r["id"]),values=(r["order_no"],r["buyer_name"],r["item"],colors,self.money(r["total_price"]),
-                        self.payment_status(r["total_price"],r["amount_paid"]),r["status"]))
+                        self.payment_status(r["total_price"],r["amount_paid"]),self._order_live_print_status(r["id"],r["status"])))
         tree.pack(fill="both",expand=True)
         tree.bind("<Double-1>",lambda e:self._open_order_from_tree(tree))
         self.after(1200,self._poll_messenger_capture)
@@ -2295,12 +2366,12 @@ class App(tk.Tk):
         right = self.card(paned, 14)
         paned.add(left, weight=2); paned.add(right, weight=3)
         tree = ttk.Treeview(left, columns=("order","buyer","item","source","status","paid"), show="headings")
-        for col,text,width in [("order","Order",115),("buyer","Buyer",130),("item","Item",165),("source","Source",110),("status","Status",100),("paid","Paid",90)]:
+        for col,text,width in [("order","Order",115),("buyer","Buyer",130),("item","Item",165),("source","Source",110),("status","Status",145),("paid","Paid",90)]:
             tree.heading(col,text=text); tree.column(col,width=width,anchor="w")
         rows = self.db.orders()
         for r in rows:
             src="Marketplace" if (r["source"] or "") == "Facebook Marketplace" else (r["source"] or "Manual")
-            tree.insert("","end",iid=str(r["id"]),values=(r["order_no"],r["buyer_name"],r["item"],src,r["status"],self.payment_status(r["total_price"],r["amount_paid"])))
+            tree.insert("","end",iid=str(r["id"]),values=(r["order_no"],r["buyer_name"],r["item"],src,self._order_live_print_status(r["id"],r["status"]),self.payment_status(r["total_price"],r["amount_paid"])))
         tree.pack(fill="both",expand=True)
         self.orders_tree = tree
         tree.bind("<<TreeviewSelect>>", lambda e: self.load_order_editor(int(tree.selection()[0]), right) if tree.selection() else None)
@@ -2400,9 +2471,12 @@ class App(tk.Tk):
         ship.grid(row=10,column=0,columnspan=4,sticky="ew",pady=(5,8))
         for c in range(8):
             ship.columnconfigure(c, weight=1 if c % 2 else 0)
+        package_entries = []
         for i,(label,key) in enumerate([("Weight lb","weight_oz"),("L in","length_in"),("W in","width_in"),("H in","height_in")]):
             ttk.Label(ship,text=label).grid(row=0,column=i*2,sticky="w",padx=(0,5))
-            ttk.Entry(ship,textvariable=vars[key],width=8).grid(row=0,column=i*2+1,sticky="ew",padx=(0,12))
+            entry = ttk.Entry(ship,textvariable=vars[key],width=8)
+            entry.grid(row=0,column=i*2+1,sticky="ew",padx=(0,12))
+            package_entries.append(entry)
 
         # Keep the recommendation on its own row so long text never pushes actions off-screen.
         self._box_recommendations = getattr(self, "_box_recommendations", {})
@@ -2491,6 +2565,15 @@ class App(tk.Tk):
         }
         for var in vars.values():
             var.trace_add("write", lambda *_args, t=token: self.schedule_order_autosave(t))
+
+        def commit_manual_package_size(_event=None, t=token):
+            # Keystroke autosave is already active; focus-out/Enter forces the
+            # final manual package value into SQLite before navigation.
+            self.schedule_order_autosave(t)
+            self.after_idle(self.flush_order_autosave)
+        for entry in package_entries:
+            entry.bind("<FocusOut>", commit_manual_package_size, add="+")
+            entry.bind("<Return>", commit_manual_package_size, add="+")
 
         def notes_changed(_event=None, t=token):
             if notes.edit_modified():
@@ -2623,7 +2706,7 @@ class App(tk.Tk):
             return
         src="Marketplace" if (row["source"] or "") == "Facebook Marketplace" else (row["source"] or "Manual")
         tree.item(str(row["id"]), values=(
-            row["order_no"], row["buyer_name"], row["item"], src, row["status"],
+            row["order_no"], row["buyer_name"], row["item"], src, self._order_live_print_status(row["id"], row["status"]),
             self.payment_status(row["total_price"], row["amount_paid"]),
         ))
 
@@ -2962,8 +3045,13 @@ class App(tk.Tk):
             self.after(0, lambda orders=changed_orders: self._refresh_live_file_status_ui(orders))
 
     def _refresh_live_file_status_ui(self, changed_orders):
-        if self.current_page == "orders" and self.current_order_id in changed_orders:
-            self.refresh_order_files(self.current_order_id)
+        if self.current_page == "orders":
+            for order_id in changed_orders:
+                row = self.db.order(order_id)
+                if row:
+                    self._update_order_tree_row(row)
+            if self.current_order_id in changed_orders:
+                self.refresh_order_files(self.current_order_id)
 
     def _attach_paths_to_order(self, order_id, sources, parent=None):
         sources = [str(x) for x in sources if str(x).strip()]
@@ -6185,7 +6273,7 @@ class App(tk.Tk):
         for c,t,w in specs: tree.heading(c,text=t);tree.column(c,width=w,anchor="w")
         rows=self.db.orders(active_only=True)
         for r in rows:
-            vals={"pos":r["queue_position"],"order":r["order_no"],"buyer":r["buyer_name"],"item":r["item"],"qty":r["quantity"],"priority":r["priority"],"status":r["status"]}
+            vals={"pos":r["queue_position"],"order":r["order_no"],"buyer":r["buyer_name"],"item":r["item"],"qty":r["quantity"],"priority":r["priority"],"status":self._order_live_print_status(r["id"],r["status"])}
             tree.insert("","end",iid=str(r["id"]),values=tuple(vals[c] for c,_,_ in specs))
         tree.pack(fill="both",expand=True)
         bf=ttk.Frame(body,style="Card.TFrame");bf.pack(fill="x",pady=(10,0))
@@ -6553,6 +6641,29 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _show_update_banner(self, info):
+        self._available_update_info = dict(info or {})
+        version = self._available_update_info.get("version") or "new"
+        self.update_banner_message.configure(text=f"PrintFlow CRM v{version} is available.")
+        self.update_banner_button.configure(text="Update Now", state="normal")
+        if not self.update_banner.winfo_ismapped():
+            self.update_banner.pack(fill="x", before=self.main)
+
+    def _hide_update_banner(self):
+        self._available_update_info = None
+        try:
+            self.update_banner.pack_forget()
+        except Exception:
+            pass
+
+    def _install_available_update(self):
+        info = self._available_update_info
+        if not info:
+            self._check_remote_update(interactive=True, force=True)
+            return
+        self.update_banner_button.configure(text="Starting…", state="disabled")
+        self._install_remote_update(info)
+
     def _download_remote_update(self, info):
         updates_dir=DATA_DIR / "updates"
         updates_dir.mkdir(parents=True,exist_ok=True)
@@ -6581,6 +6692,11 @@ class App(tk.Tk):
                 pass
 
     def _install_remote_update(self,info):
+        try:
+            if self._available_update_info:
+                self.update_banner_button.configure(text="Downloading…", state="disabled")
+        except Exception:
+            pass
         self.busy_popup(f"Downloading PrintFlow CRM v{info['version']}…")
         def worker():
             try:
@@ -6606,6 +6722,11 @@ class App(tk.Tk):
     def _remote_update_failed(self,message):
         self._close_busy()
         self._set_update_status("Update failed: "+message)
+        try:
+            if self._available_update_info:
+                self.update_banner_button.configure(text="Retry Update", state="normal")
+        except Exception:
+            pass
         messagebox.showerror("Automatic update",message,parent=self)
 
     def _handle_remote_update_result(self,info,interactive=False):
@@ -6613,16 +6734,18 @@ class App(tk.Tk):
         current=self._version_tuple(VERSION)
         self.db.set_setting("update_last_check_epoch",str(int(time.time())))
         if latest <= current:
+            self._hide_update_banner()
             self._set_update_status(f"You're up to date. Latest GitHub release: v{info['version']}.")
             if interactive:
                 messagebox.showinfo("PrintFlow updates",f"You're up to date on v{VERSION}.",parent=self)
             return
         mode=(self.db.get_setting("update_mode","Manual only") or "Manual only").strip()
+        self._show_update_banner(info)
         self._set_update_status(f"Update available: v{info['version']} ({info['asset_name']})")
         if mode == "Automatic":
             self._install_remote_update(info)
             return
-        if mode == "Notify me first" or interactive:
+        if interactive:
             if messagebox.askyesno("PrintFlow update available",f"PrintFlow CRM v{info['version']} is available.\n\nDownload, back up your database, install it, and restart now?",parent=self):
                 self._install_remote_update(info)
 
@@ -6631,8 +6754,6 @@ class App(tk.Tk):
         mode=(self.db.get_setting("update_mode","Manual only") or "Manual only").strip()
         if not repo:
             if interactive: messagebox.showwarning("PrintFlow updates","Configure a GitHub repository in Settings first.",parent=self)
-            return
-        if not interactive and mode == "Manual only":
             return
         if not force and not interactive:
             try:
@@ -6666,7 +6787,14 @@ class App(tk.Tk):
         self._check_remote_update(interactive=True,force=True)
 
     def _startup_update_check(self):
-        self._check_remote_update(interactive=False,force=False)
+        # Always refresh once per launch so Manual Only users still receive the
+        # persistent banner; their update is never installed without clicking.
+        self._check_remote_update(interactive=False,force=True)
+
+    def _schedule_update_check(self):
+        self._startup_update_check()
+        # Keep long-running order-desk sessions informed without requiring a restart.
+        self.after(60 * 60 * 1000, self._schedule_update_check)
 
     def _read_update_manifest(self, zip_path: Path):
         with zipfile.ZipFile(zip_path, "r") as z:

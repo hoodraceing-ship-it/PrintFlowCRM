@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.52
+
+- Added a persistent app-wide update banner above every screen when a newer GitHub release is available.
+- Added an Update Now button that uses the existing download validation, pre-update database backup, installation, and restart workflow.
+- Made startup update checks notify Manual Only users without installing anything automatically.
+- Added hourly background release checks for long-running PrintFlow sessions.
+- Replaced stale order-level Queued text with live physical-job progress such as Printing 1 out of 4.
+- Counted Auto Split parts as individual print jobs while de-duplicating source STL and generated G-code siblings.
+- Refreshed the Orders status column as BambuBuddy file statuses change.
+- Made manually typed package weight and L/W/H save immediately on Enter or leaving the field, in addition to normal keystroke autosave.
+- Added download/retry states to prevent duplicate update clicks and preserve recovery after a failed download.
+
 ## 0.7.51
 
 - Changed Marketplace payment-reminder matching and greetings to use the customer's first name only.
