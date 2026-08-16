@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.48
+
+- Added Ctrl/Shift multi-selection to a customer's print-file list.
+- Added sequential batch queueing for multiple selected STL, 3MF, and sliced files.
+- Added one confirmation summary, live batch progress, and a clear partial-success error if a later file fails.
+- Preserved independent BambuBuddy queue/status tracking for every selected print.
+
 ## 0.7.47
 
 - Added a guided Windows installer and first-run setup wizard.

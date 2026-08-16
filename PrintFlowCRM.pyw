@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.47"
+VERSION = "0.7.48"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 
 
@@ -2415,11 +2415,11 @@ class App(tk.Tk):
         file_frame.grid(row=11,column=0,columnspan=4,sticky="nsew",pady=(5,5))
         file_frame.columnconfigure(0,weight=1)
         ttk.Label(file_frame,text="Print files",style="CardTitle.TLabel").grid(row=0,column=0,sticky="w",pady=(0,5))
-        file_help = ttk.Label(file_frame,text="One row per print file. PrintFlow-generated split/G-code helpers stay collapsed underneath it. Expand ▶ only when you need the details. Live status follows BambuBuddy automatically.",
+        file_help = ttk.Label(file_frame,text="One row per print file. Use Ctrl+click or Shift+click to select multiple files, then Queue Selected. PrintFlow-generated split/G-code helpers stay collapsed underneath each source. Live status follows BambuBuddy automatically.",
                               style="Card.TLabel", justify="left")
         file_help.grid(row=1,column=0,sticky="ew",pady=(0,7))
         file_frame.bind("<Configure>", lambda e, lbl=file_help: lbl.configure(wraplength=max(220, e.width-12)), add="+")
-        self.order_file_tree = ttk.Treeview(file_frame,columns=("status","type"),show="tree headings",height=5,selectmode="browse")
+        self.order_file_tree = ttk.Treeview(file_frame,columns=("status","type"),show="tree headings",height=5,selectmode="extended")
         self.order_file_tree.heading("#0",text="Print File"); self.order_file_tree.column("#0",width=390,anchor="w",stretch=True)
         self.order_file_tree.heading("status",text="Print Status"); self.order_file_tree.column("status",width=155,anchor="center",stretch=False)
         self.order_file_tree.heading("type",text="Type"); self.order_file_tree.column("type",width=115,anchor="w",stretch=False)
@@ -2432,7 +2432,7 @@ class App(tk.Tk):
             ttk.Button(fb,text="Open",command=lambda:self.open_selected_file(order_id)),
             ttk.Button(fb,text="Remove",style="Danger.TButton",command=lambda:self.remove_selected_file(order_id)),
             ttk.Button(fb,text="Set Complete / Reset",command=lambda:self.toggle_selected_file_printed(order_id)),
-            ttk.Button(fb,text="Print Selected",command=lambda:self.print_selected_attachment(order_id)),
+            ttk.Button(fb,text="Queue Selected",command=lambda:self.print_selected_attachments(order_id)),
         ]
         self._responsive_grid(fb, file_buttons, min_button_width=118)
         self.refresh_order_files(order_id)
@@ -3029,6 +3029,28 @@ class App(tk.Tk):
                     return row
         return None
 
+    def _selected_order_files(self, order_id):
+        tree = getattr(self, "order_file_tree", None)
+        if not tree or not tree.winfo_exists() or self.current_order_id != order_id:
+            return []
+        rows = []
+        seen = set()
+        for iid in tree.selection():
+            try:
+                # A generated helper underneath a source represents the same logical
+                # print. Queue the parent once even if both parent and helper are selected.
+                parent_iid = tree.parent(iid)
+                file_id = int(parent_iid or iid)
+            except (TypeError, ValueError):
+                continue
+            if file_id in seen:
+                continue
+            row = self.db.order_file(file_id)
+            if row and int(row["order_id"]) == int(order_id):
+                rows.append(row)
+                seen.add(file_id)
+        return rows
+
     def open_selected_file(self, order_id):
         f = self._selected_order_file(order_id)
         if not f:
@@ -3070,6 +3092,70 @@ class App(tk.Tk):
         if not f:
             messagebox.showwarning("Choose a file","Select the STL, 3MF, or sliced .gcode.3mf file you want to print.",parent=self); return
         self.print_order(order_id, f["id"])
+
+    def print_selected_attachments(self, order_id):
+        files = self._selected_order_files(order_id)
+        if not files:
+            messagebox.showwarning("Choose files", "Select one or more STL, 3MF, or sliced .gcode.3mf files first.", parent=self)
+            return
+        if len(files) == 1:
+            self.print_order(order_id, files[0]["id"])
+            return
+        names = [f["original_name"] or Path(f["stored_path"]).name for f in files]
+        preview = "\n".join(f"• {name}" for name in names[:8])
+        if len(names) > 8:
+            preview += f"\n• …and {len(names) - 8} more"
+        if not messagebox.askyesno(
+            "Queue multiple prints",
+            f"Queue these {len(files)} files for this customer in the order shown?\n\n{preview}",
+            parent=self,
+        ):
+            return
+        context = {
+            "order_id": int(order_id),
+            "pending": [int(f["id"]) for f in files],
+            "total": len(files),
+            "completed": 0,
+            "queued_names": [],
+        }
+        self._print_next_batch_item(context)
+
+    def _print_next_batch_item(self, context):
+        pending = context.get("pending") or []
+        if not pending:
+            self._finish_print_batch(context)
+            return
+        file_id = pending.pop(0)
+        position = int(context.get("completed", 0)) + 1
+        total = int(context.get("total", 1))
+        row = self.db.order_file(file_id)
+        name = (row["original_name"] or Path(row["stored_path"]).name) if row else f"file {position}"
+        context["current_name"] = name
+        self.status_flash(f"Queueing {position} of {total}: {name}")
+        started = self.print_order(int(context["order_id"]), file_id, batch_context=context)
+        if started is False:
+            # Validation/preflight already showed the specific reason. End the batch
+            # cleanly instead of leaving it waiting for a worker that never started.
+            self._close_busy()
+            if self.current_page == "orders":
+                self.show_orders(int(context["order_id"]))
+
+    def _finish_print_batch(self, context):
+        self._close_busy()
+        total = int(context.get("total", 0))
+        completed = int(context.get("completed", 0))
+        names = context.get("queued_names") or []
+        listing = "\n".join(f"• {name}" for name in names)
+        messagebox.showinfo(
+            "Prints queued",
+            f"Successfully queued {completed} of {total} selected prints for this customer."
+            + (f"\n\n{listing}" if listing else ""),
+            parent=self,
+        )
+        if self.current_page == "orders":
+            self.show_orders(int(context["order_id"]))
+        elif self.current_page == "queue":
+            self.show_queue(compact=self.compact)
 
     def _client(self):
         return BambuBuddyClient(self.db.get_setting("bambuddy_url","http://bambuddy:8001"), self.db.get_setting("bambuddy_api_key",""))
@@ -4852,13 +4938,13 @@ class App(tk.Tk):
             )
             return False
 
-    def print_order(self, order_id, attachment_id=None):
+    def print_order(self, order_id, attachment_id=None, batch_context=None):
         # Make sure material/color/quantity edits typed immediately before Print are in SQLite.
         if self.current_order_id == order_id:
             self.flush_order_autosave()
         row = self.db.order(order_id)
         if not row:
-            return
+            return False
 
         attachment = self.db.order_file(attachment_id) if attachment_id else self._selected_order_file(order_id)
         if attachment and attachment["order_id"] != order_id:
@@ -4870,27 +4956,27 @@ class App(tk.Tk):
             if len(printable) == 1:
                 attachment = printable[0]
             elif len(printable) > 1:
-                messagebox.showwarning("Choose print file","This order has more than one print-ready file. Select the one you want, then click Print Selected.",parent=self); return
+                messagebox.showwarning("Choose print file","This order has more than one print-ready file. Select the files you want, then click Queue Selected.",parent=self); return False
             elif len(sources) == 1:
                 attachment = sources[0]
             elif len(sources) > 1:
-                messagebox.showwarning("Choose source file","This order has more than one STL/3MF source file. Select the one you want, then click Print Selected.",parent=self); return
+                messagebox.showwarning("Choose source file","This order has more than one STL/3MF source file. Select the files you want, then click Queue Selected.",parent=self); return False
 
         if not attachment:
-            messagebox.showerror("No print file","Add an STL, 3MF, or sliced .gcode.3mf file first.",parent=self); return
+            messagebox.showerror("No print file","Add an STL, 3MF, or sliced .gcode.3mf file first.",parent=self); return False
         p = Path(attachment["stored_path"] or "")
         if not p.exists():
-            messagebox.showerror("Missing print file",f"The selected file cannot be found:\n{p}",parent=self); return
+            messagebox.showerror("Missing print file",f"The selected file cannot be found:\n{p}",parent=self); return False
         display_name = attachment["original_name"] or p.name
         lower = display_name.lower()
         is_sliced = lower.endswith(".gcode.3mf") or p.name.lower().endswith(".gcode.3mf")
         is_source = lower.endswith(".stl") or (lower.endswith(".3mf") and not lower.endswith(".gcode.3mf"))
         if not (is_sliced or is_source):
-            messagebox.showinfo("Unsupported print file","Print Selected supports STL, unsliced 3MF, and sliced .gcode.3mf files.",parent=self); return
+            messagebox.showinfo("Unsupported print file","Queue Selected supports STL, unsliced 3MF, and sliced .gcode.3mf files.",parent=self); return False
 
         printer_id = self.db.get_setting("bambuddy_printer_id","")
         if not printer_id:
-            messagebox.showwarning("Choose a printer","Open Settings, connect to BambuBuddy, and choose the default printer.",parent=self); return
+            messagebox.showwarning("Choose a printer","Open Settings, connect to BambuBuddy, and choose the default printer.",parent=self); return False
 
         split_attachments = None
         if is_source and lower.endswith(".stl"):
@@ -4898,14 +4984,14 @@ class App(tk.Tk):
             # fit detection, so rotating a model can avoid an unnecessary split.
             prepared = self._prepare_preflight_attachment(order_id, attachment, p, display_name)
             if prepared is False:
-                return
+                return False
             attachment = prepared
             p = Path(attachment["stored_path"] or "")
             display_name = attachment["original_name"] or p.name
             lower = display_name.lower()
             split_result = self._oversize_stl_action(order_id, attachment, p)
             if split_result is False:
-                return
+                return False
             if isinstance(split_result, list):
                 split_attachments = split_result
 
@@ -4947,7 +5033,11 @@ class App(tk.Tk):
                         self.db.set_order_file_bambuddy_id(active_attachment["id"], file_id)
                     # Preserve part order. Rush inserts only the first part at the top; subsequent parts append
                     # normally so Part 2 cannot leapfrog Part 1.
-                    insert_top = (row["priority"] == "Rush" and source_index == 0)
+                    insert_top = (
+                        row["priority"] == "Rush"
+                        and source_index == 0
+                        and (batch_context is None or int(batch_context.get("completed", 0)) == 0)
+                    )
                     try:
                         result = client.queue_print(int(file_id), int(printer_id), quantity=int(row["quantity"] or 1), insert_at_top=insert_top)
                     except Exception as exc:
@@ -4981,17 +5071,18 @@ class App(tk.Tk):
                 with self.db.connect() as c:
                     c.execute("UPDATE orders SET status='Queued', updated_at=? WHERE id=?",(datetime.now().isoformat(timespec="seconds"),order_id))
                 if split_attachments:
-                    self.after(0, lambda: self._split_print_success(order_id, busy, generated_names, last_slice_info))
+                    self.after(0, lambda: self._split_print_success(order_id, busy, generated_names, last_slice_info, batch_context=batch_context))
                 else:
                     active_attachment_name = generated_names[-1] if generated_names else display_name
                     result = results[-1] if results else {}
-                    self.after(0,lambda:self._print_success(order_id,result,busy=busy,sliced=is_source,slice_info=last_slice_info,generated_file=active_attachment_name))
+                    self.after(0,lambda:self._print_success(order_id,result,busy=busy,sliced=is_source,slice_info=last_slice_info,generated_file=active_attachment_name,batch_context=batch_context))
             except Exception as e:
                 msg = str(e)
                 if "slicer" in msg.lower() and ("unavailable" in msg.lower() or "not configured" in msg.lower() or "no presets" in msg.lower()):
                     msg += "\n\nIn BambuBuddy, open Settings → Slicer and enable/configure the Slicer API sidecar, then retry."
-                self.after(0,lambda:self._print_error(msg))
+                self.after(0,lambda error_msg=msg:self._print_error(error_msg, batch_context=batch_context))
         threading.Thread(target=work,daemon=True).start()
+        return True
 
     def busy_popup(self,text):
         # Reuse the app's single progress window and keep a reference to the label
@@ -5059,8 +5150,13 @@ class App(tk.Tk):
             self.db.set_setting(f"slicer_saved_process_{key}", name)
             self.status_flash(f"Saved {name} for {key}")
 
-    def _print_success(self, order_id, result, busy=None, sliced=False, slice_info=None, generated_file=None):
+    def _print_success(self, order_id, result, busy=None, sliced=False, slice_info=None, generated_file=None, batch_context=None):
         self._close_busy()
+        if batch_context is not None:
+            batch_context["completed"] = int(batch_context.get("completed", 0)) + 1
+            batch_context.setdefault("queued_names", []).append(batch_context.get("current_name") or generated_file or "Print file")
+            self.after(100, lambda: self._print_next_batch_item(batch_context))
+            return
         if busy is True:
             queue_text = "The printer is already printing, so this job was added to the BambuBuddy queue."
         elif busy is False:
@@ -5084,8 +5180,13 @@ class App(tk.Tk):
         if self.current_page=="orders": self.show_orders(order_id)
         elif self.current_page=="queue": self.show_queue(compact=self.compact)
 
-    def _split_print_success(self, order_id, busy, generated_names, slice_info=None):
+    def _split_print_success(self, order_id, busy, generated_names, slice_info=None, batch_context=None):
         self._close_busy()
+        if batch_context is not None:
+            batch_context["completed"] = int(batch_context.get("completed", 0)) + 1
+            batch_context.setdefault("queued_names", []).append(batch_context.get("current_name") or "Split print")
+            self.after(100, lambda: self._print_next_batch_item(batch_context))
+            return
         state = "The printer is already printing, so both split parts were added behind the current job." if busy else "The printer is idle, so Part 1 is next and Part 2 is queued behind it."
         files = "\n".join(f"• {name}" for name in generated_names)
         extra = f"\n\nAuto Split completed. Both halves were sliced and queued in order:\n{files}"
@@ -5102,8 +5203,21 @@ class App(tk.Tk):
         if self.current_page == "orders": self.show_orders(order_id)
         elif self.current_page == "queue": self.show_queue(compact=self.compact)
 
-    def _print_error(self, msg):
-        self._close_busy(); messagebox.showerror("BambuBuddy error",msg,parent=self)
+    def _print_error(self, msg, batch_context=None):
+        self._close_busy()
+        if batch_context is not None:
+            completed = int(batch_context.get("completed", 0))
+            total = int(batch_context.get("total", 0))
+            current = batch_context.get("current_name") or "the current file"
+            messagebox.showerror(
+                "Batch queue stopped",
+                f"Queued {completed} of {total} selected prints, then stopped at {current}.\n\n{msg}",
+                parent=self,
+            )
+            if self.current_page == "orders":
+                self.show_orders(int(batch_context["order_id"]))
+            return
+        messagebox.showerror("BambuBuddy error",msg,parent=self)
 
     def _shipping_stl_parts(self, order_id):
         """Return the final physical STL parts for package sizing.
