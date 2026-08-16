@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.54
+
+- Changed No on the unpaid-order Messenger prompt to bypass the reminder and continue preparing the shipping label.
+- Clarified in the prompt that Yes sends the reminder while No proceeds with the unpaid balance still due.
+
 ## 0.7.53
 
 - Added a Settings feedback form for bug reports, fix requests, and ideas, prefilled with the running PrintFlow version and sent directly to the public project issue tracker.

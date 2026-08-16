@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.53"
+VERSION = "0.7.54"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -6138,6 +6138,7 @@ class App(tk.Tk):
         total = max(0.0, float(row["total_price"] or 0))
         paid = max(0.0, float(row["amount_paid"] or 0))
         balance = max(0.0, total - paid)
+        shipping_payment_text = "Paid in Full" if balance <= 0.005 else f"Payment bypassed • {self.money(balance)} still due"
         if balance > 0.005:
             buyer = (row["buyer_name"] or "the buyer").strip()
             first_name = buyer.split()[0] if buyer.split() else buyer
@@ -6145,35 +6146,37 @@ class App(tk.Tk):
                 f"Hi {first_name}, your remaining balance of {self.money(balance)} needs to be paid in full "
                 "before I can ship your order. Thank you!"
             )
-            if not messagebox.askyesno(
+            send_reminder = messagebox.askyesno(
                 "Payment required before shipping",
                 f"This order still has a balance of {self.money(balance)}.\n\n"
                 f"PrintFlow will open Marketplace Messenger. Click {first_name}'s conversation and the reminder below "
-                f"will be sent automatically:\n\n{message}\n\nOpen Messenger and arm this reminder?",
+                f"will be sent automatically:\n\n{message}\n\n"
+                "Choose Yes to send the reminder. Choose No to bypass it and continue to the shipping label.",
                 parent=self,
-            ):
+            )
+            if send_reminder:
+                request = {
+                    "request_id": uuid.uuid4().hex,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "order_id": int(order_id),
+                    "order_no": row["order_no"],
+                    "buyer_name": buyer,
+                    "buyer_first_name": first_name,
+                    "balance": round(balance, 2),
+                    "message": message,
+                    "status": "armed",
+                }
+                try:
+                    tmp = Path(tempfile.gettempdir()) / f"printflow-payment-{os.getpid()}.json"
+                    tmp.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+                    tmp.replace(MESSENGER_PAYMENT_REQUEST_FILE)
+                except Exception as exc:
+                    messagebox.showerror("Payment reminder", f"Could not prepare the Messenger reminder.\n\n{exc}", parent=self)
+                    return
+                self.open_messenger_capture_browser()
+                self.status_flash(f"Payment reminder armed for {first_name} • {self.money(balance)} due")
                 return
-            request = {
-                "request_id": uuid.uuid4().hex,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "order_id": int(order_id),
-                "order_no": row["order_no"],
-                "buyer_name": buyer,
-                "buyer_first_name": first_name,
-                "balance": round(balance, 2),
-                "message": message,
-                "status": "armed",
-            }
-            try:
-                tmp = Path(tempfile.gettempdir()) / f"printflow-payment-{os.getpid()}.json"
-                tmp.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
-                tmp.replace(MESSENGER_PAYMENT_REQUEST_FILE)
-            except Exception as exc:
-                messagebox.showerror("Payment reminder", f"Could not prepare the Messenger reminder.\n\n{exc}", parent=self)
-                return
-            self.open_messenger_capture_browser()
-            self.status_flash(f"Payment reminder armed for {first_name} • {self.money(balance)} due")
-            return
+            self.status_flash(f"Payment reminder bypassed • {self.money(balance)} still due")
         try:
             row = self._ensure_package_dimensions_for_pirateship(order_id) or row
             path = self._write_pirateship_csv(row)
@@ -6188,11 +6191,11 @@ class App(tk.Tk):
             pass
         webbrowser.open("https://ship.pirateship.com/")
         self.db.set_order_status(order_id, "Packed")
-        self.status_flash("Paid in full • package marked Packed • shipping label ready")
+        self.status_flash(f"{shipping_payment_text} • package marked Packed • shipping label ready")
         if self.current_page == "orders":
             self.show_orders(order_id)
         messagebox.showinfo("Ready to ship",
-                            f"{row['order_no']} is Paid in Full and is now marked Packed.\n\nPirate Ship has been opened and the CSV is ready here:\n{path}",
+                            f"{row['order_no']} is now marked Packed.\n{shipping_payment_text}.\n\nPirate Ship has been opened and the CSV is ready here:\n{path}",
                             parent=self)
 
     def export_pirateship(self, order_id):
