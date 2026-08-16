@@ -1,0 +1,10 @@
+# PrintFlow CRM runtime/optional integrations
+# Install all dependencies for a contributor/development environment with:
+#   py -m pip install -r requirements.txt
+
+pywebview==6.2.1
+numpy>=2.0
+trimesh>=4.0
+shapely>=2.0
+scipy>=1.14
+networkx>=3.0

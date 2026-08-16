@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local PrintFlow data - never commit customer data or credentials
+printflow.db
+*.db
+*.sqlite
+*.sqlite3
+attachments/
+exports/
+backups/
+thumbnails/
+updates/
+ai_usage.jsonl
+settings.json
+
+# Build / release output
+dist/
+build/
+*.zip
+*.tar.gz
