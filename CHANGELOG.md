@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.51
+
+- Changed Marketplace payment-reminder matching and greetings to use the customer's first name only.
+- Fixed new payment reminders replacing a stale reminder panel in an already-open Messenger window.
+- Fixed reopening the in-app Messenger browser when a closed WebView leaves a short-lived stale single-instance mutex.
+- Kept mismatched-conversation protection while allowing the correct first-name-only Marketplace conversation.
+
 ## 0.7.50
 
 - Prevented Prepare Shipping Label from falsely marking unpaid orders as Paid in Full.

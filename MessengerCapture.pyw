@@ -35,12 +35,12 @@ def focus_existing_window():
     try:
         user32 = ctypes.windll.user32
         hwnd = user32.FindWindowW(None, WINDOW_TITLE)
-        if not hwnd:
+        if not hwnd or not user32.IsWindow(hwnd):
             return False
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
-        return True
+        return bool(user32.IsWindowVisible(hwnd))
     except Exception:
         return False
 
@@ -53,8 +53,12 @@ def enforce_single_instance():
         _MUTEX_HANDLE = kernel32.CreateMutexW(None, False, "Local\\PrintFlowCRM_MessengerBrowser")
         # ERROR_ALREADY_EXISTS = 183
         if kernel32.GetLastError() == 183:
-            focus_existing_window()
-            return False
+            # Only yield to the prior process when it still owns a real visible
+            # browser window. A WebView process can briefly survive after its window
+            # is closed; that stale mutex must not block reopening Messenger.
+            if focus_existing_window():
+                return False
+            return True
     except Exception:
         pass
     return True
@@ -121,7 +125,14 @@ INJECT = r'''
 
   const existingCapture = document.getElementById('printflow-capture-chat');
   const pendingPayment = window.__PRINTFLOW_PAYMENT_REQUEST__;
-  if (existingCapture && (!pendingPayment || document.getElementById('printflow-payment-reminder'))) return;
+  const existingPaymentPanel = document.getElementById('printflow-payment-reminder');
+  const panelRequestId = existingPaymentPanel ? existingPaymentPanel.dataset.requestId : '';
+  const incomingRequestId = pendingPayment ? String(pendingPayment.request_id || '') : '';
+  if (existingPaymentPanel && incomingRequestId && panelRequestId !== incomingRequestId) {
+    existingPaymentPanel.remove();
+  }
+  const currentPaymentPanel = document.getElementById('printflow-payment-reminder');
+  if (existingCapture && (!pendingPayment || (currentPaymentPanel && currentPaymentPanel.dataset.requestId === incomingRequestId))) return;
   // A newly armed reminder may arrive while this single browser window is
   // already open. Recreate only the capture button so the payment panel can
   // be injected without opening a second Messenger window.
@@ -251,19 +262,20 @@ INJECT = r'''
   if (payment && payment.status === 'armed' && !document.getElementById('printflow-payment-reminder')) {
     const panel = document.createElement('div');
     panel.id = 'printflow-payment-reminder';
+    panel.dataset.requestId = String(payment.request_id || '');
     Object.assign(panel.style, {
       position:'fixed', top:'66px', right:'16px', zIndex:'2147483647', width:'360px',
       background:'#111827', color:'#fff', border:'2px solid #f59e0b', borderRadius:'10px',
       padding:'12px 14px', font:'14px Segoe UI,Arial,sans-serif', boxShadow:'0 8px 26px rgba(0,0,0,.45)'
     });
     panel.innerHTML = `<div style="font-weight:700;color:#fbbf24;margin-bottom:6px">Payment reminder armed</div>
-      <div>Click <b>${String(payment.buyer_name || 'the buyer')}</b> in the conversation list.</div>
+      <div>Click <b>${String(payment.buyer_first_name || payment.buyer_name || 'the buyer')}</b> in the conversation list.</div>
       <div style="font-size:12px;color:#cbd5e1;margin-top:7px">${String(payment.message || '')}</div>
       <div id="printflow-payment-status" style="font-size:12px;color:#93c5fd;margin-top:8px">Waiting for the matching conversation…</div>`;
     document.documentElement.appendChild(panel);
 
     const normalize = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-    const expected = normalize(payment.buyer_name);
+    const expected = normalize(payment.buyer_first_name || payment.buyer_name).split(' ')[0] || '';
     let sending = false;
 
     const setStatus = (text, color='#93c5fd') => {
@@ -316,12 +328,11 @@ INJECT = r'''
         if(r && candidate && candidate.length<500) text += ' ' + candidate;
       }
       const clicked=normalize(text);
-      const words=expected.split(' ').filter(x=>x.length>1);
-      if (!expected || !words.every(word=>clicked.includes(word))) {
-        setStatus(`That does not look like ${payment.buyer_name}. Reminder not sent.`, '#fca5a5');
+      if (!expected || !clicked.split(' ').includes(expected)) {
+        setStatus(`That does not look like ${payment.buyer_first_name || payment.buyer_name}. Reminder not sent.`, '#fca5a5');
         return;
       }
-      setStatus(`Matched ${payment.buyer_name}. Sending…`);
+      setStatus(`Matched ${payment.buyer_first_name || payment.buyer_name}. Sending…`);
       fillAndSend();
     }, true);
   }

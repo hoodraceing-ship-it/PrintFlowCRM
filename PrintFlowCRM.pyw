@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.50"
+VERSION = "0.7.51"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 BUILD_PLATE_TYPES = (
     "Textured PEI Plate",
@@ -1887,13 +1887,13 @@ class App(tk.Tk):
             user32 = ctypes.windll.user32
             title = "PrintFlow CRM — Marketplace Messenger"
             hwnd = user32.FindWindowW(None, title)
-            if not hwnd:
+            if not hwnd or not user32.IsWindow(hwnd):
                 return False
             # SW_RESTORE handles a minimized Messenger window.
             user32.ShowWindow(hwnd, 9)
             user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
-            return True
+            return bool(user32.IsWindowVisible(hwnd))
         except Exception:
             return False
 
@@ -5924,14 +5924,15 @@ class App(tk.Tk):
         balance = max(0.0, total - paid)
         if balance > 0.005:
             buyer = (row["buyer_name"] or "the buyer").strip()
+            first_name = buyer.split()[0] if buyer.split() else buyer
             message = (
-                f"Hi {buyer}, your remaining balance of {self.money(balance)} needs to be paid in full "
+                f"Hi {first_name}, your remaining balance of {self.money(balance)} needs to be paid in full "
                 "before I can ship your order. Thank you!"
             )
             if not messagebox.askyesno(
                 "Payment required before shipping",
                 f"This order still has a balance of {self.money(balance)}.\n\n"
-                f"PrintFlow will open Marketplace Messenger. Click {buyer}'s conversation and the reminder below "
+                f"PrintFlow will open Marketplace Messenger. Click {first_name}'s conversation and the reminder below "
                 f"will be sent automatically:\n\n{message}\n\nOpen Messenger and arm this reminder?",
                 parent=self,
             ):
@@ -5942,6 +5943,7 @@ class App(tk.Tk):
                 "order_id": int(order_id),
                 "order_no": row["order_no"],
                 "buyer_name": buyer,
+                "buyer_first_name": first_name,
                 "balance": round(balance, 2),
                 "message": message,
                 "status": "armed",
@@ -5954,7 +5956,7 @@ class App(tk.Tk):
                 messagebox.showerror("Payment reminder", f"Could not prepare the Messenger reminder.\n\n{exc}", parent=self)
                 return
             self.open_messenger_capture_browser()
-            self.status_flash(f"Payment reminder armed for {buyer} • {self.money(balance)} due")
+            self.status_flash(f"Payment reminder armed for {first_name} • {self.money(balance)} due")
             return
         try:
             row = self._ensure_package_dimensions_for_pirateship(order_id) or row
