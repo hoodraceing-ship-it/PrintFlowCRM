@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.59
+
+- Added Capture from Pirate Ship to every PrintFlow order for existing labels and manual recovery.
+- Added a persistent floating PrintFlow Shipment Capture panel inside the Pirate Ship browser.
+- Added a Capture This Shipment button with explicit target customer/order information.
+- Added visible Waiting, customer mismatch, ZIP mismatch, missing tracking number, save failure, and green Captured tracking-number states.
+- Kept automatic capture enabled while allowing a safe manual retry of the current shipment page.
+
 ## 0.7.58
 
 - Opened Pirate Ship in a dedicated in-app WebView2 browser with its own persistent login session instead of the normal browser.

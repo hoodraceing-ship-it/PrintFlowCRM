@@ -73,6 +73,19 @@ INJECT=r'''
   if (window.__PRINTFLOW_PS_SCANNER__) return;
   window.__PRINTFLOW_PS_SCANNER__ = true;
 
+  const panel=document.createElement('div');
+  panel.id='printflow-pirateship-scanner';
+  Object.assign(panel.style,{position:'fixed',top:'14px',right:'16px',zIndex:'2147483647',width:'320px',
+    background:'#111827',color:'#fff',border:'2px solid #38bdf8',borderRadius:'10px',padding:'12px 14px',
+    font:'14px Segoe UI,Arial,sans-serif',boxShadow:'0 8px 26px rgba(0,0,0,.42)'});
+  panel.innerHTML='<div style="font-weight:700;color:#7dd3fc">PrintFlow Shipment Capture</div>'+
+    '<div id="printflow-ps-target" style="font-size:12px;color:#cbd5e1;margin-top:5px">Waiting for an armed PrintFlow order…</div>'+
+    '<button id="printflow-ps-capture" style="margin-top:9px;width:100%;background:#2563eb;color:white;border:0;border-radius:7px;padding:9px;font-weight:700;cursor:pointer">Capture This Shipment</button>'+
+    '<div id="printflow-ps-status" style="font-size:12px;color:#93c5fd;margin-top:8px">Automatic scanning is active.</div>';
+  document.documentElement.appendChild(panel);
+  const setStatus=(text,color='#93c5fd')=>{const el=document.getElementById('printflow-ps-status');if(el){el.textContent=text;el.style.color=color;}};
+  const updateTarget=()=>{const el=document.getElementById('printflow-ps-target'),r=window.__PRINTFLOW_PS_REQUEST__;if(el)el.textContent=r?`Target: ${r.buyer_name} • ${r.order_no}`:'Waiting for an armed PrintFlow order…';};
+
   const normalize = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
   const visible = el => {
     if (!el || !el.getBoundingClientRect) return false;
@@ -116,24 +129,30 @@ INJECT=r'''
     return '';
   };
   let lastPayload='';
-  const scan = async () => {
+  const scan = async (manual=false) => {
     const request=window.__PRINTFLOW_PS_REQUEST__;
-    if(!request || !document.body) return;
+    updateTarget();
+    if(!request || !document.body) { if(manual)setStatus('Open this shipment from a PrintFlow order first.','#fca5a5'); return; }
     const body=normalize(document.body.innerText||'');
     const buyer=normalize(request.buyer_name||'');
     const postal=normalize(request.postal_code||'');
     const buyerParts=buyer.split(' ').filter(x=>x.length>1);
-    if(buyerParts.length && !buyerParts.every(x=>body.includes(x))) return;
-    if(postal && !body.includes(postal.split(' ')[0])) return;
+    if(buyerParts.length && !buyerParts.every(x=>body.includes(x))) { if(manual)setStatus(`This page does not match ${request.buyer_name}. Nothing captured.`,'#fca5a5'); return; }
+    if(postal && !body.includes(postal.split(' ')[0])) { if(manual)setStatus('The shipment ZIP does not match the armed order. Nothing captured.','#fca5a5'); return; }
     const tracking=trackingNumber();
-    if(!tracking) return;
+    if(!tracking) { if(manual)setStatus('No purchased-label tracking number found on this page yet.','#fbbf24'); return; }
     const payload={request_id:request.request_id,order_id:request.order_id,order_no:request.order_no,
       buyer_name:request.buyer_name,tracking_no:tracking,pirateship_status:stage(),url:location.href};
     const encoded=JSON.stringify(payload);
-    if(encoded===lastPayload) return;
+    if(encoded===lastPayload && !manual) return;
     lastPayload=encoded;
-    try { await window.pywebview.api.shipment_found(payload); } catch(_) {}
+    try {
+      const saved=await window.pywebview.api.shipment_found(payload);
+      if(saved)setStatus(`Captured ${tracking} ✓`,'#86efac');
+      else setStatus('PrintFlow could not save this shipment. Try again.','#fca5a5');
+    } catch(_) { setStatus('PrintFlow could not save this shipment. Try again.','#fca5a5'); }
   };
+  document.getElementById('printflow-ps-capture').onclick=()=>scan(true);
   setInterval(scan,2500);
   scan();
 })();
