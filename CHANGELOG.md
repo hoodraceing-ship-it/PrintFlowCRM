@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.58
+
+- Opened Pirate Ship in a dedicated in-app WebView2 browser with its own persistent login session instead of the normal browser.
+- Added a Pirate Ship shipment-page scanner that matches the active PrintFlow buyer and postal code before accepting shipment data.
+- Captured UPS, USPS, and FedEx tracking numbers directly from the purchased-label shipment page and saved them to the matching order.
+- Read Pirate Ship's active progress step and mapped label purchase/Ready to Ship to Packed, In Transit to Shipped, and Delivered to Delivered.
+- Delayed the Packed transition until Pirate Ship exposes the purchased label and tracking number instead of marking the order Packed merely because Pirate Ship opened.
+- Added a safe normal-browser fallback when the integrated browser component is unavailable.
+- Documented that Pirate Ship does not provide a public API; the isolated page scanner is the supported-in-app workaround.
+
 ## 0.7.57
 
 - Added a built-in Public Carrier Pages provider that requires no API key, signup, subscription, or business email.

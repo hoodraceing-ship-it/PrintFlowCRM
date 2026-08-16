@@ -19,7 +19,7 @@ jobs:
       - name: Compile Python sources
         shell: pwsh
         run: |
-          python -m py_compile PrintFlowCRM.pyw MessengerCapture.pyw SetupWizard.pyw
+          python -m py_compile PrintFlowCRM.pyw MessengerCapture.pyw PirateShipCapture.pyw SetupWizard.pyw
       - name: Validate update manifest
         shell: pwsh
         run: |

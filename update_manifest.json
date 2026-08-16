@@ -1,9 +1,10 @@
 {
   "product": "PrintFlow CRM",
-  "version": "0.7.57",
+  "version": "0.7.58",
   "app_files": [
     "PrintFlowCRM.pyw",
     "MessengerCapture.pyw",
+    "PirateShipCapture.pyw",
     "SetupWizard.pyw",
     "update_manifest.json",
     "requirements.txt"

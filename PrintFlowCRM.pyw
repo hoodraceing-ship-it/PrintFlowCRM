@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.57"
+VERSION = "0.7.58"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -119,6 +119,8 @@ THUMB_CACHE_DIR = DATA_DIR / "thumb_cache"
 APP_DIR = DATA_DIR / "App"
 MESSENGER_CAPTURE_FILE = DATA_DIR / "messenger_capture.json"
 MESSENGER_PAYMENT_REQUEST_FILE = DATA_DIR / "messenger_payment_request.json"
+PIRATESHIP_SCAN_REQUEST_FILE = DATA_DIR / "pirateship_scan_request.json"
+PIRATESHIP_SCAN_RESULT_FILE = DATA_DIR / "pirateship_scan_result.json"
 PYTHON_PACKAGES_DIR = DATA_DIR / "python_packages"
 PYTHON_PACKAGES_STAGING_DIR = DATA_DIR / "python_packages_staging"
 PYTHON_PACKAGES_BACKUP_DIR = DATA_DIR / "python_packages_previous"
@@ -1464,9 +1466,15 @@ class App(tk.Tk):
         self._model_photos = []
         self._model_search_generation = 0
         self._messenger_capture_seen = ""
+        self._pirateship_result_seen = ""
         try:
             if MESSENGER_CAPTURE_FILE.exists():
                 self._messenger_capture_seen = json.loads(MESSENGER_CAPTURE_FILE.read_text(encoding="utf-8")).get("captured_at", "")
+        except Exception:
+            pass
+        try:
+            if PIRATESHIP_SCAN_RESULT_FILE.exists():
+                self._pirateship_result_seen=json.loads(PIRATESHIP_SCAN_RESULT_FILE.read_text(encoding="utf-8")).get("captured_at","")
         except Exception:
             pass
         self._configure_styles()
@@ -1484,6 +1492,7 @@ class App(tk.Tk):
         # Keep file-level queue/printing/completion states synchronized with BambuBuddy.
         self.after(1800, self._schedule_print_status_sync)
         self.after(5000, self._schedule_tracking_status_sync)
+        self.after(2200, self._poll_pirateship_scan_result)
         # v0.7.45 beta: optionally check a configured GitHub Releases feed after the UI is usable.
         # Manual update installation remains available at all times as the rollback path.
         self.after(2600, self._schedule_update_check)
@@ -2035,6 +2044,71 @@ class App(tk.Tk):
             self.status_flash("Messenger Browser opened")
         except Exception as e:
             messagebox.showerror("Messenger Browser", str(e), parent=self)
+
+    def _focus_existing_pirateship_window(self):
+        if os.name!="nt": return False
+        try:
+            hwnd=ctypes.windll.user32.FindWindowW(None,"PrintFlow CRM — Pirate Ship")
+            if not hwnd: return False
+            ctypes.windll.user32.ShowWindow(hwnd,9)
+            ctypes.windll.user32.BringWindowToTop(hwnd)
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            return True
+        except Exception:
+            return False
+
+    def open_pirateship_browser(self, order_id=None):
+        if order_id:
+            row=self.db.order(order_id)
+            if row:
+                request={"request_id":uuid.uuid4().hex,"order_id":int(order_id),"order_no":row["order_no"],
+                         "buyer_name":row["buyer_name"] or "","postal_code":row["postal_code"] or ""}
+                try:
+                    tmp=Path(tempfile.gettempdir())/f"printflow-pirateship-request-{os.getpid()}.json"
+                    tmp.write_text(json.dumps(request,ensure_ascii=False),encoding="utf-8")
+                    tmp.replace(PIRATESHIP_SCAN_REQUEST_FILE)
+                except Exception as exc:
+                    messagebox.showerror("Pirate Ship",f"Could not prepare the shipment scanner.\n\n{exc}",parent=self); return
+        if self._focus_existing_pirateship_window():
+            self.status_flash("Pirate Ship brought to foreground")
+            return
+        helper=Path(sys.argv[0]).resolve().parent/"PirateShipCapture.pyw"
+        if os.name!="nt" or not helper.exists() or not self._pywebview_available():
+            webbrowser.open("https://ship.pirateship.com/")
+            messagebox.showwarning("Pirate Ship browser","The integrated Pirate Ship browser component is unavailable. Pirate Ship opened normally; reinstall the latest PrintFlow package if PirateShipCapture.pyw is missing.",parent=self)
+            return
+        try:
+            creationflags=0x08000000 if os.name=="nt" else 0
+            subprocess.Popen([sys.executable,str(helper)],cwd=str(helper.parent),creationflags=creationflags)
+            self.status_flash("Pirate Ship opened inside PrintFlow")
+        except Exception as exc:
+            messagebox.showerror("Pirate Ship",str(exc),parent=self)
+
+    def _poll_pirateship_scan_result(self):
+        try:
+            if PIRATESHIP_SCAN_RESULT_FILE.exists():
+                data=json.loads(PIRATESHIP_SCAN_RESULT_FILE.read_text(encoding="utf-8"))
+                stamp=data.get("captured_at","")
+                if stamp and stamp!=self._pirateship_result_seen:
+                    self._pirateship_result_seen=stamp
+                    order_id=int(data.get("order_id") or 0)
+                    row=self.db.order(order_id)
+                    tracking=(data.get("tracking_no") or "").strip()
+                    saved_buyer=re.sub(r"[^a-z0-9]+"," ",str(row["buyer_name"] if row else "").lower()).strip()
+                    scanned_buyer=re.sub(r"[^a-z0-9]+"," ",str(data.get("buyer_name") or "").lower()).strip()
+                    if row and tracking and saved_buyer==scanned_buyer:
+                        stage=(data.get("pirateship_status") or "").strip().lower()
+                        new_status="Delivered" if stage=="delivered" else ("Shipped" if stage=="in transit" else "Packed")
+                        with self.db.connect() as c:
+                            c.execute("UPDATE orders SET tracking_no=?, status=?, tracking_last_status=?, tracking_checked_at=?, updated_at=? WHERE id=?",
+                                      (tracking,new_status,"Pirate Ship: "+(data.get("pirateship_status") or "Label purchased"),stamp,stamp,order_id))
+                        self.status_flash(f"Pirate Ship synced • {tracking} • {new_status}")
+                        if self.current_page=="orders": self.show_orders(order_id)
+        except Exception:
+            pass
+        finally:
+            try:self.after(2500,self._poll_pirateship_scan_result)
+            except Exception:pass
 
     def show_marketplace(self):
         self.current_page = "marketplace"
@@ -6329,13 +6403,12 @@ class App(tk.Tk):
                 subprocess.Popen(["explorer", "/select,", str(path)])
         except Exception:
             pass
-        webbrowser.open("https://ship.pirateship.com/")
-        self.db.set_order_status(order_id, "Packed")
-        self.status_flash(f"{shipping_payment_text} • package marked Packed • shipping label ready")
+        self.open_pirateship_browser(order_id)
+        self.status_flash(f"{shipping_payment_text} • Pirate Ship ready • waiting for purchased label")
         if self.current_page == "orders":
             self.show_orders(order_id)
         messagebox.showinfo("Ready to ship",
-                            f"{row['order_no']} is now marked Packed.\n{shipping_payment_text}.\n\nPirate Ship has been opened and the CSV is ready here:\n{path}",
+                            f"{shipping_payment_text}.\n\nPirate Ship has been opened inside PrintFlow and the CSV is ready here:\n{path}\n\nAfter you purchase the label and open its shipment page, PrintFlow will capture the tracking number and mark the order Packed.",
                             parent=self)
 
     def export_pirateship(self, order_id):

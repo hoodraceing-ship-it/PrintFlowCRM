@@ -6,6 +6,7 @@ on:
     paths:
       - 'PrintFlowCRM.pyw'
       - 'MessengerCapture.pyw'
+      - 'PirateShipCapture.pyw'
       - 'SetupWizard.pyw'
       - 'requirements.txt'
       - 'update_manifest.json'
@@ -33,7 +34,7 @@ jobs:
       - name: Validate sources
         shell: pwsh
         run: |
-          python -m py_compile PrintFlowCRM.pyw MessengerCapture.pyw SetupWizard.pyw
+          python -m py_compile PrintFlowCRM.pyw MessengerCapture.pyw PirateShipCapture.pyw SetupWizard.pyw
           $m = Get-Content update_manifest.json -Raw | ConvertFrom-Json
           foreach ($file in $m.app_files) {
             if (-not (Test-Path $file)) { throw "Manifest file missing: $file" }
@@ -75,6 +76,7 @@ jobs:
           $files = @(
             'PrintFlowCRM.pyw',
             'MessengerCapture.pyw',
+            'PirateShipCapture.pyw',
             'SetupWizard.pyw',
             'requirements.txt',
             'update_manifest.json',
