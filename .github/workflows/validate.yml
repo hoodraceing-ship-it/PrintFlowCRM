@@ -1,0 +1,30 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compile Python sources
+        shell: pwsh
+        run: |
+          python -m py_compile PrintFlowCRM.pyw MessengerCapture.pyw SetupWizard.pyw
+      - name: Validate update manifest
+        shell: pwsh
+        run: |
+          $m = Get-Content update_manifest.json -Raw | ConvertFrom-Json
+          if ($m.product -ne 'PrintFlow CRM') { throw 'Unexpected product in update_manifest.json' }
+          foreach ($file in $m.app_files) {
+            if (-not (Test-Path $file)) { throw "Manifest file missing: $file" }
+          }
