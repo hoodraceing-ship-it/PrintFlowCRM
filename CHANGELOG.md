@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.57
+
+- Added a built-in Public Carrier Pages provider that requires no API key, signup, subscription, or business email.
+- Added conservative local USPS, UPS, FedEx, and DHL public-page status adapters for automatic Shipped and Delivered transitions.
+- Made the free local provider the default while retaining 17TRACK and Ship24 as optional switchable providers.
+- Added Check Tracking, Mark Shipped, and Mark Delivered buttons to every order as reliable fallbacks if a carrier changes or blocks its public page.
+- Isolated carrier URL and status parsing so a future carrier webpage change can be repaired without changing the order workflow.
+
 ## 0.7.56
 
 - Added Ship24 as the default free shipment-tracking provider, with a working dashboard signup and free tracking plan.
