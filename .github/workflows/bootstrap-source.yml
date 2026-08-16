@@ -26,7 +26,8 @@ jobs:
           base64 --decode /tmp/printflow.tar.xz.b64 > /tmp/printflow.tar.xz
           tar -xJf /tmp/printflow.tar.xz -C .
           rm -rf .bootstrap
-          rm -f .github/workflows/bootstrap-source.yml
+          rm -f .github/workflows/publish-release.yml
+          rm -f .github/workflows/validate.yml
 
       - name: Commit public source
         shell: bash
