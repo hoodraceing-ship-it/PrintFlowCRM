@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.55
+
+- Changed automatic GitHub update checks from hourly to once per minute.
+- Added a lightweight raw-manifest check so minute-by-minute polling does not exhaust GitHub's REST API rate limit.
+- Contacted the GitHub Releases API only when the manifest reports a newer version or the user clicks Check for Updates Now.
+
 ## 0.7.54
 
 - Changed No on the unpaid-order Messenger prompt to bypass the reminder and continue preparing the shipping label.

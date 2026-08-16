@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.54"
+VERSION = "0.7.55"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -6785,6 +6785,29 @@ class App(tk.Tk):
             "html_url":str(release.get("html_url") or ""),
         }
 
+    def _fetch_github_manifest_version(self, repo_value):
+        """Use GitHub's raw-file CDN for frequent lightweight checks.
+
+        This avoids spending one GitHub REST API request every minute. The
+        releases API is contacted only after the manifest advertises a newer
+        version, or when the user manually requests a full check.
+        """
+        repo=self._normalize_github_repo(repo_value)
+        last_error=None
+        for branch in ("main", "master"):
+            url=f"https://raw.githubusercontent.com/{repo}/{branch}/update_manifest.json"
+            req=urllib.request.Request(url,headers={"User-Agent":f"PrintFlowCRM/{VERSION}","Cache-Control":"no-cache"})
+            try:
+                with urllib.request.urlopen(req,timeout=12) as resp:
+                    manifest=json.loads(resp.read().decode("utf-8"))
+                version=str(manifest.get("version") or "").strip().lstrip("vV")
+                if not version:
+                    raise RuntimeError("The update manifest has no version.")
+                return version
+            except Exception as exc:
+                last_error=exc
+        raise RuntimeError(f"Could not read the GitHub update manifest: {last_error}")
+
     def save_update_settings(self):
         try:
             repo=self._normalize_github_repo(self.update_repo_var.get()) if hasattr(self,"update_repo_var") else ""
@@ -6925,11 +6948,17 @@ class App(tk.Tk):
                 last=int(self.db.get_setting("update_last_check_epoch","0") or 0)
             except Exception:
                 last=0
-            if time.time()-last < 3600:
+            if time.time()-last < 55:
                 return
         self._set_update_status("Checking GitHub for a newer release…")
         def worker():
             try:
+                if not interactive:
+                    manifest_version=self._fetch_github_manifest_version(repo)
+                    if self._version_tuple(manifest_version) <= self._version_tuple(VERSION):
+                        self.db.set_setting("update_last_check_epoch",str(int(time.time())))
+                        self.after(0,lambda:self._set_update_status(f"Up to date on v{VERSION} • checked just now"))
+                        return
                 info=self._fetch_latest_github_release(repo)
                 self.after(0,lambda i=info:self._handle_remote_update_result(i,interactive=interactive))
             except Exception as exc:
@@ -6958,8 +6987,9 @@ class App(tk.Tk):
 
     def _schedule_update_check(self):
         self._startup_update_check()
-        # Keep long-running order-desk sessions informed without requiring a restart.
-        self.after(60 * 60 * 1000, self._schedule_update_check)
+        # The lightweight raw-manifest check runs once per minute. The rate-limited
+        # GitHub Releases API is used only when that manifest reports a new version.
+        self.after(60 * 1000, self._schedule_update_check)
 
     def _read_update_manifest(self, zip_path: Path):
         with zipfile.ZipFile(zip_path, "r") as z:
