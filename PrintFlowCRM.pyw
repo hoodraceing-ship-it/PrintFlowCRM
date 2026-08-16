@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.55"
+VERSION = "0.7.56"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -3078,6 +3078,39 @@ class App(tk.Tk):
         except Exception:
             return ""
 
+    @staticmethod
+    def _carrier_tracking_url(tracking_no):
+        number=re.sub(r"[^A-Za-z0-9]", "", str(tracking_no or "")).upper()
+        if number.startswith("1Z"):
+            return f"https://www.ups.com/track?loc=en_US&tracknum={urllib.parse.quote(number)}"
+        if number.startswith(("JD", "JJD", "GM", "LX", "RX")):
+            return f"https://www.dhl.com/us-en/home/tracking.html?tracking-id={urllib.parse.quote(number)}"
+        if number.isdigit() and (len(number) in {12, 15} or len(number) == 20 and not number.startswith(("92","93","94","95"))):
+            return f"https://www.fedex.com/fedextrack/?trknbr={urllib.parse.quote(number)}"
+        return f"https://tools.usps.com/go/TrackConfirmAction?tLabels={urllib.parse.quote(number)}"
+
+    @staticmethod
+    def _ship24_status_from_payload(payload):
+        data=payload.get("data") or payload
+        trackings=(data.get("trackings") or []) if isinstance(data,dict) else []
+        first=trackings[0] if trackings else (data if isinstance(data,dict) else {})
+        shipment=first.get("shipment") or {}
+        return str(shipment.get("statusMilestone") or first.get("statusMilestone") or "").strip()
+
+    def _ship24_request(self, tracking_no, api_key):
+        req=urllib.request.Request(
+            "https://api.ship24.com/public/v1/trackers/track",
+            data=json.dumps({"trackingNumber":str(tracking_no or "").strip()}).encode("utf-8"),
+            headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","User-Agent":f"PrintFlowCRM/{VERSION}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req,timeout=65) as response:
+            payload=json.loads(response.read().decode("utf-8"))
+        status=self._ship24_status_from_payload(payload)
+        if not status:
+            raise RuntimeError(payload.get("message") or "Ship24 returned no shipment status yet.")
+        return status
+
     def _17track_request(self, endpoint, records, api_key):
         req = urllib.request.Request(
             f"https://api.17track.net/track/v2.4/{endpoint}",
@@ -3091,8 +3124,11 @@ class App(tk.Tk):
             raise RuntimeError(payload.get("message") or f"17TRACK returned code {payload.get('code')}")
         return payload.get("data") or {}
 
-    def _sync_tracking_statuses_once(self):
-        api_key = unprotect_secret(self.db.get_setting("tracking_17track_api_key_enc", "")).strip()
+    def _sync_tracking_statuses_once(self, force=False):
+        provider=(self.db.get_setting("tracking_provider", "Ship24 (Free)") or "Ship24 (Free)").strip()
+        if provider == "Pakket (Free)": provider="Ship24 (Free)"
+        key_setting="tracking_ship24_api_key_enc" if provider == "Ship24 (Free)" else "tracking_17track_api_key_enc"
+        api_key = unprotect_secret(self.db.get_setting(key_setting, "")).strip()
         if not api_key:
             return set()
         rows = [r for r in self.db.orders() if (r["tracking_no"] or "").strip() and
@@ -3101,17 +3137,28 @@ class App(tk.Tk):
         for row in rows:
             tracking_no = (row["tracking_no"] or "").strip()
             try:
-                if (row["tracking_registered_no"] or "").strip() != tracking_no:
-                    self._17track_request("register", [{"number": tracking_no, "tag": row["order_no"]}], api_key)
-                    self.db.update_tracking_sync(int(row["id"]), tracking_no, "Registered")
-                data = self._17track_request("gettrackinfo", [{"number": tracking_no}], api_key)
-                accepted = data.get("accepted") or []
-                carrier_status = self._carrier_status_from_17track(accepted[0]) if accepted else ""
+                if provider == "Ship24 (Free)" and not force and (row["tracking_checked_at"] or "").strip():
+                    try:
+                        last_check=datetime.fromisoformat(row["tracking_checked_at"]).timestamp()
+                        if time.time()-last_check < 6 * 60 * 60:
+                            continue
+                    except Exception:
+                        pass
+                if provider == "Ship24 (Free)":
+                    carrier_status=self._ship24_request(tracking_no, api_key)
+                else:
+                    if (row["tracking_registered_no"] or "").strip() != tracking_no:
+                        self._17track_request("register", [{"number": tracking_no, "tag": row["order_no"]}], api_key)
+                        self.db.update_tracking_sync(int(row["id"]), tracking_no, "Registered")
+                    data = self._17track_request("gettrackinfo", [{"number": tracking_no}], api_key)
+                    accepted = data.get("accepted") or []
+                    carrier_status = self._carrier_status_from_17track(accepted[0]) if accepted else ""
                 if not carrier_status:
                     self.db.update_tracking_sync(int(row["id"]), tracking_no, row["tracking_last_status"] or "Awaiting carrier scan")
                     continue
                 normalized = carrier_status.lower()
                 new_order_status = None
+                normalized=normalized.replace("_", "").replace("-", "").replace(" ", "")
                 if normalized.startswith("delivered"):
                     new_order_status = "Delivered"
                 elif normalized.startswith(("intransit", "outfordelivery", "availableforpickup")):
@@ -3140,13 +3187,16 @@ class App(tk.Tk):
     def test_tracking_sync(self):
         key = self.tracking_api_key_var.get().strip()
         if not key:
-            messagebox.showwarning("Shipment tracking", "Enter a 17TRACK API key first.", parent=self)
+            messagebox.showwarning("Shipment tracking", "Enter an API key for the selected provider first.", parent=self)
             return
-        self.db.set_setting("tracking_17track_api_key_enc", protect_secret(key))
+        provider=self.tracking_provider_var.get().strip() or "Ship24 (Free)"
+        self.db.set_setting("tracking_provider",provider)
+        key_setting="tracking_ship24_api_key_enc" if provider == "Ship24 (Free)" else "tracking_17track_api_key_enc"
+        self.db.set_setting(key_setting, protect_secret(key))
         self.tracking_settings_status.configure(text="Checking tracked orders…")
         def worker():
             try:
-                changed = self._sync_tracking_statuses_once()
+                changed = self._sync_tracking_statuses_once(force=True)
                 msg = f"Tracking connection works. Updated {len(changed)} order status(es)."
             except Exception as exc:
                 msg = f"Tracking test failed: {exc}"
@@ -3154,8 +3204,23 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def save_tracking_settings(self):
-        self.db.set_setting("tracking_17track_api_key_enc", protect_secret(self.tracking_api_key_var.get().strip()))
+        provider=self.tracking_provider_var.get().strip() or "Ship24 (Free)"
+        self.db.set_setting("tracking_provider",provider)
+        key_setting="tracking_ship24_api_key_enc" if provider == "Ship24 (Free)" else "tracking_17track_api_key_enc"
+        self.db.set_setting(key_setting, protect_secret(self.tracking_api_key_var.get().strip()))
         self.tracking_settings_status.configure(text="Shipment tracking settings saved.")
+
+    def _tracking_provider_changed(self, event=None):
+        provider=self.tracking_provider_var.get().strip() or "Ship24 (Free)"
+        is_ship24=provider == "Ship24 (Free)"
+        key_setting="tracking_ship24_api_key_enc" if is_ship24 else "tracking_17track_api_key_enc"
+        self.tracking_api_key_var.set(unprotect_secret(self.db.get_setting(key_setting, "")))
+        self.tracking_api_key_label.configure(text="Ship24 API key" if is_ship24 else "17TRACK API key")
+        self.tracking_signup_button.configure(
+            text="Get Free Ship24 API Key" if is_ship24 else "Get 17TRACK API Key",
+            command=lambda:webbrowser.open("https://dashboard.ship24.com/" if is_ship24 else "https://api.17track.net/en"),
+        )
+        self.tracking_settings_status.configure(text="Ship24 includes a free tracking plan." if is_ship24 else "17TRACK uses tracking-number credits.")
 
     def submit_feedback(self):
         kind = self.feedback_type_var.get().strip() or "Idea"
@@ -6580,17 +6645,28 @@ class App(tk.Tk):
         tracking = self.card(settings_inner, 12)
         tracking.pack(fill="x", pady=(0, 9))
         ttk.Label(tracking, text="Automatic Shipment Tracking", style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,8))
-        self.tracking_api_key_var=tk.StringVar(value=unprotect_secret(self.db.get_setting("tracking_17track_api_key_enc", "")))
-        ttk.Label(tracking,text="17TRACK API key",style="Card.TLabel").grid(row=1,column=0,sticky="w",pady=4)
-        ttk.Entry(tracking,textvariable=self.tracking_api_key_var,show="•",width=55).grid(row=1,column=1,sticky="ew",padx=10,pady=4)
-        ttk.Label(tracking,text="When an order has a tracking number, PrintFlow checks carrier scans every 30 minutes. A pickup or in-transit scan changes Packed to Shipped; carrier-confirmed delivery changes it to Delivered. The key stays encrypted on this computer.",style="Card.TLabel",wraplength=780,justify="left").grid(row=2,column=0,columnspan=3,sticky="w",pady=(4,7))
-        tracking_buttons=ttk.Frame(tracking,style="Card.TFrame"); tracking_buttons.grid(row=3,column=0,columnspan=3,sticky="w")
+        saved_provider=(self.db.get_setting("tracking_provider", "Ship24 (Free)") or "Ship24 (Free)").strip()
+        if saved_provider == "Pakket (Free)": saved_provider="Ship24 (Free)"
+        self.tracking_provider_var=tk.StringVar(value=saved_provider)
+        initial_key_setting="tracking_ship24_api_key_enc" if saved_provider == "Ship24 (Free)" else "tracking_17track_api_key_enc"
+        self.tracking_api_key_var=tk.StringVar(value=unprotect_secret(self.db.get_setting(initial_key_setting, "")))
+        ttk.Label(tracking,text="Provider",style="Card.TLabel").grid(row=1,column=0,sticky="w",pady=4)
+        provider_combo=ttk.Combobox(tracking,textvariable=self.tracking_provider_var,state="readonly",values=["Ship24 (Free)","17TRACK"],width=24)
+        provider_combo.grid(row=1,column=1,sticky="w",padx=10,pady=4)
+        provider_combo.bind("<<ComboboxSelected>>",self._tracking_provider_changed)
+        self.tracking_api_key_label=ttk.Label(tracking,text="API key",style="Card.TLabel")
+        self.tracking_api_key_label.grid(row=2,column=0,sticky="w",pady=4)
+        ttk.Entry(tracking,textvariable=self.tracking_api_key_var,show="•",width=55).grid(row=2,column=1,sticky="ew",padx=10,pady=4)
+        ttk.Label(tracking,text="Ship24 is the free default and is checked at most every six hours. Switch this dropdown to 17TRACK at any time if the free provider changes or stops working. Pickup/in-transit becomes Shipped and carrier-confirmed delivery becomes Delivered. Keys stay encrypted on this computer.",style="Card.TLabel",wraplength=780,justify="left").grid(row=3,column=0,columnspan=3,sticky="w",pady=(4,7))
+        tracking_buttons=ttk.Frame(tracking,style="Card.TFrame"); tracking_buttons.grid(row=4,column=0,columnspan=3,sticky="w")
         ttk.Button(tracking_buttons,text="Save Tracking Settings",style="Accent.TButton",command=self.save_tracking_settings).pack(side="left",padx=(0,7))
         ttk.Button(tracking_buttons,text="Test / Sync Now",command=self.test_tracking_sync).pack(side="left",padx=(0,7))
-        ttk.Button(tracking_buttons,text="Get 17TRACK API Key",command=lambda:webbrowser.open("https://api.17track.net/en")).pack(side="left")
+        self.tracking_signup_button=ttk.Button(tracking_buttons,text="Get API Key")
+        self.tracking_signup_button.pack(side="left")
         self.tracking_settings_status=ttk.Label(tracking,text="",style="Card.TLabel",wraplength=780,justify="left")
-        self.tracking_settings_status.grid(row=4,column=0,columnspan=3,sticky="w",pady=(7,0))
+        self.tracking_settings_status.grid(row=5,column=0,columnspan=3,sticky="w",pady=(7,0))
         tracking.columnconfigure(1,weight=1)
+        self._tracking_provider_changed()
 
         feedback = self.card(settings_inner, 12)
         feedback.pack(fill="x", pady=(0, 9))

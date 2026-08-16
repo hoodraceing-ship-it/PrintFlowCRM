@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.56
+
+- Added Ship24 as the default free shipment-tracking provider, with a working dashboard signup and free tracking plan.
+- Added a tracking-provider dropdown so users can switch between Ship24 and 17TRACK without an app update.
+- Saved each provider's encrypted API key separately so switching providers does not overwrite the fallback key.
+- Limited automatic Ship24 checks to once every six hours per active shipment while retaining Test / Sync Now.
+
 ## 0.7.55
 
 - Changed automatic GitHub update checks from hourly to once per minute.
