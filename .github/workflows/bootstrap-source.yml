@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - '.bootstrap/**'
+      - '.bootstrap/READY'
   workflow_dispatch:
 
 permissions:
@@ -22,9 +22,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .bootstrap/part-* > /tmp/printflow.tar.gz.b64
-          base64 --decode /tmp/printflow.tar.gz.b64 > /tmp/printflow.tar.gz
-          tar -xzf /tmp/printflow.tar.gz -C .
+          cat .bootstrap/part-* > /tmp/printflow.tar.xz.b64
+          base64 --decode /tmp/printflow.tar.xz.b64 > /tmp/printflow.tar.xz
+          tar -xJf /tmp/printflow.tar.xz -C .
           rm -rf .bootstrap
           rm -f .github/workflows/bootstrap-source.yml
 
