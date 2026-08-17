@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.67
+
+- Added a live overhang warning banner to Print Preflight & Orientation that rechecks the model after every rotation.
+- Added a per-print Enable Supports control that defaults to the recommendation while still letting the user override it.
+- Passed the support choice directly to BambuBuddy as a slicer process override, including for automatically split parts.
+
 ## 0.7.66
 
 - Removed the manual Mark Shipped and Mark Delivered controls now that carrier tracking manages those states.

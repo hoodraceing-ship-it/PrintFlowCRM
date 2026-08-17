@@ -26,7 +26,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.66"
+VERSION = "0.7.67"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -4098,8 +4098,23 @@ class App(tk.Tk):
             raise RuntimeError("The selected BambuBuddy printer could not be found. Reload printers in Settings.")
         presets = client.list_slicer_presets()
         auto_supports = self.db.get_setting("slicer_auto_supports", "1") != "0"
-        needs_support = bool(auto_supports and source_name.endswith(".stl") and self._stl_likely_needs_support(path))
-        picked = self._choose_auto_slice_presets(presets, printer, row["material"] or "PLA", needs_support=needs_support)
+        try:
+            support_override = attachment.get("_support_enabled_override")
+            preflight_recommendation = attachment.get("_support_recommended")
+        except Exception:
+            support_override = None
+            preflight_recommendation = None
+        geometry_needs_support = (
+            bool(preflight_recommendation)
+            if preflight_recommendation is not None
+            else bool(source_name.endswith(".stl") and self._stl_likely_needs_support(path))
+        )
+        supports_enabled = bool(support_override) if support_override is not None else bool(auto_supports and geometry_needs_support)
+        picked = self._choose_auto_slice_presets(
+            presets, printer, row["material"] or "PLA", needs_support=geometry_needs_support
+        )
+        picked["needs_support"] = geometry_needs_support
+        picked["supports_enabled"] = supports_enabled
         source_library_id = self._ensure_source_uploaded(client, attachment, path)
         use_auto_orient, orientation_mode = self._orientation_policy(source_name)
         try:
@@ -4120,6 +4135,9 @@ class App(tk.Tk):
             "auto_arrange": True,
             "auto_orient": bool(use_auto_orient),
             "bed_type": self.db.get_setting("slicer_bed_type", "Textured PEI Plate") or "Textured PEI Plate",
+            # BambuBuddy applies this sparse process patch after the selected preset,
+            # so the user's preflight choice wins for this print only.
+            "process_overrides": {"enable_support": "1" if supports_enabled else "0"},
         }
 
         def run_slice(slice_payload):
@@ -5319,7 +5337,8 @@ class App(tk.Tk):
             except Exception:
                 preview_original = original
         transform = np.eye(4)
-        result = {"ok": False, "mesh": None, "auto": False, "changed": False}
+        result = {"ok": False, "mesh": None, "auto": False, "changed": False,
+                  "supports_enabled": False, "supports_recommended": False}
 
         win = tk.Toplevel(self)
         win.title("Print Preflight & Orientation")
@@ -5336,6 +5355,23 @@ class App(tk.Tk):
                  wraplength=900, justify="left", bg="#0f1722", fg="#7f93aa",
                  font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 8))
 
+        support_var = tk.BooleanVar(value=False)
+        support_message = tk.StringVar(value="Checking the model for unsupported overhangs…")
+        support_choice_touched = {"value": False}
+        support_banner = tk.Frame(outer, bg="#263447", highlightthickness=1, highlightbackground="#58708b", padx=10, pady=7)
+        support_banner.pack(fill="x", pady=(0, 8))
+        support_label = tk.Label(support_banner, textvariable=support_message, wraplength=700, justify="left",
+                                 bg="#263447", fg="#ffffff", font=("Segoe UI", 9, "bold"))
+        support_label.pack(side="left", fill="x", expand=True, anchor="w")
+        def support_changed():
+            support_choice_touched["value"] = True
+        support_toggle = tk.Checkbutton(
+            support_banner, text="Enable supports for this print", variable=support_var,
+            command=support_changed, bg="#263447", fg="#ffffff", activebackground="#263447",
+            activeforeground="#ffffff", selectcolor="#111b28", font=("Segoe UI", 9, "bold")
+        )
+        support_toggle.pack(side="right", padx=(12, 0))
+
         vf = tk.Frame(outer, bg="#111b28", highlightthickness=1, highlightbackground="#334155")
         vf.pack(fill="both", expand=True)
         canvas = tk.Canvas(vf, bg="#111b28", highlightthickness=0, cursor="fleur")
@@ -5349,6 +5385,26 @@ class App(tk.Tk):
         view = {"yaw": math.radians(-38), "pitch": math.radians(-58), "zoom": 1.0,
                 "drag": None, "last_motion_render": 0.0, "full_render_job": None}
         geometry = {}
+
+        def update_support_banner(support_area, total_area):
+            threshold = max(18.0, float(total_area) * 0.002)
+            recommended = bool(support_area >= threshold)
+            result["supports_recommended"] = recommended
+            if not support_choice_touched["value"]:
+                support_var.set(recommended)
+            if recommended:
+                bg, border = "#5a3518", "#e69a43"
+                support_message.set(
+                    f"⚠ Supports recommended — about {support_area:.0f} mm² of raised downward-facing surface may print in mid-air."
+                )
+            else:
+                bg, border = "#183f32", "#42b883"
+                support_message.set(
+                    "✓ Supports probably not needed — no meaningful raised, downward-facing overhang was detected."
+                )
+            support_banner.configure(bg=bg, highlightbackground=border)
+            support_label.configure(bg=bg)
+            support_toggle.configure(bg=bg, activebackground=bg)
 
         def rot_view():
             yaw,pitch=view["yaw"],view["pitch"]
@@ -5377,13 +5433,14 @@ class App(tk.Tk):
             # rewarding stable bed contact. Actual time is still determined by Bambu Studio.
             score=float(ext[2])*3.0 + support_area*0.035 - min(contact,5000)*0.008
             if not fits: score += 100000
-            return ext, fits, support_area, contact, score
+            return ext, fits, support_area, contact, score, float(areas.sum()) if len(areas) else 0.0
 
         def render(motion=False, rebuild=False):
             nonlocal current
             if rebuild or not geometry:
                 current=oriented_mesh()
-                ext,fits,sup,contact,score=estimate(current)
+                ext,fits,sup,contact,score,total_area=estimate(current)
+                update_support_banner(sup, total_area)
                 pm=preview_original.copy(); pm.apply_transform(transform)
                 pm.apply_translation((0,0,-float(pm.bounds[0][2])))
                 verts=np.asarray(pm.vertices,float).copy()
@@ -5457,7 +5514,7 @@ class App(tk.Tk):
                         if key in seen: continue
                         seen.add(key)
                         m=original.copy(); m.apply_transform(M); m.apply_translation((0,0,-float(m.bounds[0][2])))
-                        ext,fits,sup,contact,score=estimate(m)
+                        ext,fits,sup,contact,score,_total_area=estimate(m)
                         candidates.append((score,M,ext,fits,sup,contact))
             candidates.sort(key=lambda x:x[0])
             best=candidates[0]
@@ -5503,6 +5560,7 @@ class App(tk.Tk):
             result["ok"]=ok
             if ok:
                 result["mesh"]=oriented_mesh()
+                result["supports_enabled"] = bool(support_var.get())
                 self.db.set_setting("slicer_bed_type",plate_var.get().strip() or "Textured PEI Plate")
             win.destroy()
         tk.Button(buttons,text="Cancel",width=13,command=lambda:choose(False)).pack(side="right")
@@ -5521,8 +5579,14 @@ class App(tk.Tk):
         result=self._show_print_preflight_dialog(path,display_name)
         if not result or not result.get("ok"):
             return False
+        support_fields = {
+            "_support_enabled_override": bool(result.get("supports_enabled")),
+            "_support_recommended": bool(result.get("supports_recommended")),
+        }
         if not result.get("changed"):
-            return attachment
+            prepared = dict(attachment)
+            prepared.update(support_fields)
+            return prepared
         target=DATA_DIR / "preflight"
         target.mkdir(parents=True,exist_ok=True)
         stem=Path(display_name).stem
@@ -5537,6 +5601,7 @@ class App(tk.Tk):
             "bambuddy_library_file_id": None,
             "_preflight_locked": True,
             "_preflight_auto": bool(result.get("auto")),
+            **support_fields,
         }
 
     def _oversize_stl_action(self, order_id, attachment, path):
@@ -5592,6 +5657,19 @@ class App(tk.Tk):
             return False
         try:
             parts, axis_name, split_at = self._split_stl_for_p2s(order_id, attachment, info)
+            try:
+                support_override = attachment.get("_support_enabled_override")
+                support_recommended = attachment.get("_support_recommended")
+            except Exception:
+                support_override = support_recommended = None
+            if support_override is not None:
+                wrapped = []
+                for part in parts:
+                    item = dict(part)
+                    item["_support_enabled_override"] = bool(support_override)
+                    item["_support_recommended"] = bool(support_recommended)
+                    wrapped.append(item)
+                parts = wrapped
             self.refresh_order_files(order_id)
             return parts
         except Exception as exc:
@@ -5684,6 +5762,7 @@ class App(tk.Tk):
                             "seconds": slice_result.get("print_time_seconds"),
                             "needs_support": picked.get("needs_support"),
                             "support_profile_used": picked.get("support_profile_used"),
+                            "supports_enabled": picked.get("supports_enabled"),
                             "recommendation": picked.get("recommendation"),
                             "material_key": picked.get("material_key"),
                             "orientation_mode": picked.get("orientation_mode"),
@@ -5831,8 +5910,10 @@ class App(tk.Tk):
                 extra += "\nOrientation: Bambu Studio auto-optimized before slicing."
             elif slice_info and slice_info.get("orientation_fallback"):
                 extra += "\nOrientation: Auto-orient was rejected by the slicer, so PrintFlow safely retried the saved orientation."
-            if slice_info and slice_info.get("needs_support") and not slice_info.get("support_profile_used"):
-                extra += "\n\n⚠ PrintFlow detected meaningful overhangs, but no support-named process preset was available. Verify that the selected Bambu Studio process preset has automatic supports enabled."
+            if slice_info and slice_info.get("supports_enabled"):
+                extra += "\nSupports: enabled for this slice from Print Preflight."
+            elif slice_info and slice_info.get("needs_support"):
+                extra += "\n\n⚠ Supports were recommended in Print Preflight but left off for this slice."
         messagebox.showinfo("Queued", queue_text + extra, parent=self)
         if sliced:
             self._offer_profile_recommendation(slice_info)
@@ -5855,8 +5936,10 @@ class App(tk.Tk):
             extra += "\nOrientation: Bambu Studio auto-optimized the split parts before slicing."
         elif slice_info and slice_info.get("orientation_fallback"):
             extra += "\nOrientation: Auto-orient was rejected for a split part, so PrintFlow safely retried its generated orientation."
-        if slice_info and slice_info.get("needs_support") and not slice_info.get("support_profile_used"):
-            extra += "\n\n⚠ Overhangs were detected, but no support-named process preset was available. Verify automatic supports in the selected Bambu Studio process preset."
+        if slice_info and slice_info.get("supports_enabled"):
+            extra += "\nSupports: enabled for both slices from Print Preflight."
+        elif slice_info and slice_info.get("needs_support"):
+            extra += "\n\n⚠ Supports were recommended in Print Preflight but left off for these slices."
         messagebox.showinfo("Split parts queued", state + extra, parent=self)
         self._offer_profile_recommendation(slice_info)
         if self.current_page == "orders": self.show_orders(order_id)
