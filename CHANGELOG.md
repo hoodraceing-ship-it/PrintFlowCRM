@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.66
+
+- Removed the manual Mark Shipped and Mark Delivered controls now that carrier tracking manages those states.
+- Removed Export CSV Only because Prepare Shipping Label already creates and opens the Pirate Ship export automatically.
+- Renamed Capture from Pirate Ship to Open Pirate Ship while preserving automatic order arming, tracking capture, and label capture.
+- Moved Set Paid in Full and Set Half Paid into the pinned main controls at the bottom of each order.
+- Removed the duplicate bottom tracking action because Track Shipment now sits beside the tracking number.
+
 ## 0.7.65
 
 - Added Send Now, Schedule for Later, and Don't Send choices for customer payment and tracking messages.

@@ -26,7 +26,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.65"
+VERSION = "0.7.66"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2194,7 +2194,7 @@ class App(tk.Tk):
     def view_shipping_label(self,order_id):
         path=self._shipping_label_path(order_id)
         if not path:
-            messagebox.showinfo("Shipping label not saved","No saved label is attached to this order yet.\n\nOpen the order with Capture from Pirate Ship, then generate or reprint the 4×6 label. PrintFlow will preserve the PDF automatically.",parent=self);return
+            messagebox.showinfo("Shipping label not saved","No saved label is attached to this order yet.\n\nClick Open Pirate Ship for this order, then generate or reprint the 4×6 label. PrintFlow will preserve the PDF automatically.",parent=self);return
         try:
             os.startfile(str(path)) if os.name=="nt" else webbrowser.open(path.as_uri())
         except Exception as exc:messagebox.showerror("View shipping label",str(exc),parent=self)
@@ -2794,12 +2794,6 @@ class App(tk.Tk):
         payline.grid(row=12,column=0,columnspan=4,sticky="ew",pady=(4,8))
         summary = ttk.Label(payline,text=f"Payment: {pay_status}    •    Balance: {self.money(balance)}",style="Card.TLabel")
         summary.grid(row=0,column=0,sticky="w",pady=(0,5))
-        pay_actions = ttk.Frame(payline, style="Card.TFrame")
-        pay_actions.grid(row=1,column=0,sticky="ew")
-        self._responsive_grid(pay_actions, [
-            ttk.Button(pay_actions,text="Set Full",command=lambda: self.set_payment_fraction(vars, 1.0)),
-            ttk.Button(pay_actions,text="Set Half",command=lambda: self.set_payment_fraction(vars, 0.5)),
-        ], min_button_width=110)
         payline.columnconfigure(0,weight=1)
 
         buttons = editor_footer
@@ -2808,17 +2802,15 @@ class App(tk.Tk):
         action_bar.grid(row=1,column=0,sticky="ew")
         action_buttons = [
             ttk.Button(action_bar,text="Queue via BambuBuddy",command=lambda:self.print_order(order_id)),
+            ttk.Button(action_bar,text="Set Paid in Full",command=lambda: self.set_payment_fraction(vars, 1.0)),
+            ttk.Button(action_bar,text="Set Half Paid",command=lambda: self.set_payment_fraction(vars, 0.5)),
             ttk.Button(action_bar,text="Prepare Shipping Label",style="Accent.TButton",command=lambda:self.prepare_shipping_label(order_id)),
-            ttk.Button(action_bar,text="Capture from Pirate Ship",command=lambda:self.open_pirateship_browser(order_id)),
+            ttk.Button(action_bar,text="Open Pirate Ship",command=lambda:self.open_pirateship_browser(order_id)),
             ttk.Button(action_bar,text="View Shipping Label",command=lambda:self.view_shipping_label(order_id)),
             ttk.Button(action_bar,text="Print Shipping Label",command=lambda:self.print_shipping_label(order_id)),
             ttk.Button(action_bar,text="View Packing List",command=lambda:self.view_packing_list(order_id)),
             ttk.Button(action_bar,text="Print Packing List",command=lambda:self.print_packing_list(order_id)),
             ttk.Button(action_bar,text="Scheduled Messages",command=lambda:self.show_scheduled_messages(order_id)),
-            ttk.Button(action_bar,text="Export CSV Only",command=lambda:self.export_pirateship(order_id)),
-            ttk.Button(action_bar,text="Check Tracking",command=lambda:self.open_order_tracking(order_id)),
-            ttk.Button(action_bar,text="Mark Shipped",command=lambda:self.mark_shipping_status(order_id,"Shipped")),
-            ttk.Button(action_bar,text="Mark Delivered",command=lambda:self.mark_shipping_status(order_id,"Delivered")),
             ttk.Button(action_bar,text="Delete Order",style="Danger.TButton",command=lambda:self.delete_order_with_confirmation(order_id)),
         ]
         if (row["source"] or "") == "Facebook Marketplace":
@@ -7146,7 +7138,7 @@ class App(tk.Tk):
         self.tracking_api_key_label.grid(row=2,column=0,sticky="w",pady=4)
         self.tracking_api_key_entry=ttk.Entry(tracking,textvariable=self.tracking_api_key_var,show="•",width=55)
         self.tracking_api_key_entry.grid(row=2,column=1,sticky="ew",padx=10,pady=4)
-        ttk.Label(tracking,text="The free local provider reads public USPS, UPS, FedEx, and DHL tracking pages without an account. Carrier webpage changes can temporarily break automatic detection, so each carrier is isolated for easy updates and Check Tracking / Mark Shipped / Mark Delivered remain available on every order. Paid providers can be selected later without rebuilding PrintFlow.",style="Card.TLabel",wraplength=780,justify="left").grid(row=3,column=0,columnspan=3,sticky="w",pady=(4,7))
+        ttk.Label(tracking,text="The free local provider reads public USPS, UPS, FedEx, and DHL tracking pages without an account. Carrier webpage changes can temporarily break automatic detection, so each carrier is isolated for easy updates. Track Shipment beside each order's tracking number opens the carrier page directly. Paid providers can be selected later without rebuilding PrintFlow.",style="Card.TLabel",wraplength=780,justify="left").grid(row=3,column=0,columnspan=3,sticky="w",pady=(4,7))
         tracking_buttons=ttk.Frame(tracking,style="Card.TFrame"); tracking_buttons.grid(row=4,column=0,columnspan=3,sticky="w")
         ttk.Button(tracking_buttons,text="Save Tracking Settings",style="Accent.TButton",command=self.save_tracking_settings).pack(side="left",padx=(0,7))
         ttk.Button(tracking_buttons,text="Test / Sync Now",command=self.test_tracking_sync).pack(side="left",padx=(0,7))
