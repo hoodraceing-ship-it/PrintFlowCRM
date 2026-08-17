@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.63
+
+- Changed every PrintFlow-created BambuBuddy queue item to Queue Only / Manual Start mode.
+- Prevented failed or cancelled prints from allowing later PrintFlow queue items to start automatically.
+- Applied Manual Start to single files, multi-file customer batches, quantities, and every Auto-Split part.
+- Renamed Print actions to Queue actions and added explicit Manual Start confirmation text.
+
 ## 0.7.62
 
 - Added Delete Order with a clear confirmation and protection for the customer's real files and folder.

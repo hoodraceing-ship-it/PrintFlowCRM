@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.62"
+VERSION = "0.7.63"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -864,7 +864,10 @@ class BambuBuddyClient:
             "printer_id": int(printer_id),
             "quantity": max(1, int(quantity)),
             "scheduled_time": None,
-            "manual_start": False,
+            # Queue Only safety: every PrintFlow-created item must be explicitly
+            # started by the user in BambuBuddy.  A failure/cancel therefore can
+            # never cascade into the next PrintFlow job automatically starting.
+            "manual_start": True,
             "insert_at_top": bool(insert_at_top),
         }
         return self._json_request("POST", "/queue/", payload, timeout=30)
@@ -2648,7 +2651,7 @@ class App(tk.Tk):
         action_bar = ttk.Frame(buttons, style="Card.TFrame")
         action_bar.grid(row=1,column=0,sticky="ew")
         action_buttons = [
-            ttk.Button(action_bar,text="Print via BambuBuddy",command=lambda:self.print_order(order_id)),
+            ttk.Button(action_bar,text="Queue via BambuBuddy",command=lambda:self.print_order(order_id)),
             ttk.Button(action_bar,text="Prepare Shipping Label",style="Accent.TButton",command=lambda:self.prepare_shipping_label(order_id)),
             ttk.Button(action_bar,text="Capture from Pirate Ship",command=lambda:self.open_pirateship_browser(order_id)),
             ttk.Button(action_bar,text="Export CSV Only",command=lambda:self.export_pirateship(order_id)),
@@ -3622,7 +3625,7 @@ class App(tk.Tk):
         listing = "\n".join(f"• {name}" for name in names)
         messagebox.showinfo(
             "Prints queued",
-            f"Successfully queued {completed} of {total} selected prints for this customer."
+            f"Successfully queued {completed} of {total} selected prints for this customer. Each item requires Manual Start in BambuBuddy."
             + (f"\n\n{listing}" if listing else ""),
             parent=self,
         )
@@ -5665,12 +5668,7 @@ class App(tk.Tk):
             batch_context.setdefault("queued_names", []).append(batch_context.get("current_name") or generated_file or "Print file")
             self.after(100, lambda: self._print_next_batch_item(batch_context))
             return
-        if busy is True:
-            queue_text = "The printer is already printing, so this job was added to the BambuBuddy queue."
-        elif busy is False:
-            queue_text = "The printer is idle, so this ASAP queue item can start on BambuBuddy's next scheduler pass."
-        else:
-            queue_text = "The job was added to the BambuBuddy queue."
+        queue_text = "The job was added in Queue Only mode. It will NOT start automatically; open BambuBuddy and manually start it when the printer is ready."
         extra = ""
         if sliced:
             extra = f"\n\nSTL/3MF auto-slice completed and was saved to this order as:\n{generated_file or 'sliced .gcode.3mf'}"
@@ -5695,7 +5693,7 @@ class App(tk.Tk):
             batch_context.setdefault("queued_names", []).append(batch_context.get("current_name") or "Split print")
             self.after(100, lambda: self._print_next_batch_item(batch_context))
             return
-        state = "The printer is already printing, so both split parts were added behind the current job." if busy else "The printer is idle, so Part 1 is next and Part 2 is queued behind it."
+        state = "Both split parts were added in Queue Only mode. Neither part will start until you manually start it in BambuBuddy."
         files = "\n".join(f"• {name}" for name in generated_names)
         extra = f"\n\nAuto Split completed. Both halves were sliced and queued in order:\n{files}"
         if slice_info and slice_info.get("profiles"):
@@ -6728,7 +6726,7 @@ class App(tk.Tk):
         ttk.Button(bf,text="↑ Move Up",command=lambda:self.move_queue_selected(tree,-1)).pack(side="left",padx=3)
         ttk.Button(bf,text="↓ Move Down",command=lambda:self.move_queue_selected(tree,1)).pack(side="left",padx=3)
         ttk.Button(bf,text="Open Order",command=lambda:self.queue_open_order(tree)).pack(side="left",padx=3)
-        ttk.Button(bf,text="Print",style="Accent.TButton",command=lambda:self.queue_print_selected(tree)).pack(side="right",padx=3)
+        ttk.Button(bf,text="Queue Selected",style="Accent.TButton",command=lambda:self.queue_print_selected(tree)).pack(side="right",padx=3)
         tree.bind("<Double-1>",lambda e:self.queue_open_order(tree))
 
     def move_queue_selected(self,tree,delta):
