@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.65
+
+- Added Send Now, Schedule for Later, and Don't Send choices for customer payment and tracking messages.
+- Added persistent message delays from 30 minutes through tomorrow, the order due date, or a custom date/time.
+- Added a Scheduled Messages manager on every order with cancel and send-now controls.
+- Added saved packing lists containing the customer, order, quantity, notes, and grouped print files with pack-off checkboxes.
+- Added View Packing List and Print Packing List to every order profile.
+- Added Track Shipment directly beside the tracking-number field.
+
 ## 0.7.64
 
 - Captured and preserved the original Pirate Ship 4x6 label PDF when a label is generated or reprinted in the integrated browser.

@@ -2,6 +2,7 @@ import base64
 import csv
 import ctypes
 import hashlib
+import html as html_lib
 import itertools
 import json
 import os
@@ -19,13 +20,13 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.64"
+VERSION = "0.7.65"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -115,6 +116,8 @@ DB_PATH = DATA_DIR / "printflow.db"
 FILES_DIR = DATA_DIR / "files"
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
+PACKING_LIST_DIR = DATA_DIR / "packing_lists"
+PACKING_LIST_DIR.mkdir(exist_ok=True)
 THUMB_CACHE_DIR = DATA_DIR / "thumb_cache"
 APP_DIR = DATA_DIR / "App"
 MESSENGER_CAPTURE_FILE = DATA_DIR / "messenger_capture.json"
@@ -365,6 +368,20 @@ class Database:
                     added_at TEXT NOT NULL,
                     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS scheduled_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    purpose TEXT NOT NULL DEFAULT 'message',
+                    provider TEXT NOT NULL DEFAULT 'Marketplace Messenger',
+                    message TEXT NOT NULL,
+                    balance REAL NOT NULL DEFAULT 0,
+                    send_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'Scheduled',
+                    created_at TEXT NOT NULL,
+                    sent_at TEXT DEFAULT '',
+                    FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+                );
                 """
             )
             # v0.4 migration: Marketplace intake metadata. Existing databases are upgraded in place.
@@ -380,6 +397,7 @@ class Database:
                 ("tracking_last_status", "TEXT DEFAULT ''"),
                 ("tracking_checked_at", "TEXT DEFAULT ''"),
                 ("shipping_label_path", "TEXT DEFAULT ''"),
+                ("packing_list_path", "TEXT DEFAULT ''"),
             ]:
                 if col not in order_columns:
                     c.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
@@ -534,6 +552,29 @@ class Database:
         """Delete the CRM order and its attachment records, never the files on disk."""
         with self.connect() as c:
             c.execute("DELETE FROM orders WHERE id=?", (order_id,))
+
+    def schedule_message(self,order_id,purpose,provider,message,balance,send_at):
+        now=datetime.now().isoformat(timespec="seconds")
+        with self.connect() as c:
+            cur=c.execute("INSERT INTO scheduled_messages(order_id,purpose,provider,message,balance,send_at,status,created_at) VALUES(?,?,?,?,?,?,'Scheduled',?)",
+                          (int(order_id),purpose or "message",provider or "Marketplace Messenger",message or "",float(balance or 0),send_at,now))
+            return cur.lastrowid
+
+    def next_due_message(self):
+        now=datetime.now().isoformat(timespec="seconds")
+        with self.connect() as c:
+            return c.execute("SELECT sm.*,b.name AS buyer_name,o.order_no FROM scheduled_messages sm JOIN orders o ON o.id=sm.order_id JOIN buyers b ON b.id=o.buyer_id WHERE sm.status='Scheduled' AND sm.send_at<=? ORDER BY sm.send_at,sm.id LIMIT 1",(now,)).fetchone()
+
+    def scheduled_messages(self,order_id=None):
+        q="SELECT sm.*,b.name AS buyer_name,o.order_no FROM scheduled_messages sm JOIN orders o ON o.id=sm.order_id JOIN buyers b ON b.id=o.buyer_id"
+        params=[]
+        if order_id is not None:q+=" WHERE sm.order_id=?";params.append(int(order_id))
+        q+=" ORDER BY CASE WHEN sm.status='Scheduled' THEN 0 ELSE 1 END,sm.send_at DESC"
+        with self.connect() as c:return c.execute(q,params).fetchall()
+
+    def set_scheduled_message_status(self,message_id,status):
+        with self.connect() as c:
+            c.execute("UPDATE scheduled_messages SET status=?,sent_at=? WHERE id=?",(status,datetime.now().isoformat(timespec="seconds") if status=='Sent' else "",int(message_id)))
 
     def update_marketplace_chat(self, order_id, chat, primary_color=None, secondary_color=None):
         with self.connect() as c:
@@ -1509,6 +1550,8 @@ class App(tk.Tk):
         self.after(1800, self._schedule_print_status_sync)
         self.after(5000, self._schedule_tracking_status_sync)
         self.after(2200, self._poll_pirateship_scan_result)
+        # Persisted delayed customer messages survive restarts and dispatch when due.
+        self.after(6000, self._dispatch_scheduled_messages)
         # v0.7.45 beta: optionally check a configured GitHub Releases feed after the UI is usable.
         # Manual update installation remains available at all times as the rollback path.
         self.after(2600, self._schedule_update_check)
@@ -2122,9 +2165,7 @@ class App(tk.Tk):
                         if self.current_page=="orders": self.show_orders(order_id)
                         template=self.db.get_setting("tracking_message_template", "Hi {first_name}, your order has shipped! Your tracking number is {tracking_number}. You can track it here: {tracking_url}")
                         message=self._format_customer_message(template,row,tracking_no=tracking)
-                        provider=self._message_provider()
-                        if messagebox.askyesno("Send tracking to customer",f"Tracking number {tracking} was captured.\n\nSend this update to {row['buyer_name']} using {provider}?\n\n{message}",parent=self):
-                            self._send_customer_message(order_id,message,"tracking update")
+                        self._prompt_customer_message(order_id,message,"tracking update")
             if PIRATESHIP_LABEL_RESULT_FILE.exists():
                 label_data=json.loads(PIRATESHIP_LABEL_RESULT_FILE.read_text(encoding="utf-8"))
                 label_stamp=label_data.get("captured_at","")
@@ -2171,6 +2212,69 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Print shipping label",f"Windows could not print the PDF automatically. PrintFlow will open it so you can choose Print manually.\n\n{exc}",parent=self)
             self.view_shipping_label(order_id)
+
+    def _generate_packing_list(self,order_id,auto_print=False):
+        if self.current_order_id==order_id:self.flush_order_autosave()
+        row=self.db.order(order_id)
+        if not row:return None
+        groups=self._group_order_files_for_display(self.db.order_files(order_id))
+        file_rows=[]
+        for main,_helpers,members in groups:
+            name=main["original_name"] or Path(main["stored_path"]).name
+            status=self._aggregate_print_file_status(members,main)
+            file_rows.append(f"<tr><td>{html_lib.escape(name)}</td><td>{html_lib.escape(status)}</td></tr>")
+        if not file_rows:file_rows.append("<tr><td colspan='2'>No print files attached</td></tr>")
+        city_line=" ".join(str(v or "").strip() for v in [row["city"],row["state"],row["postal_code"]] if str(v or "").strip())
+        address="<br>".join(html_lib.escape(str(v)) for v in [row["address1"],row["address2"],city_line] if str(v or "").strip())
+        script="<script>window.addEventListener('load',()=>setTimeout(()=>window.print(),300));</script>" if auto_print else ""
+        page=f"""<!doctype html><html><head><meta charset='utf-8'><title>Packing List {html_lib.escape(row['order_no'])}</title>
+<style>@page{{size:letter;margin:.5in}}body{{font:14px Arial,sans-serif;color:#111;margin:0}}h1{{font-size:24px;margin:0 0 4px}}.top{{display:flex;justify-content:space-between;border-bottom:2px solid #111;padding-bottom:12px}}.box{{margin-top:18px}}table{{width:100%;border-collapse:collapse;margin-top:8px}}th,td{{border:1px solid #777;padding:9px;text-align:left}}th{{background:#eee}}.check{{font-size:20px;width:42px}}.footer{{margin-top:28px;border-top:1px solid #999;padding-top:10px;color:#555}}</style>{script}</head><body>
+<div class='top'><div><h1>PACKING LIST</h1><b>PrintFlow CRM</b></div><div><b>Order:</b> {html_lib.escape(row['order_no'])}<br><b>Date:</b> {datetime.now().strftime('%m/%d/%Y')}<br><b>Quantity:</b> {int(row['quantity'] or 1)}</div></div>
+<div class='box'><b>Customer</b><br>{html_lib.escape(row['buyer_name'])}<br>{address}</div>
+<div class='box'><b>Order item</b><br>{html_lib.escape(row['item'] or '')}</div>
+<div class='box'><b>Printed files / parts to pack</b><table><thead><tr><th>File</th><th>Status</th><th class='check'>Packed</th></tr></thead><tbody>{''.join(r.replace('</tr>',"<td class='check'>☐</td></tr>") if "colspan" not in r else r for r in file_rows)}</tbody></table></div>
+<div class='box'><b>Customer notes</b><br>{html_lib.escape(row['notes'] or '—').replace(chr(10),'<br>')}</div><div class='footer'>Packed by: ____________________ &nbsp;&nbsp; Date: __________</div></body></html>"""
+        suffix="-print" if auto_print else ""
+        path=PACKING_LIST_DIR/f"{row['order_no']}{suffix}-packing-list.html"
+        path.write_text(page,encoding="utf-8")
+        if not auto_print:
+            with self.db.connect() as c:c.execute("UPDATE orders SET packing_list_path=?,updated_at=? WHERE id=?",(str(path),datetime.now().isoformat(timespec="seconds"),order_id))
+        return path
+
+    def view_packing_list(self,order_id):
+        try:path=self._generate_packing_list(order_id)
+        except Exception as exc:messagebox.showerror("Packing list",str(exc),parent=self);return
+        if path:webbrowser.open(path.as_uri());self.status_flash("Packing list opened")
+
+    def print_packing_list(self,order_id):
+        try:path=self._generate_packing_list(order_id,auto_print=True)
+        except Exception as exc:messagebox.showerror("Packing list",str(exc),parent=self);return
+        if path:
+            webbrowser.open(path.as_uri())
+            self.status_flash("Packing list opened in the print dialog")
+
+    def show_scheduled_messages(self,order_id):
+        win=tk.Toplevel(self);win.title("Scheduled Customer Messages");win.geometry("820x430");win.transient(self)
+        outer=ttk.Frame(win,padding=12);outer.pack(fill="both",expand=True)
+        tree=ttk.Treeview(outer,columns=("send","purpose","provider","status"),show="headings")
+        for key,title,width in [("send","Send At",165),("purpose","Message",170),("provider","Provider",180),("status","Status",100)]:tree.heading(key,text=title);tree.column(key,width=width,anchor="w")
+        def refresh():
+            tree.delete(*tree.get_children())
+            for m in self.db.scheduled_messages(order_id):
+                try:when=datetime.fromisoformat(m["send_at"]).strftime("%m/%d/%Y %I:%M %p")
+                except Exception:when=m["send_at"]
+                tree.insert("","end",iid=str(m["id"]),values=(when,m["purpose"].title(),m["provider"],m["status"]))
+        tree.pack(fill="both",expand=True)
+        buttons=ttk.Frame(outer);buttons.pack(fill="x",pady=(8,0))
+        def cancel():
+            if tree.selection():self.db.set_scheduled_message_status(int(tree.selection()[0]),"Cancelled");refresh()
+        def send_now():
+            if not tree.selection():return
+            mid=int(tree.selection()[0]);m=next((x for x in self.db.scheduled_messages(order_id) if int(x["id"])==mid),None)
+            if m and self._send_customer_message(order_id,m["message"],m["purpose"],m["balance"],provider=m["provider"]):self.db.set_scheduled_message_status(mid,"Sent");refresh()
+        ttk.Button(buttons,text="Cancel Scheduled Message",style="Danger.TButton",command=cancel).pack(side="left")
+        ttk.Button(buttons,text="Send Selected Now",style="Accent.TButton",command=send_now).pack(side="right")
+        ttk.Button(buttons,text="Close",command=win.destroy).pack(side="right",padx=(0,7));refresh()
 
     def show_marketplace(self):
         self.current_page = "marketplace"
@@ -2609,7 +2713,10 @@ class App(tk.Tk):
         add("Payment", ttk.Combobox(form,textvariable=vars["payment_method"],values=["Cash App","Venmo","PayPal","Cash","Zelle","Card","Other"]),3,0)
         add("Priority", ttk.Combobox(form,textvariable=vars["priority"],values=["Low","Normal","High","Rush"],state="readonly"),3,2)
         add("Due date", ttk.Entry(form,textvariable=vars["due_date"]),4,0)
-        add("Tracking #", ttk.Entry(form,textvariable=vars["tracking_no"]),4,2)
+        tracking_box=ttk.Frame(form,style="Card.TFrame")
+        ttk.Entry(tracking_box,textvariable=vars["tracking_no"]).pack(side="left",fill="x",expand=True)
+        ttk.Button(tracking_box,text="Track Shipment",command=lambda:self.open_order_tracking(order_id)).pack(side="left",padx=(6,0))
+        add("Tracking #",tracking_box,4,2)
         add("Source", ttk.Combobox(form,textvariable=vars["source"],values=["Manual","Facebook Marketplace","Repeat Buyer","Other"],state="readonly"),5,0)
         add("Messenger link", ttk.Entry(form,textvariable=vars["messenger_url"]),5,2)
         add("Primary color", ttk.Entry(form,textvariable=vars["primary_color"]),6,0)
@@ -2705,6 +2812,9 @@ class App(tk.Tk):
             ttk.Button(action_bar,text="Capture from Pirate Ship",command=lambda:self.open_pirateship_browser(order_id)),
             ttk.Button(action_bar,text="View Shipping Label",command=lambda:self.view_shipping_label(order_id)),
             ttk.Button(action_bar,text="Print Shipping Label",command=lambda:self.print_shipping_label(order_id)),
+            ttk.Button(action_bar,text="View Packing List",command=lambda:self.view_packing_list(order_id)),
+            ttk.Button(action_bar,text="Print Packing List",command=lambda:self.print_packing_list(order_id)),
+            ttk.Button(action_bar,text="Scheduled Messages",command=lambda:self.show_scheduled_messages(order_id)),
             ttk.Button(action_bar,text="Export CSV Only",command=lambda:self.export_pirateship(order_id)),
             ttk.Button(action_bar,text="Check Tracking",command=lambda:self.open_order_tracking(order_id)),
             ttk.Button(action_bar,text="Mark Shipped",command=lambda:self.mark_shipping_status(order_id,"Shipped")),
@@ -6458,10 +6568,10 @@ class App(tk.Tk):
         for key,value in values.items(): message=message.replace("{"+key+"}",str(value))
         return message.strip()
 
-    def _send_customer_message(self, order_id, message, purpose="message", balance=0.0):
+    def _send_customer_message(self, order_id, message, purpose="message", balance=0.0, provider=None):
         row=self.db.order(order_id)
         if not row:return False
-        provider=self._message_provider()
+        provider=provider or self._message_provider()
         buyer=(row["buyer_name"] or "the buyer").strip()
         first=buyer.split()[0] if buyer.split() else buyer
         if provider=="Marketplace Messenger":
@@ -6490,6 +6600,66 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Messaging integration",str(exc),parent=self);return False
 
+    def _prompt_customer_message(self,order_id,message,purpose="message",balance=0.0):
+        """Ask whether to send now, persist a delay, or skip the message."""
+        row=self.db.order(order_id)
+        if not row:return "cancel"
+        result={"action":"cancel"}
+        win=tk.Toplevel(self);win.title("Customer message");win.geometry("650x430");win.minsize(540,390);win.transient(self);win.grab_set()
+        outer=ttk.Frame(win,padding=16);outer.pack(fill="both",expand=True)
+        ttk.Label(outer,text=f"{purpose.title()} for {row['buyer_name']}",style="Title.TLabel").pack(anchor="w")
+        ttk.Label(outer,text=f"Provider: {self._message_provider()}",style="Card.TLabel").pack(anchor="w",pady=(3,8))
+        preview=tk.Text(outer,height=7,wrap="word",bg=self.INPUT,fg=self.TEXT,insertbackground=self.TEXT,relief="solid",bd=1,font=("Segoe UI",10))
+        preview.pack(fill="both",expand=True);preview.insert("1.0",message);preview.configure(state="disabled")
+        ttk.Label(outer,text="Ready to send it now? If the order is still printing, choose a delay. Scheduled messages are saved even if PrintFlow closes.",wraplength=600,justify="left").pack(anchor="w",pady=(9,5))
+        delay_var=tk.StringVar(value="2 hours")
+        custom_var=tk.StringVar(value=(datetime.now()+timedelta(hours=2)).strftime("%m/%d/%Y %I:%M %p"))
+        delay_row=ttk.Frame(outer);delay_row.pack(fill="x",pady=(0,10))
+        ttk.Label(delay_row,text="Delay").pack(side="left")
+        choices=["30 minutes","1 hour","2 hours","4 hours","8 hours","12 hours","Tomorrow","Order due date","Custom date/time"]
+        ttk.Combobox(delay_row,textvariable=delay_var,state="readonly",values=choices,width=20).pack(side="left",padx=(8,8))
+        ttk.Entry(delay_row,textvariable=custom_var,width=24).pack(side="left",fill="x",expand=True)
+        ttk.Label(outer,text="Custom format: MM/DD/YYYY HH:MM AM/PM",style="Card.TLabel").pack(anchor="w",pady=(0,9))
+        def send_now():
+            if self._send_customer_message(order_id,message,purpose,balance):result["action"]="sent";win.destroy()
+        def schedule():
+            option=delay_var.get();now=datetime.now()
+            offsets={"30 minutes":timedelta(minutes=30),"1 hour":timedelta(hours=1),"2 hours":timedelta(hours=2),"4 hours":timedelta(hours=4),"8 hours":timedelta(hours=8),"12 hours":timedelta(hours=12),"Tomorrow":timedelta(days=1)}
+            try:
+                if option in offsets:send_at=now+offsets[option]
+                elif option=="Order due date":
+                    due=(row["due_date"] or "").strip()
+                    parsed=None
+                    for fmt in ("%m/%d/%y","%m/%d/%Y","%Y-%m-%d"):
+                        try:parsed=datetime.strptime(due,fmt);break
+                        except ValueError:pass
+                    if not parsed:raise ValueError("This order does not have a valid due date.")
+                    send_at=parsed.replace(hour=9,minute=0,second=0)
+                else:
+                    send_at=datetime.strptime(custom_var.get().strip(),"%m/%d/%Y %I:%M %p")
+                if send_at<=now:raise ValueError("Choose a time in the future.")
+            except ValueError as exc:
+                messagebox.showwarning("Message delay",str(exc),parent=win);return
+            self.db.schedule_message(order_id,purpose,self._message_provider(),message,balance,send_at.isoformat(timespec="seconds"))
+            self.status_flash(f"{purpose.title()} scheduled for {send_at.strftime('%m/%d %I:%M %p')}")
+            result["action"]="scheduled";win.destroy()
+        buttons=ttk.Frame(outer);buttons.pack(fill="x")
+        ttk.Button(buttons,text="Don't Send",command=win.destroy).pack(side="left")
+        ttk.Button(buttons,text="Schedule for Later",command=schedule).pack(side="right",padx=(7,0))
+        ttk.Button(buttons,text="Send Now",style="Accent.TButton",command=send_now).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW",win.destroy);self.wait_window(win);return result["action"]
+
+    def _dispatch_scheduled_messages(self):
+        try:
+            item=self.db.next_due_message()
+            if item:
+                if self._send_customer_message(int(item["order_id"]),item["message"],item["purpose"],item["balance"],provider=item["provider"]):
+                    self.db.set_scheduled_message_status(int(item["id"]),"Sent")
+                else:self.db.set_scheduled_message_status(int(item["id"]),"Scheduled")
+        finally:
+            try:self.after(30000,self._dispatch_scheduled_messages)
+            except Exception:pass
+
     def prepare_shipping_label(self, order_id):
         if self.current_order_id == order_id:
             self.flush_order_autosave()
@@ -6505,17 +6675,11 @@ class App(tk.Tk):
             first_name = buyer.split()[0] if buyer.split() else buyer
             template=self.db.get_setting("balance_message_template", "Hi {first_name}, your remaining balance of {balance} needs to be paid in full before I can ship your order. Thank you!")
             message=self._format_customer_message(template,row,balance=balance)
-            provider=self._message_provider()
-            send_reminder = messagebox.askyesno(
-                "Payment required before shipping",
-                f"This order still has a balance of {self.money(balance)}.\n\n"
-                f"PrintFlow will use {provider} for the reminder below:\n\n{message}\n\n"
-                "Choose Yes to send the reminder. Choose No to bypass it and continue to the shipping label.",
-                parent=self,
-            )
-            if send_reminder:
-                self._send_customer_message(order_id,message,"payment reminder",balance=balance)
+            action=self._prompt_customer_message(order_id,message,"payment reminder",balance=balance)
+            if action == "sent":
                 return
+            if action == "scheduled":
+                self.status_flash(f"Payment reminder scheduled • continuing to shipping label")
             self.status_flash(f"Payment reminder bypassed • {self.money(balance)} still due")
         try:
             row = self._ensure_package_dimensions_for_pirateship(order_id) or row
