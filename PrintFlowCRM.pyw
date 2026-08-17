@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.63"
+VERSION = "0.7.64"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -121,6 +121,7 @@ MESSENGER_CAPTURE_FILE = DATA_DIR / "messenger_capture.json"
 MESSENGER_PAYMENT_REQUEST_FILE = DATA_DIR / "messenger_payment_request.json"
 PIRATESHIP_SCAN_REQUEST_FILE = DATA_DIR / "pirateship_scan_request.json"
 PIRATESHIP_SCAN_RESULT_FILE = DATA_DIR / "pirateship_scan_result.json"
+PIRATESHIP_LABEL_RESULT_FILE = DATA_DIR / "pirateship_label_result.json"
 PYTHON_PACKAGES_DIR = DATA_DIR / "python_packages"
 PYTHON_PACKAGES_STAGING_DIR = DATA_DIR / "python_packages_staging"
 PYTHON_PACKAGES_BACKUP_DIR = DATA_DIR / "python_packages_previous"
@@ -378,6 +379,7 @@ class Database:
                 ("tracking_registered_no", "TEXT DEFAULT ''"),
                 ("tracking_last_status", "TEXT DEFAULT ''"),
                 ("tracking_checked_at", "TEXT DEFAULT ''"),
+                ("shipping_label_path", "TEXT DEFAULT ''"),
             ]:
                 if col not in order_columns:
                     c.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
@@ -1475,6 +1477,7 @@ class App(tk.Tk):
         self._model_search_generation = 0
         self._messenger_capture_seen = ""
         self._pirateship_result_seen = ""
+        self._pirateship_label_seen = ""
         try:
             if MESSENGER_CAPTURE_FILE.exists():
                 self._messenger_capture_seen = json.loads(MESSENGER_CAPTURE_FILE.read_text(encoding="utf-8")).get("captured_at", "")
@@ -1483,6 +1486,11 @@ class App(tk.Tk):
         try:
             if PIRATESHIP_SCAN_RESULT_FILE.exists():
                 self._pirateship_result_seen=json.loads(PIRATESHIP_SCAN_RESULT_FILE.read_text(encoding="utf-8")).get("captured_at","")
+        except Exception:
+            pass
+        try:
+            if PIRATESHIP_LABEL_RESULT_FILE.exists():
+                self._pirateship_label_seen=json.loads(PIRATESHIP_LABEL_RESULT_FILE.read_text(encoding="utf-8")).get("captured_at","")
         except Exception:
             pass
         self._configure_styles()
@@ -2117,11 +2125,52 @@ class App(tk.Tk):
                         provider=self._message_provider()
                         if messagebox.askyesno("Send tracking to customer",f"Tracking number {tracking} was captured.\n\nSend this update to {row['buyer_name']} using {provider}?\n\n{message}",parent=self):
                             self._send_customer_message(order_id,message,"tracking update")
+            if PIRATESHIP_LABEL_RESULT_FILE.exists():
+                label_data=json.loads(PIRATESHIP_LABEL_RESULT_FILE.read_text(encoding="utf-8"))
+                label_stamp=label_data.get("captured_at","")
+                if label_stamp and label_stamp!=self._pirateship_label_seen:
+                    self._pirateship_label_seen=label_stamp
+                    order_id=int(label_data.get("order_id") or 0)
+                    row=self.db.order(order_id)
+                    path=Path(label_data.get("label_path") or "")
+                    if row and path.is_file() and path.read_bytes()[:5]==b"%PDF-":
+                        with self.db.connect() as c:
+                            c.execute("UPDATE orders SET shipping_label_path=?, updated_at=? WHERE id=?",(str(path),label_stamp,order_id))
+                        self.status_flash(f"Saved 4×6 shipping label • {row['order_no']}")
+                        if self.current_page=="orders":self.show_orders(order_id)
         except Exception:
             pass
         finally:
             try:self.after(2500,self._poll_pirateship_scan_result)
             except Exception:pass
+
+    def _shipping_label_path(self,order_id):
+        row=self.db.order(order_id)
+        if not row:return None
+        path=Path((row["shipping_label_path"] or "").strip()) if "shipping_label_path" in row.keys() else None
+        return path if path and path.is_file() else None
+
+    def view_shipping_label(self,order_id):
+        path=self._shipping_label_path(order_id)
+        if not path:
+            messagebox.showinfo("Shipping label not saved","No saved label is attached to this order yet.\n\nOpen the order with Capture from Pirate Ship, then generate or reprint the 4×6 label. PrintFlow will preserve the PDF automatically.",parent=self);return
+        try:
+            os.startfile(str(path)) if os.name=="nt" else webbrowser.open(path.as_uri())
+        except Exception as exc:messagebox.showerror("View shipping label",str(exc),parent=self)
+
+    def print_shipping_label(self,order_id):
+        path=self._shipping_label_path(order_id)
+        if not path:
+            self.view_shipping_label(order_id);return
+        if os.name!="nt":
+            self.view_shipping_label(order_id);return
+        if not messagebox.askyesno("Print 4×6 shipping label",f"Send the saved 4×6 PDF to your Windows default printer?\n\n{path.name}\n\nMake sure your thermal label printer is the default printer and is loaded with 4×6 labels.",parent=self):return
+        try:
+            os.startfile(str(path),"print")
+            self.status_flash("4×6 shipping label sent to the default printer")
+        except Exception as exc:
+            messagebox.showerror("Print shipping label",f"Windows could not print the PDF automatically. PrintFlow will open it so you can choose Print manually.\n\n{exc}",parent=self)
+            self.view_shipping_label(order_id)
 
     def show_marketplace(self):
         self.current_page = "marketplace"
@@ -2654,6 +2703,8 @@ class App(tk.Tk):
             ttk.Button(action_bar,text="Queue via BambuBuddy",command=lambda:self.print_order(order_id)),
             ttk.Button(action_bar,text="Prepare Shipping Label",style="Accent.TButton",command=lambda:self.prepare_shipping_label(order_id)),
             ttk.Button(action_bar,text="Capture from Pirate Ship",command=lambda:self.open_pirateship_browser(order_id)),
+            ttk.Button(action_bar,text="View Shipping Label",command=lambda:self.view_shipping_label(order_id)),
+            ttk.Button(action_bar,text="Print Shipping Label",command=lambda:self.print_shipping_label(order_id)),
             ttk.Button(action_bar,text="Export CSV Only",command=lambda:self.export_pirateship(order_id)),
             ttk.Button(action_bar,text="Check Tracking",command=lambda:self.open_order_tracking(order_id)),
             ttk.Button(action_bar,text="Mark Shipped",command=lambda:self.mark_shipping_status(order_id,"Shipped")),

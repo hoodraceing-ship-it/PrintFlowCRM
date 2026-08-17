@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.64
+
+- Captured and preserved the original Pirate Ship 4x6 label PDF when a label is generated or reprinted in the integrated browser.
+- Added View Shipping Label and Print Shipping Label to every order profile.
+- Saved labels per order in PrintFlow's local application data so forgotten labels can be reopened later.
+- Printed saved 4x6 PDFs through the Windows default thermal printer with a confirmation and manual-view fallback.
+- Kept barcode quality intact by saving Pirate Ship's original PDF bytes instead of taking a screenshot.
+
 ## 0.7.63
 
 - Changed every PrintFlow-created BambuBuddy queue item to Queue Only / Manual Start mode.
