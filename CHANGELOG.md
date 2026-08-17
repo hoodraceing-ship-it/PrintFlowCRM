@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.62
+
+- Added Delete Order with a clear confirmation and protection for the customer's real files and folder.
+- Added Change Folder beside Customer Folder on every order.
+- Added Change Print Folder directly on the Buyers screen.
+- Kept existing BambuBuddy queue jobs untouched when their PrintFlow order is deleted.
+
 ## 0.7.61
 
 - Added an optional customer-message prompt immediately after a Pirate Ship tracking number is captured.

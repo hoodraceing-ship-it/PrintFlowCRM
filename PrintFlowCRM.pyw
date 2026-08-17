@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.61"
+VERSION = "0.7.62"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -527,6 +527,11 @@ class Database:
                  primary_color or "", secondary_color or "", material or "PLA", now, now),
             )
             return cur.lastrowid
+
+    def delete_order(self, order_id):
+        """Delete the CRM order and its attachment records, never the files on disk."""
+        with self.connect() as c:
+            c.execute("DELETE FROM orders WHERE id=?", (order_id,))
 
     def update_marketplace_chat(self, order_id, chat, primary_color=None, secondary_color=None):
         with self.connect() as c:
@@ -2615,6 +2620,7 @@ class App(tk.Tk):
         file_buttons = [
             ttk.Button(fb,text="+ Add Files",style="Accent.TButton",command=lambda:self.attach_files(order_id)),
             ttk.Button(fb,text="Customer Folder",command=lambda:self.browse_order_buyer_folder(order_id)),
+            ttk.Button(fb,text="Change Folder",command=lambda:self.change_order_buyer_folder(order_id)),
             ttk.Button(fb,text="Open",command=lambda:self.open_selected_file(order_id)),
             ttk.Button(fb,text="Remove",style="Danger.TButton",command=lambda:self.remove_selected_file(order_id)),
             ttk.Button(fb,text="Set Complete / Reset",command=lambda:self.toggle_selected_file_printed(order_id)),
@@ -2649,6 +2655,7 @@ class App(tk.Tk):
             ttk.Button(action_bar,text="Check Tracking",command=lambda:self.open_order_tracking(order_id)),
             ttk.Button(action_bar,text="Mark Shipped",command=lambda:self.mark_shipping_status(order_id,"Shipped")),
             ttk.Button(action_bar,text="Mark Delivered",command=lambda:self.mark_shipping_status(order_id,"Delivered")),
+            ttk.Button(action_bar,text="Delete Order",style="Danger.TButton",command=lambda:self.delete_order_with_confirmation(order_id)),
         ]
         if (row["source"] or "") == "Facebook Marketplace":
             action_buttons.extend([
@@ -2830,6 +2837,23 @@ class App(tk.Tk):
             self.status_flash("Order saved")
         except Exception as e:
             messagebox.showerror("Could not save", str(e), parent=self)
+
+    def delete_order_with_confirmation(self, order_id):
+        row=self.db.order(order_id)
+        if not row:return
+        if not messagebox.askyesno("Delete order",f"Permanently remove order {row['order_no']} for {row['buyer_name']} from PrintFlow?\n\nThe customer's actual files and customer folder will NOT be deleted. Existing BambuBuddy print jobs are also left alone.",parent=self):return
+        if self._autosave_after_id:
+            try:self.after_cancel(self._autosave_after_id)
+            except Exception:pass
+            self._autosave_after_id=None
+        self._autosave_context=None
+        self.current_order_id=None
+        try:
+            self.db.delete_order(order_id)
+            self.status_flash(f"Order {row['order_no']} deleted")
+            self.show_orders()
+        except Exception as exc:
+            messagebox.showerror("Could not delete order",str(exc),parent=self)
 
     def _file_type_label(self, name):
         n = name.lower()
@@ -6493,7 +6517,10 @@ class App(tk.Tk):
             tree.insert("","end",iid=str(b["id"]),values=(b["name"],b["phone"],b["email"],b["city"],b["state"],Path(folder).name if folder else "Not assigned"))
         tree.pack(fill="both",expand=True)
         bf=ttk.Frame(body,style="Card.TFrame");bf.pack(fill="x",pady=(10,0))
-        ttk.Button(bf,text="Edit",command=lambda:self.edit_selected_buyer(tree)).pack(side="left",padx=(0,5)); ttk.Button(bf,text="Open Print Folder",command=lambda:self.open_selected_buyer_folder(tree)).pack(side="left",padx=(0,5)); ttk.Button(bf,text="Delete",command=lambda:self.delete_selected_buyer(tree)).pack(side="left")
+        ttk.Button(bf,text="Edit",command=lambda:self.edit_selected_buyer(tree)).pack(side="left",padx=(0,5))
+        ttk.Button(bf,text="Change Print Folder",command=lambda:self.change_selected_buyer_folder(tree)).pack(side="left",padx=(0,5))
+        ttk.Button(bf,text="Open Print Folder",command=lambda:self.open_selected_buyer_folder(tree)).pack(side="left",padx=(0,5))
+        ttk.Button(bf,text="Delete",command=lambda:self.delete_selected_buyer(tree)).pack(side="left")
         tree.bind("<Double-1>",lambda e:self.edit_selected_buyer(tree))
 
     def _open_buyer_print_folder(self,buyer_id,offer_assign=True):
@@ -6642,6 +6669,29 @@ class App(tk.Tk):
     def open_selected_buyer_folder(self,tree):
         sel=tree.selection()
         if sel: self._open_buyer_print_folder(int(sel[0]))
+
+    def change_buyer_folder(self,buyer_id,refresh=None):
+        buyer=self.db.buyer(int(buyer_id))
+        if not buyer:return False
+        current=(buyer["print_files_folder"] or "").strip()
+        initial=current if current and Path(current).exists() else str(Path.home())
+        chosen=filedialog.askdirectory(parent=self,title=f"Choose a new print folder for {buyer['name']}",initialdir=initial)
+        if not chosen:return False
+        values=[buyer[k] or "" for k in ["name","phone","email","address1","address2","city","state","postal_code","country"]]+[chosen]
+        self.db.save_buyer(int(buyer_id),values)
+        self.status_flash(f"Customer folder changed for {buyer['name']}")
+        if refresh:refresh()
+        return True
+
+    def change_selected_buyer_folder(self,tree):
+        sel=tree.selection()
+        if not sel:
+            messagebox.showinfo("Change print folder","Select a customer first.",parent=self);return
+        self.change_buyer_folder(int(sel[0]),self.show_buyers)
+
+    def change_order_buyer_folder(self,order_id):
+        row=self.db.order(order_id)
+        if row:self.change_buyer_folder(int(row["buyer_id"]))
 
     def open_order_buyer_folder(self,order_id):
         row=self.db.order(order_id)
