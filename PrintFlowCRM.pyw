@@ -26,7 +26,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.68"
+VERSION = "0.7.69"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2391,11 +2391,10 @@ class App(tk.Tk):
         if not row:return None
         groups=self._group_order_files_for_display(self.db.order_files(order_id))
         file_rows=[]
-        for main,_helpers,members in groups:
+        for main,_helpers,_members in groups:
             name=main["original_name"] or Path(main["stored_path"]).name
-            status=self._aggregate_print_file_status(members,main)
-            file_rows.append(f"<tr><td>{html_lib.escape(name)}</td><td>{html_lib.escape(status)}</td></tr>")
-        if not file_rows:file_rows.append("<tr><td colspan='2'>No print files attached</td></tr>")
+            file_rows.append(f"<tr><td>{html_lib.escape(name)}</td></tr>")
+        if not file_rows:file_rows.append("<tr><td>No print files attached</td></tr>")
         city_line=" ".join(str(v or "").strip() for v in [row["city"],row["state"],row["postal_code"]] if str(v or "").strip())
         address="<br>".join(html_lib.escape(str(v)) for v in [row["address1"],row["address2"],city_line] if str(v or "").strip())
         script="<script>window.addEventListener('load',()=>setTimeout(()=>window.print(),300));</script>" if auto_print else ""
@@ -2404,7 +2403,7 @@ class App(tk.Tk):
 <div class='top'><div><h1>PACKING LIST</h1><b>PrintFlow CRM</b></div><div><b>Order:</b> {html_lib.escape(row['order_no'])}<br><b>Date:</b> {datetime.now().strftime('%m/%d/%Y')}<br><b>Quantity:</b> {int(row['quantity'] or 1)}</div></div>
 <div class='box'><b>Customer</b><br>{html_lib.escape(row['buyer_name'])}<br>{address}</div>
 <div class='box'><b>Order item</b><br>{html_lib.escape(row['item'] or '')}</div>
-<div class='box'><b>Printed files / parts to pack</b><table><thead><tr><th>File</th><th>Status</th><th class='check'>Packed</th></tr></thead><tbody>{''.join(r.replace('</tr>',"<td class='check'>☐</td></tr>") if "colspan" not in r else r for r in file_rows)}</tbody></table></div>
+<div class='box'><b>Printed files / parts to pack</b><table><thead><tr><th>File</th><th class='check'>Packed</th></tr></thead><tbody>{''.join(r.replace('</tr>',"<td class='check'>☐</td></tr>") for r in file_rows)}</tbody></table></div>
 <div class='box'><b>Customer notes</b><br>{html_lib.escape(row['notes'] or '—').replace(chr(10),'<br>')}</div><div class='footer'>Packed by: ____________________ &nbsp;&nbsp; Date: __________</div></body></html>"""
         suffix="-print" if auto_print else ""
         path=PACKING_LIST_DIR/f"{row['order_no']}{suffix}-packing-list.html"

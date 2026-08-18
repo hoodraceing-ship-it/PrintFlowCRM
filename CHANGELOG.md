@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.69
+
+- Removed the Status column and status values from packing lists, leaving a clean file/part list with Packed checkboxes.
+
 ## 0.7.68
 
 - Changed Print Shipping Label to open the native Windows print window instead of relying on a missing PDF print association.
