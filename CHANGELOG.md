@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.70
+
+- Added a built-in Model Library organized by the tool/product each model fits, with preview photos and dedicated folders.
+- Added quick link import that pulls page titles and preview images, downloads exposed source files, and extracts supported source files from ZIP archives.
+- Added quick local-file importing for sites that require a manual download click.
+- Blocked G-code and `.gcode.3mf` files from the Model Library while allowing STL, design 3MF, STEP, OBJ, AMF, SCAD, and F3D source files.
+
 ## 0.7.69
 
 - Removed the Status column and status values from packing lists, leaving a clean file/part list with Packed checkboxes.

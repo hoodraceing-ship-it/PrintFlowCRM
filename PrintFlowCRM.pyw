@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import html as html_lib
 import itertools
+import io
 import json
 import os
 import shutil
@@ -23,10 +24,10 @@ import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.69"
+VERSION = "0.7.70"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -119,6 +120,8 @@ BACKUP_DIR = DATA_DIR / "backups"
 PACKING_LIST_DIR = DATA_DIR / "packing_lists"
 PACKING_LIST_DIR.mkdir(exist_ok=True)
 THUMB_CACHE_DIR = DATA_DIR / "thumb_cache"
+MODEL_LIBRARY_DIR = DATA_DIR / "model_library"
+MODEL_LIBRARY_DIR.mkdir(exist_ok=True)
 APP_DIR = DATA_DIR / "App"
 MESSENGER_CAPTURE_FILE = DATA_DIR / "messenger_capture.json"
 MESSENGER_PAYMENT_REQUEST_FILE = DATA_DIR / "messenger_payment_request.json"
@@ -381,6 +384,30 @@ class Database:
                     created_at TEXT NOT NULL,
                     sent_at TEXT DEFAULT '',
                     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS model_library (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_name TEXT NOT NULL,
+                    model_number TEXT DEFAULT '',
+                    title TEXT DEFAULT '',
+                    source_url TEXT DEFAULT '',
+                    image_url TEXT DEFAULT '',
+                    image_path TEXT DEFAULT '',
+                    folder_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS model_library_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_id INTEGER NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    source_url TEXT DEFAULT '',
+                    sha256 TEXT DEFAULT '',
+                    added_at TEXT NOT NULL,
+                    FOREIGN KEY (model_id) REFERENCES model_library(id) ON DELETE CASCADE
                 );
                 """
             )
@@ -1516,6 +1543,8 @@ class App(tk.Tk):
         self.printer_map = {}
         self._model_photos = []
         self._model_search_generation = 0
+        self._library_photos = []
+        self._library_importing = False
         self._messenger_capture_seen = ""
         self._pirateship_result_seen = ""
         self._pirateship_label_seen = ""
@@ -1806,7 +1835,8 @@ class App(tk.Tk):
         tk.Label(self.nav, text="3D order desk", bg=self.NAV, fg="#8fa1b5", font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(0,18))
         for text, command in [
             ("Dashboard", self.show_dashboard), ("Orders", self.show_orders), ("Marketplace", self.show_marketplace),
-            ("Model Finder", self.show_model_finder), ("Buyers", self.show_buyers), ("Print Queue", self.show_queue), ("Settings", self.show_settings),
+            ("Model Finder", self.show_model_finder), ("Model Library", self.show_model_library),
+            ("Buyers", self.show_buyers), ("Print Queue", self.show_queue), ("Settings", self.show_settings),
         ]:
             ttk.Button(self.nav, text=text, style="Nav.TButton", command=command).pack(fill="x", padx=8, pady=2)
         tk.Frame(self.nav, bg=self.BORDER, height=1).pack(fill="x", padx=12, pady=15)
@@ -2476,6 +2506,346 @@ class App(tk.Tk):
         tree.pack(fill="both",expand=True)
         tree.bind("<Double-1>",lambda e:self._open_order_from_tree(tree))
         self.after(1200,self._poll_messenger_capture)
+
+    @staticmethod
+    def _model_source_allowed(name):
+        lower=Path(str(name or "")).name.lower()
+        if lower.endswith(".gcode.3mf") or ".gcode." in lower or lower.endswith((".gcode",".bgcode")):
+            return False
+        return lower.endswith((".stl",".3mf",".step",".stp",".obj",".amf",".scad",".f3d"))
+
+    @staticmethod
+    def _model_folder_name(value):
+        clean=re.sub(r"[^A-Za-z0-9._ -]+"," ",str(value or "")).strip()
+        clean=re.sub(r"\s+"," ",clean).rstrip(". ")
+        return (clean[:90] or "Unsorted Model")
+
+    def _library_rows(self):
+        with self.db.connect() as c:
+            return c.execute(
+                """SELECT m.*,COUNT(f.id) AS file_count FROM model_library m
+                   LEFT JOIN model_library_files f ON f.model_id=m.id
+                   GROUP BY m.id ORDER BY LOWER(m.product_name),LOWER(m.title)"""
+            ).fetchall()
+
+    def show_model_library(self,select_model_id=None):
+        if self.compact:
+            self.toggle_compact();return
+        self.current_page="model_library"
+        self.clear_main();self._library_photos=[]
+        self.page_header("Model Library","Source models organized by what they fit — G-code is never stored",
+                         "Add Clipboard Link",self._library_import_clipboard)
+        quick=self.card(self.main,12);quick.pack(fill="x",pady=(0,10))
+        ttk.Label(quick,text="Quick Add from a link",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,7))
+        self.library_url_var=tk.StringVar()
+        self.library_product_var=tk.StringVar(value=self.db.get_setting("model_library_last_product",""))
+        ttk.Label(quick,text="Model page link",style="Card.TLabel").grid(row=1,column=0,sticky="w")
+        ttk.Label(quick,text="Fits / product (optional)",style="Card.TLabel").grid(row=1,column=2,sticky="w",padx=(10,0))
+        url_entry=ttk.Entry(quick,textvariable=self.library_url_var)
+        url_entry.grid(row=2,column=0,columnspan=2,sticky="ew",padx=(0,10))
+        product_entry=ttk.Entry(quick,textvariable=self.library_product_var)
+        product_entry.grid(row=2,column=2,sticky="ew",padx=(0,10))
+        self.library_add_btn=ttk.Button(quick,text="Auto Add",style="Accent.TButton",command=self.start_model_library_import)
+        self.library_add_btn.grid(row=2,column=3,sticky="ew")
+        self.library_status=ttk.Label(quick,text="Paste a MakerWorld, Printables, Thingiverse, or other model-page link. Example product: Milwaukee M12 3/8 Impact 2562-20",style="Card.TLabel")
+        self.library_status.grid(row=3,column=0,columnspan=4,sticky="w",pady=(7,0))
+        quick.columnconfigure(0,weight=2);quick.columnconfigure(1,weight=1);quick.columnconfigure(2,weight=2)
+        url_entry.bind("<Return>",lambda _e:self.start_model_library_import())
+
+        pane=ttk.Panedwindow(self.main,orient="horizontal");pane.pack(fill="both",expand=True)
+        left=self.card(pane,10);right=self.card(pane,14);pane.add(left,weight=3);pane.add(right,weight=4)
+        search_var=tk.StringVar()
+        ttk.Entry(left,textvariable=search_var).pack(fill="x",pady=(0,8))
+        self.library_tree=ttk.Treeview(left,columns=("files",),show="tree headings",selectmode="browse")
+        self.library_tree.heading("#0",text="Fits / Product");self.library_tree.column("#0",width=310,anchor="w")
+        self.library_tree.heading("files",text="Files");self.library_tree.column("files",width=55,anchor="center",stretch=False)
+        sy=ttk.Scrollbar(left,orient="vertical",command=self.library_tree.yview);self.library_tree.configure(yscrollcommand=sy.set)
+        sy.pack(side="right",fill="y");self.library_tree.pack(side="left",fill="both",expand=True)
+        self.library_detail=right
+
+        def refill(*_args):
+            q=search_var.get().strip().lower();self.library_tree.delete(*self.library_tree.get_children())
+            for row in self._library_rows():
+                hay=" ".join(str(row[k] or "") for k in ("product_name","model_number","title","source_url")).lower()
+                if q and q not in hay:continue
+                label=row["product_name"]+(f"  ({row['model_number']})" if row["model_number"] and row["model_number"] not in row["product_name"] else "")
+                self.library_tree.insert("","end",iid=str(row["id"]),text=label,values=(row["file_count"],))
+            items=self.library_tree.get_children()
+            wanted=str(select_model_id) if select_model_id and str(select_model_id) in items else (items[0] if items else None)
+            if wanted:self.library_tree.selection_set(wanted);self.library_tree.focus(wanted);self._show_model_library_detail(int(wanted))
+            else:self._show_model_library_detail(None)
+        search_var.trace_add("write",refill)
+        self.library_tree.bind("<<TreeviewSelect>>",lambda _e:self._show_model_library_detail(int(self.library_tree.selection()[0])) if self.library_tree.selection() else None)
+        refill();url_entry.focus_set()
+
+    def _library_import_clipboard(self):
+        try:text=(self.clipboard_get() or "").strip()
+        except Exception:text=""
+        match=re.search(r"https?://\S+",text)
+        if not match:
+            messagebox.showinfo("Add Clipboard Link","Copy a model-page link, then click Add Clipboard Link.",parent=self);return
+        url=match.group(0).rstrip(".,;)>]\"")
+        extra=(text[:match.start()]+" "+text[match.end():]).strip(" |—-\t\r\n")
+        self.library_url_var.set(url)
+        if extra:self.library_product_var.set(extra[:180])
+        self.start_model_library_import()
+
+    def start_model_library_import(self):
+        if self._library_importing:return
+        url=(self.library_url_var.get() or "").strip()
+        if not re.match(r"^https?://",url,re.I):
+            messagebox.showwarning("Model link","Paste the full model-page link beginning with http:// or https://.",parent=self);return
+        product=(self.library_product_var.get() or "").strip()
+        self._library_importing=True;self.library_add_btn.configure(state="disabled")
+        self.library_status.configure(text="Reading the model page, preview photo, and available source downloads…")
+        def work():
+            try:data=self._inspect_model_library_link(url,product);error=None
+            except Exception as exc:data=None;error=str(exc)
+            self.after(0,lambda:self._finish_model_library_import(data,error))
+        threading.Thread(target=work,daemon=True,name="PrintFlowModelLibraryImport").start()
+
+    @staticmethod
+    def _page_meta(html_text,key):
+        escaped=re.escape(key)
+        patterns=[
+            rf'<meta[^>]+(?:property|name)=["\']{escaped}["\'][^>]+content=["\']([^"\']+)',
+            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{escaped}["\']',
+        ]
+        for pattern in patterns:
+            found=re.search(pattern,html_text,re.I)
+            if found:return html_lib.unescape(found.group(1).strip())
+        return ""
+
+    def _inspect_model_library_link(self,url,product_hint=""):
+        direct_name=Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
+        if self._model_source_allowed(direct_name) or direct_name.lower().endswith(".zip"):
+            title=Path(direct_name).stem or "Imported model"
+            return {"url":url,"title":title,"product":(product_hint or title)[:180],"model_number":"",
+                    "image_url":"","download_links":[url]}
+        request=urllib.request.Request(url,headers={"User-Agent":f"Mozilla/5.0 PrintFlowCRM/{VERSION}","Accept":"text/html,application/xhtml+xml"})
+        try:
+            with urllib.request.urlopen(request,timeout=30) as response:
+                final_url=response.geturl();raw=response.read(8_000_000)
+                charset=response.headers.get_content_charset() or "utf-8"
+        except urllib.error.HTTPError:
+            # A few model sites put bot protection in front of their public pages.
+            # Still create the organized entry instantly; the user can use Open Source
+            # and Add Local Files without retyping any product information.
+            slug=Path(urllib.parse.urlparse(url).path).name
+            slug=re.sub(r"^\d+-?","",slug);title=re.sub(r"[-_]+"," ",slug).strip().title() or "Imported model"
+            number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",product_hint or title,re.I)
+            number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
+            return {"url":url,"title":title,"product":(product_hint or title)[:180],"model_number":number[:40],
+                    "image_url":"","download_links":[]}
+        page=raw.decode(charset,errors="replace")
+        title=self._page_meta(page,"og:title") or self._page_meta(page,"twitter:title")
+        if not title:
+            m=re.search(r"<title[^>]*>(.*?)</title>",page,re.I|re.S);title=html_lib.unescape(re.sub(r"\s+"," ",m.group(1)).strip()) if m else "Imported model"
+        image_url=self._page_meta(page,"og:image") or self._page_meta(page,"twitter:image")
+        image_url=urllib.parse.urljoin(final_url,image_url) if image_url else ""
+        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",product_hint or title,re.I)
+        model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
+        product=(product_hint or title).strip()
+        links=[]
+        for match in re.findall(r'(?:href|data-url|download-url)=["\']([^"\']+)["\']',page,re.I):
+            absolute=html_lib.unescape(urllib.parse.urljoin(final_url,match))
+            clean=urllib.parse.unquote(urllib.parse.urlparse(absolute).path).lower()
+            if self._model_source_allowed(clean) or clean.endswith(".zip"):links.append(absolute)
+        # Some JavaScript pages keep CDN links inside JSON rather than anchor tags.
+        for match in re.findall(r'https?:\\?/\\?/[^"\'<> ]+?\.(?:stl|3mf|step|stp|obj|amf|scad|f3d|zip)(?:\?[^"\'<> ]*)?',page,re.I):
+            absolute=html_lib.unescape(match.replace("\\/","/"))
+            if absolute not in links:links.append(absolute)
+        return {"url":final_url,"title":title[:250],"product":product[:180],"model_number":model_number[:40],
+                "image_url":image_url,"download_links":list(dict.fromkeys(links))[:30]}
+
+    def _finish_model_library_import(self,data,error):
+        self._library_importing=False
+        if hasattr(self,"library_add_btn") and self.library_add_btn.winfo_exists():self.library_add_btn.configure(state="normal")
+        if error:
+            self.library_status.configure(text="The page could not be imported.")
+            messagebox.showerror("Auto Add model",error,parent=self);return
+        try:model_id,downloaded=self._save_model_library_import(data)
+        except Exception as exc:
+            messagebox.showerror("Auto Add model",str(exc),parent=self);return
+        self.db.set_setting("model_library_last_product",data["product"])
+        self.library_url_var.set("")
+        note=f"Added {downloaded} source file(s)." if downloaded else "Saved the page and photo. This site did not expose a direct source download; use Add Local Files after downloading it."
+        self.status_flash(note);self.show_model_library(model_id)
+
+    def _save_model_library_import(self,data):
+        now=datetime.now().isoformat(timespec="seconds")
+        product=self._model_folder_name(data.get("product") or data.get("title"))
+        with self.db.connect() as c:
+            existing=c.execute("SELECT * FROM model_library WHERE LOWER(product_name)=LOWER(?)",(product,)).fetchone()
+            if existing:
+                model_id=int(existing["id"]);folder=Path(existing["folder_path"])
+                c.execute("UPDATE model_library SET title=?,source_url=?,image_url=?,model_number=CASE WHEN model_number='' THEN ? ELSE model_number END,updated_at=? WHERE id=?",
+                          (data.get("title",""),data.get("url",""),data.get("image_url",""),data.get("model_number",""),now,model_id))
+            else:
+                folder=MODEL_LIBRARY_DIR/self._model_folder_name(product);folder.mkdir(parents=True,exist_ok=True)
+                cur=c.execute("INSERT INTO model_library(product_name,model_number,title,source_url,image_url,folder_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                              (product,data.get("model_number",""),data.get("title",""),data.get("url",""),data.get("image_url",""),str(folder),now,now))
+                model_id=int(cur.lastrowid)
+        folder.mkdir(parents=True,exist_ok=True)
+        image_path=""
+        if data.get("image_url"):
+            try:
+                cached=self._download_thumbnail(data["image_url"])
+                if cached:
+                    image=folder/"preview.png";shutil.copy2(cached,image);image_path=str(image)
+            except Exception:pass
+        downloaded=0
+        for link in data.get("download_links",[]):
+            try:downloaded+=self._download_model_library_source(model_id,folder,link)
+            except Exception:continue
+        with self.db.connect() as c:
+            if image_path:c.execute("UPDATE model_library SET image_path=?,updated_at=? WHERE id=?",(image_path,now,model_id))
+        return model_id,downloaded
+
+    def _download_model_library_source(self,model_id,folder,url):
+        request=urllib.request.Request(url,headers={"User-Agent":f"Mozilla/5.0 PrintFlowCRM/{VERSION}"})
+        with urllib.request.urlopen(request,timeout=45) as response:
+            if int(response.headers.get("Content-Length") or 0)>250_000_000:raise RuntimeError("Model download is larger than 250 MB")
+            data=response.read(250_000_001);disposition=response.headers.get("Content-Disposition") or ""
+            final_url=response.geturl()
+        if len(data)>250_000_000:raise RuntimeError("Model download is larger than 250 MB")
+        filename_match=re.search(r'filename\*?=(?:UTF-8[\'\']*)?["\']?([^"\';]+)',disposition,re.I)
+        name=urllib.parse.unquote(filename_match.group(1).strip()) if filename_match else Path(urllib.parse.unquote(urllib.parse.urlparse(final_url).path)).name
+        name=self._model_folder_name(name)
+        added=0
+        if name.lower().endswith(".zip") or data[:4]==b"PK\x03\x04" and not self._model_source_allowed(name):
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                for member in archive.infolist():
+                    member_name=Path(member.filename).name
+                    if member.is_dir() or not self._model_source_allowed(member_name):continue
+                    if member.file_size>250_000_000:continue
+                    added+=self._store_model_library_bytes(model_id,folder,member_name,archive.read(member),url)
+            return added
+        if self._model_source_allowed(name):return self._store_model_library_bytes(model_id,folder,name,data,url)
+        return 0
+
+    def _store_model_library_bytes(self,model_id,folder,name,data,source_url=""):
+        if not self._model_source_allowed(name):return 0
+        digest=hashlib.sha256(data).hexdigest();safe=self._model_folder_name(Path(name).name)
+        with self.db.connect() as c:
+            if c.execute("SELECT 1 FROM model_library_files WHERE model_id=? AND sha256=?",(model_id,digest)).fetchone():return 0
+            destination=folder/safe
+            if destination.exists():destination=folder/f"{Path(safe).stem}_{digest[:8]}{Path(safe).suffix}"
+            destination.write_bytes(data)
+            c.execute("INSERT INTO model_library_files(model_id,stored_path,original_name,source_url,sha256,added_at) VALUES(?,?,?,?,?,?)",
+                      (model_id,str(destination),safe,source_url,digest,datetime.now().isoformat(timespec="seconds")))
+        return 1
+
+    def _show_model_library_detail(self,model_id):
+        for widget in self.library_detail.winfo_children():widget.destroy()
+        if not model_id:
+            ttk.Label(self.library_detail,text="Your saved models will appear here.",style="CardTitle.TLabel").pack(anchor="w");return
+        with self.db.connect() as c:
+            row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
+            files=c.execute("SELECT * FROM model_library_files WHERE model_id=? ORDER BY LOWER(original_name)",(model_id,)).fetchall()
+        if not row:return
+        top=ttk.Frame(self.library_detail,style="Card.TFrame");top.pack(fill="x")
+        preview=tk.Label(top,text="No preview",bg=self.INPUT,fg=self.MUTED,width=24,height=9)
+        preview.pack(side="left",padx=(0,14))
+        image_path=Path(row["image_path"] or "")
+        if image_path.is_file():
+            try:
+                photo=tk.PhotoImage(file=str(image_path));factor=max(1,(max(photo.width(),photo.height())+219)//220)
+                if factor>1:photo=photo.subsample(factor,factor)
+                self._library_photos.append(photo);preview.configure(image=photo,text="",width=220,height=145)
+            except Exception:pass
+        body=ttk.Frame(top,style="Card.TFrame");body.pack(side="left",fill="both",expand=True)
+        ttk.Label(body,text=row["product_name"],style="CardTitle.TLabel",wraplength=520).pack(anchor="w")
+        if row["model_number"]:ttk.Label(body,text="Model: "+row["model_number"],style="Card.TLabel").pack(anchor="w",pady=(4,0))
+        ttk.Label(body,text=row["title"] or "Imported model",style="Card.TLabel",wraplength=520,justify="left").pack(anchor="w",pady=(4,8))
+        actions=ttk.Frame(body,style="Card.TFrame");actions.pack(fill="x")
+        ttk.Button(actions,text="Add Local Files",style="Accent.TButton",command=lambda:self._library_add_local_files(model_id)).pack(side="left",padx=(0,6))
+        ttk.Button(actions,text="Open Folder",command=lambda:self._open_library_folder(row["folder_path"])).pack(side="left",padx=(0,6))
+        ttk.Button(actions,text="Rename",command=lambda:self._rename_library_product(model_id)).pack(side="left",padx=(0,6))
+        ttk.Button(actions,text="Change Photo",command=lambda:self._library_change_photo(model_id)).pack(side="left",padx=(0,6))
+        if row["source_url"]:ttk.Button(actions,text="Open Source",command=lambda:webbrowser.open(row["source_url"])).pack(side="left")
+        ttk.Label(self.library_detail,text=f"Source files ({len(files)})",style="CardTitle.TLabel").pack(anchor="w",pady=(18,7))
+        tree=ttk.Treeview(self.library_detail,columns=("type",),show="headings",height=max(5,min(12,len(files)+1)))
+        tree.heading("type",text="File type");tree.column("type",width=90,stretch=False)
+        tree["columns"]=("name","type");tree.heading("name",text="File");tree.column("name",width=430);tree.heading("type",text="Type")
+        for item in files:tree.insert("","end",iid=str(item["id"]),values=(item["original_name"],Path(item["original_name"]).suffix.upper().lstrip(".")))
+        tree.pack(fill="both",expand=True)
+        bottom=ttk.Frame(self.library_detail,style="Card.TFrame");bottom.pack(fill="x",pady=(8,0))
+        ttk.Button(bottom,text="Delete Selected File",style="Danger.TButton",command=lambda:self._delete_library_file(model_id,tree)).pack(side="left")
+        ttk.Button(bottom,text="Delete Product",style="Danger.TButton",command=lambda:self._delete_library_product(model_id)).pack(side="right")
+
+    def _library_add_local_files(self,model_id):
+        paths=filedialog.askopenfilenames(parent=self,title="Add source models (no G-code)",filetypes=[("3D source models","*.stl *.3mf *.step *.stp *.obj *.amf *.scad *.f3d"),("All files","*.*")])
+        if not paths:return
+        with self.db.connect() as c:row=c.execute("SELECT folder_path FROM model_library WHERE id=?",(model_id,)).fetchone()
+        if not row:return
+        added=0
+        for value in paths:
+            source=Path(value)
+            if not self._model_source_allowed(source.name):continue
+            try:added+=self._store_model_library_bytes(model_id,Path(row["folder_path"]),source.name,source.read_bytes(),"")
+            except Exception:continue
+        self.status_flash(f"Added {added} source file(s) • G-code excluded");self.show_model_library(model_id)
+
+    def _rename_library_product(self,model_id):
+        with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
+        if not row:return
+        value=simpledialog.askstring("Rename product","What do these models fit?",initialvalue=row["product_name"],parent=self)
+        if not value or not value.strip():return
+        value=self._model_folder_name(value)
+        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",value,re.I)
+        model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else row["model_number"]
+        old_folder=Path(row["folder_path"]);new_folder=MODEL_LIBRARY_DIR/self._model_folder_name(value)
+        if new_folder!=old_folder and not new_folder.exists():
+            try:old_folder.rename(new_folder)
+            except Exception:new_folder=old_folder
+        with self.db.connect() as c:
+            c.execute("UPDATE model_library SET product_name=?,model_number=?,folder_path=?,updated_at=? WHERE id=?",
+                      (value,model_number,str(new_folder),datetime.now().isoformat(timespec="seconds"),model_id))
+            if new_folder!=old_folder:
+                for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
+                    c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",(str(new_folder/Path(file_row["stored_path"]).name),file_row["id"]))
+                image_path=new_folder/"preview.png"
+                c.execute("UPDATE model_library SET image_path=? WHERE id=?",(str(image_path) if image_path.exists() else "",model_id))
+        self.db.set_setting("model_library_last_product",value);self.show_model_library(model_id)
+
+    def _library_change_photo(self,model_id):
+        selected=filedialog.askopenfilename(parent=self,title="Choose product/model photo",filetypes=[("Images","*.png *.jpg *.jpeg *.gif *.bmp *.webp"),("All files","*.*")])
+        if not selected:return
+        with self.db.connect() as c:row=c.execute("SELECT folder_path FROM model_library WHERE id=?",(model_id,)).fetchone()
+        if not row:return
+        destination=Path(row["folder_path"])/"preview.png"
+        try:
+            from PIL import Image
+            with Image.open(selected) as image:image.convert("RGB").save(destination,"PNG")
+            with self.db.connect() as c:c.execute("UPDATE model_library SET image_path=?,updated_at=? WHERE id=?",(str(destination),datetime.now().isoformat(timespec="seconds"),model_id))
+            self.show_model_library(model_id)
+        except Exception as exc:messagebox.showerror("Change model photo",str(exc),parent=self)
+
+    @staticmethod
+    def _open_library_folder(path):
+        folder=Path(path);folder.mkdir(parents=True,exist_ok=True)
+        if os.name=="nt":os.startfile(str(folder))
+        else:webbrowser.open(folder.as_uri())
+
+    def _delete_library_file(self,model_id,tree):
+        selected=tree.selection()
+        if not selected:return
+        file_id=int(selected[0])
+        with self.db.connect() as c:row=c.execute("SELECT * FROM model_library_files WHERE id=? AND model_id=?",(file_id,model_id)).fetchone()
+        if not row or not messagebox.askyesno("Delete source file",f"Delete {row['original_name']} from the Model Library?",parent=self):return
+        try:Path(row["stored_path"]).unlink(missing_ok=True)
+        except Exception:pass
+        with self.db.connect() as c:c.execute("DELETE FROM model_library_files WHERE id=?",(file_id,))
+        self.show_model_library(model_id)
+
+    def _delete_library_product(self,model_id):
+        with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
+        if not row or not messagebox.askyesno("Delete product library",f"Delete {row['product_name']} and all of its saved source files?",parent=self):return
+        try:shutil.rmtree(Path(row["folder_path"]),ignore_errors=True)
+        except Exception:pass
+        with self.db.connect() as c:c.execute("DELETE FROM model_library WHERE id=?",(model_id,))
+        self.show_model_library()
 
     def show_model_finder(self):
         if self.compact:
