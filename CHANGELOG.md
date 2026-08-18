@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.77
+
+- Replaced free-text-only group changes with an editable dropdown that lists every current Model Library group.
+- Allowed selecting an existing group when moving one product or renaming a whole group, with a confirmation before groups are merged.
+- Added the same current-group dropdown to link-import overrides and Add My Files while still allowing brand-new group names.
+
 ## 0.7.76
 
 - Added a group detail screen when a Model Library group is selected, including product, stock, and source-file totals.

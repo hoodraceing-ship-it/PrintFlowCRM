@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.76"
+VERSION = "0.7.77"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -3341,6 +3341,37 @@ class App(tk.Tk):
         aliases[old_category]=new_category
         self.db.set_setting("model_library_group_aliases",json.dumps(aliases,sort_keys=True))
 
+    def _library_group_choices(self,exclude=""):
+        current=sorted({str(row["category"]) for row in self._library_rows() if row["category"]},key=str.casefold)
+        defaults=[self._resolved_library_category(row[0]) for row in MODEL_CATEGORY_RULES]+[self._resolved_library_category("Other Models")]
+        choices=[];seen=set();excluded=str(exclude or "").casefold()
+        for value in current+defaults:
+            clean=clean_model_item_name(value);key=clean.casefold()
+            if key==excluded or key in seen:continue
+            seen.add(key);choices.append(clean)
+        return choices
+
+    def _choose_library_group(self,title,prompt,initial="",exclude=""):
+        result=[]
+        win=tk.Toplevel(self);win.title(title);win.transient(self);win.grab_set();win.resizable(False,False)
+        body=ttk.Frame(win,padding=16);body.pack(fill="both",expand=True)
+        ttk.Label(body,text=prompt,style="CardTitle.TLabel",wraplength=500,justify="left").pack(anchor="w")
+        ttk.Label(body,text="Select an existing group or type a new group name.",style="Sub.TLabel").pack(anchor="w",pady=(4,10))
+        value_var=tk.StringVar(value=initial)
+        combo=ttk.Combobox(body,textvariable=value_var,values=self._library_group_choices(exclude),state="normal",width=52)
+        combo.pack(fill="x")
+        buttons=ttk.Frame(body);buttons.pack(fill="x",pady=(14,0))
+        def accept():
+            value=(value_var.get() or "").strip()
+            if not value:
+                messagebox.showwarning(title,"Select a group or type a new group name.",parent=win);return
+            result.append(clean_model_item_name(value));win.destroy()
+        ttk.Button(buttons,text="Cancel",command=win.destroy).pack(side="right")
+        ttk.Button(buttons,text="Use This Group",style="Accent.TButton",command=accept).pack(side="right",padx=(0,8))
+        combo.focus_set();combo.select_range(0,"end")
+        win.bind("<Return>",lambda _e:accept());win.bind("<Escape>",lambda _e:win.destroy());win.wait_window()
+        return result[0] if result else ""
+
     def show_model_library(self,select_model_id=None,select_category=None):
         if self.compact:
             self.toggle_compact();return
@@ -3357,7 +3388,7 @@ class App(tk.Tk):
         ttk.Label(quick,text="Group override (optional)",style="Card.TLabel").grid(row=1,column=2,sticky="w",padx=(10,0))
         url_entry=ttk.Entry(quick,textvariable=self.library_url_var)
         url_entry.grid(row=2,column=0,columnspan=2,sticky="ew",padx=(0,10))
-        product_entry=ttk.Entry(quick,textvariable=self.library_product_var)
+        product_entry=ttk.Combobox(quick,textvariable=self.library_product_var,values=self._library_group_choices(),state="normal")
         product_entry.grid(row=2,column=2,sticky="ew",padx=(0,10))
         self.library_add_btn=ttk.Button(quick,text="Auto Add",style="Accent.TButton",command=self.start_model_library_import)
         self.library_add_btn.grid(row=2,column=3,sticky="ew")
@@ -3429,8 +3460,7 @@ class App(tk.Tk):
         name_entry.grid(row=1,column=1,sticky="ew",padx=(12,0),pady=5)
         ttk.Label(body,text="Product group").grid(row=2,column=0,sticky="w",pady=5)
         group_var=tk.StringVar(value=self._resolved_library_category(detect_model_category(suggested)))
-        current_groups=[row["category"] for row in self._library_rows() if row["category"]]
-        groups=list(dict.fromkeys([self._resolved_library_category(row[0]) for row in MODEL_CATEGORY_RULES]+current_groups+["Other Models"]))
+        groups=self._library_group_choices()
         ttk.Combobox(body,textvariable=group_var,values=groups,width=49).grid(row=2,column=1,sticky="ew",padx=(12,0),pady=5)
         ttk.Label(body,text="Tool / model number").grid(row=3,column=0,sticky="w",pady=5)
         number_var=tk.StringVar(value=detect_model_number(suggested))
@@ -3854,9 +3884,8 @@ class App(tk.Tk):
         return moved
 
     def _rename_library_group(self,category):
-        value=simpledialog.askstring("Rename product group","New group name:",initialvalue=category,parent=self)
-        if not value or not value.strip():return
-        new_category=clean_model_item_name(value)
+        new_category=self._choose_library_group("Rename product group",f'Rename "{category}" or select another group to merge into:',category,exclude=category)
+        if not new_category:return
         if new_category==category:return
         with self.db.connect() as c:
             existing=c.execute("SELECT COUNT(*) FROM model_library WHERE LOWER(category)=LOWER(?) AND category<>?",(new_category,category)).fetchone()[0]
@@ -4013,9 +4042,8 @@ class App(tk.Tk):
     def _change_library_category(self,model_id):
         with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
         if not row:return
-        value=simpledialog.askstring("Change product group","Group name:",initialvalue=row["category"] or detect_model_category(row["product_name"],row["title"]),parent=self)
-        if not value or not value.strip():return
-        category=clean_model_item_name(value)
+        category=self._choose_library_group("Change product group",f'Choose a group for "{row["product_name"]}":',row["category"] or detect_model_category(row["product_name"],row["title"]))
+        if not category or category==row["category"]:return
         old_folder=Path(row["folder_path"]);new_folder=MODEL_LIBRARY_DIR/self._model_folder_name(category)/self._model_folder_name(row["product_name"])
         if new_folder!=old_folder:
             if new_folder.exists():new_folder=new_folder.with_name(new_folder.name+f"-{model_id}")
