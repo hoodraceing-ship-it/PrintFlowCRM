@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.71
+
+- Changed View Packing List to open a native PrintFlow window instead of a web browser.
+- Replaced protected-page scraping for MakerWorld links with BambuBuddy's dedicated MakerWorld resolve/import integration.
+- Added real MakerWorld title, cover-photo, profile, and model-file importing through the user's configured Bambu Cloud connection.
+- Removed embedded G-code/toolpath files from imported MakerWorld 3MFs before saving them to the source-only Model Library.
+- Added Delete Entire Library with a dated recoverable backup, while keeping per-product and per-file deletion controls.
+- Added an always-visible printer strip across every screen with a saved printer selector, live printer state, current print filename, completion percentage, remaining time, and layer progress.
+- Added a continuously updating BambuBuddy camera thumbnail that opens into a large in-app live view when clicked, with automatic reconnection and a compact-window layout.
+
 ## 0.7.70
 
 - Added a built-in Model Library organized by the tool/product each model fits, with preview photos and dedicated folders.

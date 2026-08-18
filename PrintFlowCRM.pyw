@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.70"
+VERSION = "0.7.71"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -812,6 +812,48 @@ class BambuBuddyClient:
     def list_printers(self):
         return self._json_request("GET", "/printers/") or []
 
+    def printer_status(self, printer_id):
+        """Return BambuBuddy's current live state for one printer."""
+        return self._json_request("GET", f"/printers/{int(printer_id)}/status", timeout=12) or {}
+
+    def camera_stream_token(self):
+        """Create the short-lived token required by BambuBuddy's MJPEG camera stream."""
+        data = self._json_request("POST", "/printers/camera/stream-token", timeout=15) or {}
+        return str(data.get("token") or data.get("stream_token") or "").strip()
+
+    def camera_stream_url(self, printer_id, token, fps=5):
+        query = urllib.parse.urlencode({"fps": max(1, min(15, int(fps))), "token": str(token or "")})
+        return f"{self.api_base}/printers/{int(printer_id)}/camera/stream?{query}"
+
+    @staticmethod
+    def iter_mjpeg_frames(response, is_active=None):
+        """Yield complete images from BambuBuddy's multipart MJPEG response."""
+        active = is_active or (lambda: True)
+        while active():
+            content_length = None
+            while active():
+                line = response.readline()
+                if not line:
+                    return
+                stripped = line.strip()
+                if not stripped:
+                    if content_length is not None:
+                        break
+                    continue
+                lower = stripped.lower()
+                if lower.startswith(b"content-length:"):
+                    try:
+                        content_length = int(lower.split(b":", 1)[1].strip())
+                    except (ValueError, TypeError):
+                        content_length = None
+            if not content_length or content_length > 25_000_000:
+                continue
+            frame = response.read(content_length)
+            if len(frame) != content_length:
+                return
+            if frame.startswith((b"\xff\xd8", b"\x89PNG")):
+                yield frame
+
     def list_queue(self, printer_id=None, status=None):
         query = {}
         if printer_id is not None:
@@ -902,6 +944,26 @@ class BambuBuddyClient:
             raise RuntimeError(f"BambuBuddy download failed (HTTP {e.code}): {body}") from None
         except urllib.error.URLError as e:
             raise RuntimeError(f"Could not reach BambuBuddy: {e.reason}") from None
+
+    def makerworld_status(self):
+        return self._json_request("GET", "/makerworld/status", timeout=20) or {}
+
+    def resolve_makerworld(self, url):
+        return self._json_request("POST", "/makerworld/resolve", {"url": str(url)}, timeout=60) or {}
+
+    def import_makerworld(self, model_id, profile_id=None):
+        payload={"model_id":int(model_id),"profile_id":int(profile_id) if profile_id else None,"folder_id":None}
+        return self._json_request("POST", "/makerworld/import", payload, timeout=180) or {}
+
+    def download_makerworld_thumbnail(self, image_url, destination):
+        query=urllib.parse.urlencode({"url":str(image_url)})
+        request=urllib.request.Request(self.api_base+"/makerworld/thumbnail?"+query,headers=self._headers(),method="GET")
+        try:
+            with urllib.request.urlopen(request,timeout=45) as response:data=response.read(12_000_000)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"BambuBuddy thumbnail failed (HTTP {exc.code}).") from None
+        destination=Path(destination);destination.parent.mkdir(parents=True,exist_ok=True);destination.write_bytes(data)
+        return destination
 
     def upload_file(self, file_path: Path):
         boundary = "----PrintFlow" + uuid.uuid4().hex
@@ -1541,6 +1603,17 @@ class App(tk.Tk):
         self._autosave_after_id = None
         self._autosave_context = None
         self.printer_map = {}
+        self._top_printer_map = {}
+        self._top_printer_details = {}
+        self._top_printer_loading = False
+        self._top_printer_polling = False
+        self._top_printer_load_generation = 0
+        self._printer_camera_generation = 0
+        self._printer_camera_stopping = False
+        self._printer_camera_frame_bytes = None
+        self._printer_camera_photo = None
+        self._large_camera_window = None
+        self._large_camera_photo = None
         self._model_photos = []
         self._model_search_generation = 0
         self._library_photos = []
@@ -1575,6 +1648,9 @@ class App(tk.Tk):
         # This keeps BambuBuddy/Tailscale-style remote URLs reachable without making
         # Tailscale a hard dependency for open-source users.
         self.after(350, self._launch_remote_network_app_on_startup)
+        # The persistent printer strip is shared by every page and starts after
+        # the shell is visible so startup never waits on network/camera I/O.
+        self.after(700, self._initialize_printer_strip)
         # Keep file-level queue/printing/completion states synchronized with BambuBuddy.
         self.after(1800, self._schedule_print_status_sync)
         self.after(5000, self._schedule_tracking_status_sync)
@@ -1864,8 +1940,385 @@ class App(tk.Tk):
         self.update_banner_button.pack(side="right", padx=(12,0))
         self._available_update_info = None
 
+        # Persistent printer telemetry. This frame is outside self.main, so it
+        # stays visible while the user moves between every PrintFlow page.
+        self.printer_strip = tk.Frame(
+            self.content_shell, bg="#111923", height=112,
+            highlightthickness=1, highlightbackground=self.BORDER,
+        )
+        self.printer_strip.pack(fill="x")
+        self.printer_strip.pack_propagate(False)
+        self.printer_strip.columnconfigure(1, weight=1)
+
+        self.printer_select_frame = tk.Frame(self.printer_strip, bg="#111923")
+        self.printer_select_frame.grid(row=0, column=0, sticky="nsw", padx=(16, 18), pady=12)
+        tk.Label(self.printer_select_frame, text="PRINTER", bg="#111923", fg=self.MUTED,
+                 font=("Segoe UI Semibold", 8)).pack(anchor="w")
+        self.top_printer_var = tk.StringVar()
+        self.top_printer_combo = ttk.Combobox(
+            self.printer_select_frame, textvariable=self.top_printer_var, state="readonly", width=27,
+        )
+        self.top_printer_combo.pack(anchor="w", pady=(5, 0))
+        self.top_printer_combo.bind("<<ComboboxSelected>>", self._top_printer_changed)
+        self.top_printer_connection = tk.Label(
+            self.printer_select_frame, text="Connecting to BambuBuddy…", bg="#111923", fg=self.MUTED,
+            font=("Segoe UI", 8), anchor="w",
+        )
+        self.top_printer_connection.pack(anchor="w", pady=(5, 0))
+
+        self.printer_telemetry_frame = tk.Frame(self.printer_strip, bg="#111923")
+        self.printer_telemetry_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 18), pady=12)
+        self.printer_telemetry_frame.columnconfigure(0, weight=1)
+        status_row = tk.Frame(self.printer_telemetry_frame, bg="#111923")
+        status_row.grid(row=0, column=0, sticky="ew")
+        self.top_printer_state = tk.Label(
+            status_row, text="Connecting", bg="#111923", fg="#93c5fd",
+            font=("Segoe UI Semibold", 11), anchor="w",
+        )
+        self.top_printer_state.pack(side="left")
+        self.top_printer_percent = tk.Label(
+            status_row, text="—", bg="#111923", fg="white",
+            font=("Segoe UI Semibold", 11), anchor="e",
+        )
+        self.top_printer_percent.pack(side="right")
+        self.top_printer_file = tk.Label(
+            self.printer_telemetry_frame, text="Waiting for printer status…", bg="#111923", fg=self.TEXT,
+            font=("Segoe UI", 9), anchor="w",
+        )
+        self.top_printer_file.grid(row=1, column=0, sticky="ew", pady=(5, 5))
+        self.top_printer_progress_var = tk.DoubleVar(value=0)
+        self.top_printer_progress = ttk.Progressbar(
+            self.printer_telemetry_frame, variable=self.top_printer_progress_var, maximum=100,
+            style="Horizontal.TProgressbar",
+        )
+        self.top_printer_progress.grid(row=2, column=0, sticky="ew")
+        self.top_printer_detail = tk.Label(
+            self.printer_telemetry_frame, text="", bg="#111923", fg=self.MUTED,
+            font=("Segoe UI", 8), anchor="w",
+        )
+        self.top_printer_detail.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+
+        self.printer_camera_frame = tk.Frame(self.printer_strip, bg="#111923")
+        self.printer_camera_frame.grid(row=0, column=2, sticky="nse", padx=(0, 14), pady=9)
+        tk.Label(self.printer_camera_frame, text="LIVE CAMERA  •  CLICK TO ENLARGE", bg="#111923", fg=self.MUTED,
+                 font=("Segoe UI Semibold", 7)).pack(anchor="center", pady=(0, 4))
+        self.top_camera_label = tk.Label(
+            self.printer_camera_frame, text="Camera starting…", bg="#05070a", fg=self.MUTED,
+            font=("Segoe UI", 8), width=28, height=5, cursor="hand2",
+            highlightthickness=1, highlightbackground=self.BORDER,
+        )
+        self.top_camera_label.pack()
+        self.top_camera_label.bind("<Button-1>", self._open_large_printer_camera)
+
         self.main = ttk.Frame(self.content_shell, padding=(22,18))
         self.main.pack(fill="both", expand=True)
+
+    def _initialize_printer_strip(self, force=False):
+        if self._printer_camera_stopping or self._top_printer_loading:
+            return
+        self._top_printer_loading = True
+        self._top_printer_load_generation += 1
+        generation = self._top_printer_load_generation
+        try:
+            self.top_printer_connection.configure(text="Connecting to BambuBuddy…", fg=self.MUTED)
+        except tk.TclError:
+            return
+
+        def work():
+            try:
+                printers = self._client().list_printers()
+                self.after(0, lambda: self._apply_top_printers(printers, generation))
+            except Exception as exc:
+                self.after(0, lambda message=str(exc): self._top_printers_failed(message, generation))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _top_printers_failed(self, error, generation):
+        if generation != self._top_printer_load_generation or self._printer_camera_stopping:
+            return
+        self._top_printer_loading = False
+        self.top_printer_state.configure(text="Printer unavailable", fg="#fca5a5")
+        self.top_printer_file.configure(text="Check BambuBuddy connection in Settings")
+        self.top_printer_detail.configure(text=error)
+        self.top_printer_connection.configure(text="Will retry automatically", fg="#f59e0b")
+        self.top_camera_label.configure(text="Camera offline", image="")
+        self.after(15_000, self._initialize_printer_strip)
+
+    @staticmethod
+    def _printer_display_label(printer):
+        name = str(printer.get("name") or "Printer").strip()
+        model = str(printer.get("model") or printer.get("printer_type") or "").strip()
+        pid = str(printer.get("id") or "").strip()
+        suffix = f" • {model}" if model else ""
+        return f"{name}{suffix}  (ID {pid})"
+
+    def _apply_top_printers(self, printers, generation=None):
+        if generation is not None and generation != self._top_printer_load_generation:
+            return
+        self._top_printer_loading = False
+        valid = [p for p in (printers or []) if isinstance(p, dict) and p.get("id") is not None]
+        self._top_printer_details = {str(p.get("id")): p for p in valid}
+        self._top_printer_map = {self._printer_display_label(p): str(p.get("id")) for p in valid}
+        self.top_printer_combo["values"] = list(self._top_printer_map)
+        if not self._top_printer_map:
+            self.top_printer_var.set("")
+            self.top_printer_state.configure(text="No printers found", fg="#f59e0b")
+            self.top_printer_file.configure(text="Add a printer in BambuBuddy, then open Settings to reconnect")
+            self.top_printer_detail.configure(text="")
+            self.top_printer_connection.configure(text="Connected • 0 printers", fg=self.MUTED)
+            self.top_camera_label.configure(text="No camera", image="")
+            self.after(15_000, self._initialize_printer_strip)
+            return
+
+        saved = self.db.get_setting("bambuddy_printer_id", "")
+        selected = next((label for label, pid in self._top_printer_map.items() if pid == saved), "")
+        if not selected:
+            selected = next(iter(self._top_printer_map))
+        self.top_printer_var.set(selected)
+        self.top_printer_connection.configure(
+            text=f"BambuBuddy connected • {len(self._top_printer_map)} printer(s)", fg="#86efac",
+        )
+        self._begin_top_printer_session(save=True)
+
+    def _selected_top_printer_id(self):
+        return self._top_printer_map.get(self.top_printer_var.get(), "")
+
+    def _top_printer_changed(self, event=None):
+        self._begin_top_printer_session(save=True)
+
+    def _begin_top_printer_session(self, save=True):
+        printer_id = self._selected_top_printer_id()
+        if not printer_id:
+            return
+        if save:
+            self.db.set_setting("bambuddy_printer_id", printer_id)
+        self._printer_camera_generation += 1
+        generation = self._printer_camera_generation
+        self._printer_camera_frame_bytes = None
+        self._printer_camera_photo = None
+        self.top_camera_label.configure(image="", text="Camera connecting…")
+        self.top_printer_state.configure(text="Checking printer…", fg="#93c5fd")
+        self.top_printer_file.configure(text="Waiting for live status…")
+        self.top_printer_detail.configure(text="")
+        self.top_printer_progress_var.set(0)
+        self.top_printer_percent.configure(text="—")
+        self._schedule_top_printer_poll(0)
+        self._start_top_camera(printer_id, generation)
+
+    def _schedule_top_printer_poll(self, delay=2500):
+        old = getattr(self, "_top_printer_after_id", None)
+        if old:
+            try:
+                self.after_cancel(old)
+            except Exception:
+                pass
+        self._top_printer_after_id = self.after(max(0, int(delay)), self._poll_top_printer_status)
+
+    def _poll_top_printer_status(self):
+        self._top_printer_after_id = None
+        if self._printer_camera_stopping:
+            return
+        printer_id = self._selected_top_printer_id()
+        if not printer_id:
+            self._schedule_top_printer_poll(5000)
+            return
+        if self._top_printer_polling:
+            self._schedule_top_printer_poll(1000)
+            return
+        self._top_printer_polling = True
+
+        def work():
+            try:
+                status = self._client().printer_status(printer_id)
+                self.after(0, lambda: self._apply_top_printer_status(printer_id, status, None))
+            except Exception as exc:
+                self.after(0, lambda message=str(exc): self._apply_top_printer_status(printer_id, None, message))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _format_printer_minutes(value):
+        try:
+            minutes = max(0, int(float(value)))
+        except (TypeError, ValueError):
+            return ""
+        if minutes >= 60:
+            hours, remainder = divmod(minutes, 60)
+            return f"{hours}h {remainder}m remaining"
+        return f"{minutes}m remaining"
+
+    def _apply_top_printer_status(self, printer_id, status, error):
+        self._top_printer_polling = False
+        if self._printer_camera_stopping or printer_id != self._selected_top_printer_id():
+            return
+        if error:
+            self.top_printer_state.configure(text="Connection lost", fg="#fca5a5")
+            self.top_printer_detail.configure(text=error)
+            self._schedule_top_printer_poll(5000)
+            return
+
+        status = status or {}
+        connected = status.get("connected") is not False
+        raw_state = str(status.get("state") or status.get("gcode_state") or "Idle").strip()
+        state_key = raw_state.upper().replace(" ", "_")
+        state_names = {
+            "RUNNING": "Printing", "PRINTING": "Printing", "PAUSE": "Paused",
+            "PAUSED": "Paused", "FINISH": "Finished", "FINISHED": "Finished",
+            "FAILED": "Print failed", "ERROR": "Printer error", "IDLE": "Idle",
+            "OFFLINE": "Offline", "PREPARE": "Preparing", "SLICING": "Slicing",
+        }
+        state_text = "Offline" if not connected else state_names.get(state_key, raw_state.title() or "Idle")
+        state_color = "#86efac" if state_text == "Printing" else "#fbbf24" if state_text in ("Paused", "Preparing", "Slicing") else "#fca5a5" if state_text in ("Offline", "Print failed", "Printer error") else "#93c5fd"
+        self.top_printer_state.configure(text=state_text, fg=state_color)
+
+        file_name = str(
+            status.get("subtask_name") or status.get("current_print") or
+            status.get("gcode_file") or "No active print"
+        ).strip()
+        self.top_printer_file.configure(text=file_name)
+        try:
+            progress = max(0.0, min(100.0, float(status.get("progress") or 0)))
+        except (TypeError, ValueError):
+            progress = 0.0
+        self.top_printer_progress_var.set(progress)
+        self.top_printer_percent.configure(text=f"{progress:.0f}%" if file_name != "No active print" else "—")
+
+        details = []
+        remaining = self._format_printer_minutes(status.get("remaining_time"))
+        if remaining and file_name != "No active print":
+            details.append(remaining)
+        try:
+            layer = int(status.get("layer_num") or 0)
+            total_layers = int(status.get("total_layers") or 0)
+            if layer or total_layers:
+                details.append(f"Layer {layer:,} of {total_layers:,}" if total_layers else f"Layer {layer:,}")
+        except (TypeError, ValueError):
+            pass
+        self.top_printer_detail.configure(text=" • ".join(details) if details else ("Ready" if connected else "Printer is offline"))
+        if status.get("ipcam") is False and self._printer_camera_frame_bytes is None:
+            self.top_camera_label.configure(text="Camera unavailable", image="")
+        self._schedule_top_printer_poll(2500)
+
+    def _start_top_camera(self, printer_id, generation):
+        if self._printer_camera_stopping or generation != self._printer_camera_generation:
+            return
+
+        def work():
+            error = None
+            try:
+                client = self._client()
+                token = client.camera_stream_token()
+                request = urllib.request.Request(
+                    client.camera_stream_url(printer_id, token, fps=5),
+                    headers=client._headers({"Accept": "multipart/x-mixed-replace"}), method="GET",
+                )
+                with urllib.request.urlopen(request, timeout=35) as response:
+                    last_sent = 0.0
+                    active = lambda: (not self._printer_camera_stopping and generation == self._printer_camera_generation)
+                    for frame in client.iter_mjpeg_frames(response, active):
+                        if not active():
+                            return
+                        now = time.monotonic()
+                        if now - last_sent < 0.15:
+                            continue
+                        last_sent = now
+                        try:
+                            self.after(0, lambda data=frame: self._apply_top_camera_frame(data, generation))
+                        except (RuntimeError, tk.TclError):
+                            return
+            except Exception as exc:
+                error = str(exc)
+            if self._printer_camera_stopping or generation != self._printer_camera_generation:
+                return
+            try:
+                self.after(0, lambda: self._top_camera_disconnected(printer_id, generation, error))
+            except (RuntimeError, tk.TclError):
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _camera_photo(frame_bytes, width, height):
+        from PIL import Image, ImageTk
+        with Image.open(io.BytesIO(frame_bytes)) as source:
+            image = source.convert("RGB")
+        width, height = max(32, int(width)), max(32, int(height))
+        ratio = min(width / image.width, height / image.height)
+        size = (max(1, int(image.width * ratio)), max(1, int(image.height * ratio)))
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        image = image.resize(size, resampling)
+        canvas = Image.new("RGB", (width, height), "black")
+        canvas.paste(image, ((width - size[0]) // 2, (height - size[1]) // 2))
+        return ImageTk.PhotoImage(canvas)
+
+    def _apply_top_camera_frame(self, frame, generation):
+        if self._printer_camera_stopping or generation != self._printer_camera_generation:
+            return
+        self._printer_camera_frame_bytes = bytes(frame)
+        try:
+            self._printer_camera_photo = self._camera_photo(frame, 196, 74)
+            self.top_camera_label.configure(image=self._printer_camera_photo, text="", width=196, height=74)
+        except Exception as exc:
+            self.top_camera_label.configure(image="", text=f"Camera image error\n{exc}")
+            return
+        window = self._large_camera_window
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    self._render_large_camera_frame()
+            except tk.TclError:
+                self._large_camera_window = None
+
+    def _top_camera_disconnected(self, printer_id, generation, error=None):
+        if self._printer_camera_stopping or generation != self._printer_camera_generation:
+            return
+        if self._printer_camera_frame_bytes is None:
+            message = "Camera reconnecting…"
+            if error and "403" in error:
+                message = "Camera permission needed"
+            self.top_camera_label.configure(image="", text=message)
+        self.after(4000, lambda: self._start_top_camera(printer_id, generation))
+
+    def _open_large_printer_camera(self, event=None):
+        if self._large_camera_window is not None:
+            try:
+                if self._large_camera_window.winfo_exists():
+                    self._large_camera_window.deiconify()
+                    self._large_camera_window.lift()
+                    return
+            except tk.TclError:
+                pass
+        window = tk.Toplevel(self)
+        self._large_camera_window = window
+        window.title(f"Live Printer Camera — {self.top_printer_var.get() or 'Printer'}")
+        window.geometry("1100x700")
+        window.minsize(640, 420)
+        window.configure(bg="black")
+        self.large_camera_label = tk.Label(
+            window, text="Waiting for live camera…", bg="black", fg=self.MUTED,
+            font=("Segoe UI", 12), anchor="center",
+        )
+        self.large_camera_label.pack(fill="both", expand=True)
+        self.large_camera_label.bind("<Configure>", lambda event: self._render_large_camera_frame())
+
+        def close():
+            self._large_camera_window = None
+            self._large_camera_photo = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close)
+        self._render_large_camera_frame()
+
+    def _render_large_camera_frame(self):
+        if self._large_camera_window is None or not self._printer_camera_frame_bytes:
+            return
+        try:
+            width = max(320, self.large_camera_label.winfo_width())
+            height = max(240, self.large_camera_label.winfo_height())
+            self._large_camera_photo = self._camera_photo(self._printer_camera_frame_bytes, width, height)
+            self.large_camera_label.configure(image=self._large_camera_photo, text="")
+        except (tk.TclError, Exception):
+            pass
 
     def _restore_topmost(self):
         top = self.db.get_setting("always_top", "0") == "1"
@@ -1881,15 +2334,36 @@ class App(tk.Tk):
         if self.compact:
             self.db.set_setting("full_geometry", self.geometry())
             self.nav.pack_forget()
+            self._set_printer_strip_compact(True)
             self.geometry("470x720")
             self.minsize(430, 600)
             self.show_queue(compact=True)
         else:
+            self._set_printer_strip_compact(False)
             self.nav.pack(side="left", fill="y", before=self.content_shell)
             self.nav.pack_propagate(False)
             self.geometry(self.db.get_setting("full_geometry", "1180x760"))
             self.minsize(900, 620)
             self.show_dashboard()
+
+    def _set_printer_strip_compact(self, compact):
+        """Keep every live printer control usable when Compact Widget is narrow."""
+        try:
+            if compact:
+                self.printer_strip.configure(height=202)
+                self.printer_strip.columnconfigure(1, weight=1)
+                self.printer_select_frame.grid_configure(row=0, column=0, sticky="nsw", padx=(10, 8), pady=(9, 5))
+                self.printer_telemetry_frame.grid_configure(row=0, column=1, sticky="nsew", padx=(0, 10), pady=(9, 5))
+                self.printer_camera_frame.grid_configure(row=1, column=0, columnspan=2, sticky="n", padx=8, pady=(0, 8))
+                self.top_printer_combo.configure(width=17)
+            else:
+                self.printer_strip.configure(height=112)
+                self.printer_select_frame.grid_configure(row=0, column=0, columnspan=1, sticky="nsw", padx=(16, 18), pady=12)
+                self.printer_telemetry_frame.grid_configure(row=0, column=1, columnspan=1, sticky="nsew", padx=(0, 18), pady=12)
+                self.printer_camera_frame.grid_configure(row=0, column=2, columnspan=1, sticky="nse", padx=(0, 14), pady=9)
+                self.top_printer_combo.configure(width=27)
+        except tk.TclError:
+            pass
 
     def clear_main(self):
         self.flush_order_autosave()
@@ -2443,9 +2917,53 @@ class App(tk.Tk):
         return path
 
     def view_packing_list(self,order_id):
-        try:path=self._generate_packing_list(order_id)
-        except Exception as exc:messagebox.showerror("Packing list",str(exc),parent=self);return
-        if path:webbrowser.open(path.as_uri());self.status_flash("Packing list opened")
+        if self.current_order_id==order_id:self.flush_order_autosave()
+        row=self.db.order(order_id)
+        if not row:return
+        groups=self._group_order_files_for_display(self.db.order_files(order_id))
+        win=tk.Toplevel(self);win.title(f"Packing List — {row['order_no']}");win.geometry("760x680");win.minsize(620,520);win.transient(self)
+        outer=ttk.Frame(win,padding=18);outer.pack(fill="both",expand=True)
+        heading=ttk.Frame(outer);heading.pack(fill="x",pady=(0,14))
+        title=ttk.Frame(heading);title.pack(side="left",fill="x",expand=True)
+        ttk.Label(title,text="PACKING LIST",style="Title.TLabel").pack(anchor="w")
+        ttk.Label(title,text="PrintFlow CRM",style="Sub.TLabel").pack(anchor="w",pady=(2,0))
+        summary=ttk.Frame(heading);summary.pack(side="right")
+        ttk.Label(summary,text=f"Order: {row['order_no']}").pack(anchor="e")
+        ttk.Label(summary,text=f"Date: {datetime.now().strftime('%m/%d/%Y')}").pack(anchor="e")
+        ttk.Label(summary,text=f"Quantity: {int(row['quantity'] or 1)}").pack(anchor="e")
+
+        info=self.card(outer,12);info.pack(fill="x",pady=(0,12))
+        city_line=" ".join(str(v or "").strip() for v in (row["city"],row["state"],row["postal_code"]) if str(v or "").strip())
+        address="\n".join(str(v or "").strip() for v in (row["address1"],row["address2"],city_line) if str(v or "").strip())
+        ttk.Label(info,text="Customer",style="CardTitle.TLabel").grid(row=0,column=0,sticky="nw")
+        ttk.Label(info,text=(row["buyer_name"]+("\n"+address if address else "")),style="Card.TLabel",justify="left").grid(row=1,column=0,sticky="nw",pady=(4,0))
+        ttk.Label(info,text="Order item",style="CardTitle.TLabel").grid(row=0,column=1,sticky="nw",padx=(35,0))
+        ttk.Label(info,text=row["item"] or "—",style="Card.TLabel",wraplength=330,justify="left").grid(row=1,column=1,sticky="nw",padx=(35,0),pady=(4,0))
+        info.columnconfigure(0,weight=1);info.columnconfigure(1,weight=1)
+
+        ttk.Label(outer,text="Printed files / parts to pack",style="CardTitle.TLabel").pack(anchor="w",pady=(0,6))
+        files_frame=ttk.Frame(outer);files_frame.pack(fill="both",expand=True)
+        tree=ttk.Treeview(files_frame,columns=("file","packed"),show="headings")
+        tree.heading("file",text="File / part");tree.column("file",width=540,anchor="w")
+        tree.heading("packed",text="Packed");tree.column("packed",width=80,anchor="center",stretch=False)
+        for main,_helpers,_members in groups:
+            name=main["original_name"] or Path(main["stored_path"]).name
+            tree.insert("","end",values=(name,"☐"))
+        if not groups:tree.insert("","end",values=("No print files attached",""))
+        sy=ttk.Scrollbar(files_frame,orient="vertical",command=tree.yview);tree.configure(yscrollcommand=sy.set)
+        sy.pack(side="right",fill="y");tree.pack(side="left",fill="both",expand=True)
+        def toggle_packed(event):
+            item=tree.identify_row(event.y);column=tree.identify_column(event.x)
+            if item and column=="#2":
+                values=list(tree.item(item,"values"));values[1]="✓" if values[1]!="✓" else "☐";tree.item(item,values=values)
+        tree.bind("<Button-1>",toggle_packed,add="+")
+        notes=self.card(outer,10);notes.pack(fill="x",pady=(12,10))
+        ttk.Label(notes,text="Customer notes",style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(notes,text=row["notes"] or "—",style="Card.TLabel",wraplength=680,justify="left").pack(anchor="w",pady=(4,0))
+        buttons=ttk.Frame(outer);buttons.pack(fill="x")
+        ttk.Button(buttons,text="Close",command=win.destroy).pack(side="right")
+        ttk.Button(buttons,text="Print Packing List",style="Accent.TButton",command=lambda:self.print_packing_list(order_id)).pack(side="right",padx=(0,8))
+        self.status_flash("Packing list opened inside PrintFlow")
 
     def print_packing_list(self,order_id):
         try:path=self._generate_packing_list(order_id,auto_print=True)
@@ -2534,7 +3052,7 @@ class App(tk.Tk):
         self.current_page="model_library"
         self.clear_main();self._library_photos=[]
         self.page_header("Model Library","Source models organized by what they fit — G-code is never stored",
-                         "Add Clipboard Link",self._library_import_clipboard)
+                         "Add Clipboard Link",self._library_import_clipboard,"Delete Entire Library",self._delete_entire_model_library)
         quick=self.card(self.main,12);quick.pack(fill="x",pady=(0,10))
         ttk.Label(quick,text="Quick Add from a link",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,7))
         self.library_url_var=tk.StringVar()
@@ -2617,6 +3135,8 @@ class App(tk.Tk):
         return ""
 
     def _inspect_model_library_link(self,url,product_hint=""):
+        if "makerworld.com" in (urllib.parse.urlparse(url).hostname or "").lower():
+            return self._inspect_makerworld_library_link(url,product_hint)
         direct_name=Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
         if self._model_source_allowed(direct_name) or direct_name.lower().endswith(".zip"):
             title=Path(direct_name).stem or "Imported model"
@@ -2658,6 +3178,24 @@ class App(tk.Tk):
         return {"url":final_url,"title":title[:250],"product":product[:180],"model_number":model_number[:40],
                 "image_url":image_url,"download_links":list(dict.fromkeys(links))[:30]}
 
+    def _inspect_makerworld_library_link(self,url,product_hint=""):
+        client=self._client()
+        resolved=client.resolve_makerworld(url)
+        design=resolved.get("design") or {}
+        title=str(design.get("title") or design.get("name") or "MakerWorld model").strip()
+        image_url=str(design.get("coverUrl") or design.get("cover_url") or design.get("thumbnail") or "").strip()
+        profile_id=resolved.get("profile_id")
+        instances=resolved.get("instances") or []
+        if not profile_id:
+            for instance in instances:
+                profile_id=instance.get("profileId") or instance.get("profile_id")
+                if profile_id:break
+        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",product_hint or title,re.I)
+        model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
+        return {"url":url,"title":title[:250],"product":str(product_hint or title)[:180],
+                "model_number":model_number[:40],"image_url":image_url,"download_links":[],
+                "makerworld_model_id":resolved.get("model_id"),"makerworld_profile_id":profile_id}
+
     def _finish_model_library_import(self,data,error):
         self._library_importing=False
         if hasattr(self,"library_add_btn") and self.library_add_btn.winfo_exists():self.library_add_btn.configure(state="normal")
@@ -2693,14 +3231,62 @@ class App(tk.Tk):
                 cached=self._download_thumbnail(data["image_url"])
                 if cached:
                     image=folder/"preview.png";shutil.copy2(cached,image);image_path=str(image)
-            except Exception:pass
+            except Exception:
+                if data.get("makerworld_model_id"):
+                    try:
+                        raw=folder/"preview-source.img";self._client().download_makerworld_thumbnail(data["image_url"],raw)
+                        from PIL import Image
+                        with Image.open(raw) as source:source.convert("RGB").save(folder/"preview.png","PNG")
+                        raw.unlink(missing_ok=True);image_path=str(folder/"preview.png")
+                    except Exception:pass
         downloaded=0
+        if data.get("makerworld_model_id"):
+            downloaded+=self._import_makerworld_library_source(model_id,folder,data)
         for link in data.get("download_links",[]):
             try:downloaded+=self._download_model_library_source(model_id,folder,link)
             except Exception:continue
         with self.db.connect() as c:
             if image_path:c.execute("UPDATE model_library SET image_path=?,updated_at=? WHERE id=?",(image_path,now,model_id))
         return model_id,downloaded
+
+    def _import_makerworld_library_source(self,model_id,folder,data):
+        client=self._client()
+        status=client.makerworld_status()
+        if not status.get("can_download"):
+            if status.get("sign_in_expired"):
+                raise RuntimeError("BambuBuddy's Bambu Cloud sign-in has expired. Sign in again in BambuBuddy, then retry this link.")
+            raise RuntimeError("MakerWorld downloads need Bambu Cloud sign-in in BambuBuddy. Open BambuBuddy → Settings → Bambu Cloud, sign in once, then retry.")
+        imported=client.import_makerworld(data["makerworld_model_id"],data.get("makerworld_profile_id"))
+        library_id=imported.get("library_file_id")
+        if not library_id:raise RuntimeError("BambuBuddy imported the MakerWorld model but did not return its library file ID.")
+        filename=Path(str(imported.get("filename") or f"{data.get('title') or 'makerworld-model'}.3mf")).name
+        if not filename.lower().endswith(".3mf"):filename+= ".3mf"
+        temp=Path(tempfile.gettempdir())/f"printflow-makerworld-{uuid.uuid4().hex}.3mf"
+        client.download_library_file(int(library_id),temp)
+        try:
+            clean=self._source_only_3mf_bytes(temp)
+            return self._store_model_library_bytes(model_id,folder,filename,clean,data.get("url",""))
+        finally:
+            temp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _source_only_3mf_bytes(path):
+        """Return a design 3MF with all embedded G-code/toolpath payloads removed."""
+        source=Path(path).read_bytes()
+        try:
+            src=zipfile.ZipFile(io.BytesIO(source),"r")
+        except Exception as exc:
+            raise RuntimeError(f"MakerWorld returned an invalid 3MF: {exc}") from None
+        output=io.BytesIO()
+        with src,zipfile.ZipFile(output,"w",zipfile.ZIP_DEFLATED) as dst:
+            for member in src.infolist():
+                lower=member.filename.replace("\\","/").lower()
+                if lower.endswith((".gcode",".bgcode")) or "/gcode/" in lower or lower.startswith("gcode/"):
+                    continue
+                dst.writestr(member,src.read(member))
+        cleaned=output.getvalue()
+        if not cleaned.startswith(b"PK\x03\x04"):raise RuntimeError("Could not create a source-only design 3MF.")
+        return cleaned
 
     def _download_model_library_source(self,model_id,folder,url):
         request=urllib.request.Request(url,headers={"User-Agent":f"Mozilla/5.0 PrintFlowCRM/{VERSION}"})
@@ -2846,6 +3432,32 @@ class App(tk.Tk):
         except Exception:pass
         with self.db.connect() as c:c.execute("DELETE FROM model_library WHERE id=?",(model_id,))
         self.show_model_library()
+
+    def _delete_entire_model_library(self):
+        with self.db.connect() as c:
+            count=int(c.execute("SELECT COUNT(*) FROM model_library").fetchone()[0])
+            file_count=int(c.execute("SELECT COUNT(*) FROM model_library_files").fetchone()[0])
+        if count==0:
+            messagebox.showinfo("Delete Model Library","The Model Library is already empty.",parent=self);return
+        if not messagebox.askyesno(
+            "Delete Entire Model Library",
+            f"Delete all {count} product libraries and {file_count} saved source files from PrintFlow?\n\n"
+            "The model folder will be moved into PrintFlow's Backups folder first so the files can be recovered.",
+            parent=self,
+        ):return
+        backup=BACKUP_DIR/f"Deleted-Model-Library-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        try:
+            if MODEL_LIBRARY_DIR.exists():shutil.move(str(MODEL_LIBRARY_DIR),str(backup))
+            MODEL_LIBRARY_DIR.mkdir(parents=True,exist_ok=True)
+            with self.db.connect() as c:c.execute("DELETE FROM model_library")
+            self.status_flash(f"Model Library deleted • backup saved as {backup.name}")
+            self.show_model_library()
+        except Exception as exc:
+            try:
+                if backup.exists() and not any(MODEL_LIBRARY_DIR.iterdir()):
+                    MODEL_LIBRARY_DIR.rmdir();shutil.move(str(backup),str(MODEL_LIBRARY_DIR))
+            except Exception:pass
+            messagebox.showerror("Delete Model Library",f"PrintFlow could not safely delete the library. No database entries were removed.\n\n{exc}",parent=self)
 
     def show_model_finder(self):
         if self.compact:
@@ -8402,6 +9014,7 @@ finally:
         if not self.bb_printer.get() and self.printer_map:
             self.printer_combo.current(0)
         self.settings_status.configure(text=f"Connected — {len(self.printer_map)} printer(s) found.")
+        self._apply_top_printers(printers)
 
     def test_auto_slicer(self):
         self.settings_status.configure(text="Checking BambuBuddy slicer presets…")
@@ -8461,6 +9074,12 @@ finally:
             self.db.set_setting("shipping_location_mode",self.shipping_location_mode_var.get().strip() or "Automatic (IP-based)")
             self.db.set_setting("shipping_manual_location",self.shipping_manual_location_var.get().strip())
         self.settings_status.configure(text="Settings saved.")
+        # URL, API key, or default printer may have changed; refresh the shared
+        # top strip immediately instead of waiting for a failed poll/retry.
+        self._top_printer_load_generation += 1
+        self._top_printer_loading = False
+        self._printer_camera_generation += 1
+        self.after(50, lambda: self._initialize_printer_strip(force=True))
 
     def save_messaging_settings(self):
         provider=self.message_provider_var.get().strip() or "Marketplace Messenger"
@@ -8517,6 +9136,15 @@ finally:
         self.title(f"{APP_NAME} — {text}");self.after(1800,lambda:self.title(f"{APP_NAME} {VERSION}"))
 
     def on_close(self):
+        self._printer_camera_stopping = True
+        self._printer_camera_generation += 1
+        for attr in ("_top_printer_after_id",):
+            after_id = getattr(self, attr, None)
+            if after_id:
+                try:
+                    self.after_cancel(after_id)
+                except Exception:
+                    pass
         self.flush_order_autosave()
         if not self.compact:
             self._save_window_state()
