@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.75
+
+- Fixed oscillating and multi-tool MakerWorld designs being grouped under Batteries & Chargers when their descriptions merely mentioned a battery.
+- Added an Oscillating & Multi-Tools inventory group and made specific model titles take priority over broader description text.
+- Added automatic migration of affected saved entries, including their source folders, without changing stock counts or saved files.
+- Added reliable `2836-20` detection for the Milwaukee Packout M18 Oscillating Multi-Tool design, even when MakerWorld's API omits the model number.
+- Preserved deliberate Change Group overrides while allowing automatic imports to benefit from improved detection.
+- Added Add My Files for creating a local inventory item from your own STL, 3MF, STEP, OBJ, AMF, SCAD, or F3D source files, with a quick name, group, and model-number form.
+
 ## 0.7.74
 
 - Added automatic stockable-item detection from model-page titles so each MakerWorld design keeps its own inventory count.

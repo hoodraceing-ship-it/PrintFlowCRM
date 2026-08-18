@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.74"
+VERSION = "0.7.75"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -65,10 +65,8 @@ def clean_model_item_name(value):
     return (text[:180] or "Imported model")
 
 
-def detect_model_category(*values):
-    """Fast local category detection; an optional UI override always wins."""
-    text=" ".join(str(v or "") for v in values).lower()
-    rules=(
+MODEL_CATEGORY_RULES=(
+        ("Oscillating & Multi-Tools",("oscillating multi-tool","oscillating multi tool","oscillating tool","multi-tool","multi tool","multitool")),
         ("Batteries & Chargers",("battery","batteries","charger","charging")),
         ("Sockets & Organizers",("socket","sockets")),
         ("Impact Wrenches & Drivers",("impact wrench","impact driver","stubby impact","mid torque","high torque")),
@@ -81,9 +79,37 @@ def detect_model_category(*values):
         ("Packout Storage & Mounts",("packout","toolbox","tool box","storage bin")),
         ("Measuring Tools",("tape measure","level","laser","measuring")),
     )
-    for category,keywords in rules:
-        if any(keyword in text for keyword in keywords):return category
+
+KNOWN_MODEL_SOURCE_NUMBERS={
+    # MakerWorld's design metadata does not always include the tool number even
+    # though the public listing does. Keep exact fallbacks narrow so a similarly
+    # named older/newer tool can never inherit the wrong number.
+    "makerworld:1414251":"2836-20",
+}
+
+
+def detect_model_category(*values):
+    """Detect a group with the item title taking priority over page details."""
+    primary=str(values[0] or "").lower() if values else ""
+    for category,keywords in MODEL_CATEGORY_RULES:
+        if any(keyword in primary for keyword in keywords):return category
+    context=" ".join(str(v or "") for v in values[1:]).lower()
+    for category,keywords in MODEL_CATEGORY_RULES:
+        if any(keyword in context for keyword in keywords):return category
     return "Other Models"
+
+
+def detect_model_number(*values):
+    for value in values:
+        found=re.search(r"\b(?:[A-Z]{1,4}-)?\d{3,5}-\d{2}\b",str(value or ""),re.I)
+        if found:return re.sub(r"\s+","",found.group(0))[:40]
+    return ""
+
+
+def model_folder_name(value):
+    clean=re.sub(r"[^A-Za-z0-9._ -]+"," ",str(value or "")).strip()
+    clean=re.sub(r"\s+"," ",clean).rstrip(". ")
+    return (clean[:90] or "Unsorted Model")
 
 
 def app_data_dir() -> Path:
@@ -450,6 +476,7 @@ class Database:
                     image_path TEXT DEFAULT '',
                     folder_path TEXT NOT NULL,
                     stock_qty INTEGER NOT NULL DEFAULT 0,
+                    category_manual INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -535,18 +562,49 @@ class Database:
                 c.execute("ALTER TABLE model_library ADD COLUMN category TEXT NOT NULL DEFAULT 'Other Models'")
             if "source_key" not in model_columns:
                 c.execute("ALTER TABLE model_library ADD COLUMN source_key TEXT DEFAULT ''")
+            added_category_manual="category_manual" not in model_columns
+            if added_category_manual:
+                c.execute("ALTER TABLE model_library ADD COLUMN category_manual INTEGER NOT NULL DEFAULT 0")
+                # Categories from an older release may have been deliberately
+                # changed before this flag existed. Preserve those overrides.
+                c.execute("UPDATE model_library SET category_manual=1 WHERE COALESCE(category,'') NOT IN ('','Other Models')")
             # Imported links used to treat the broad Fits/Product text as the item.
             # Upgrade them to one stockable item per design while preserving stock/files.
-            for model in c.execute("SELECT id,product_name,title,source_url,category,source_key FROM model_library").fetchall():
+            for model in c.execute("SELECT id,product_name,title,source_url,category,source_key,folder_path,category_manual,model_number FROM model_library").fetchall():
                 title=clean_model_item_name(model["title"])
                 product=clean_model_item_name(model["product_name"])
                 has_specific_title=bool(model["source_url"] and title.lower() not in {"", "imported model", "makerworld model"})
                 item=title if has_specific_title else product
                 category=(model["category"] or "").strip()
-                if not category or category=="Other Models":category=detect_model_category(product,title)
                 source_key=(model["source_key"] or "").strip() or canonical_model_source_key(model["source_url"])
-                c.execute("UPDATE model_library SET product_name=?,category=?,source_key=? WHERE id=?",
-                          (item,category,source_key,int(model["id"])))
+                model_number=(model["model_number"] or "").strip() or detect_model_number(title,product) or KNOWN_MODEL_SOURCE_NUMBERS.get(source_key,"")
+                detected=detect_model_category(title,product)
+                specific_conflict=(category=="Batteries & Chargers" and detected=="Oscillating & Multi-Tools")
+                category_manual=int(model["category_manual"] or 0)
+                if specific_conflict:
+                    # Repair the v0.7.74 false positive caused by descriptive
+                    # text such as "battery end" on an oscillating-tool page.
+                    category=detected;category_manual=0
+                elif not category or category=="Other Models":category=detected
+                old_folder=Path(model["folder_path"]);new_folder=old_folder
+                if category!=str(model["category"] or ""):
+                    candidate=MODEL_LIBRARY_DIR/model_folder_name(category)/model_folder_name(item)
+                    if candidate!=old_folder:
+                        if candidate.exists():candidate=candidate.with_name(candidate.name+f"-{int(model['id'])}")
+                        try:
+                            candidate.parent.mkdir(parents=True,exist_ok=True)
+                            if old_folder.exists():old_folder.rename(candidate)
+                            new_folder=candidate
+                        except Exception:new_folder=old_folder
+                c.execute("UPDATE model_library SET product_name=?,category=?,category_manual=?,source_key=?,model_number=?,folder_path=? WHERE id=?",
+                          (item,category,category_manual,source_key,model_number,str(new_folder),int(model["id"])))
+                if new_folder!=old_folder:
+                    for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(int(model["id"]),)).fetchall():
+                        c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",
+                                  (str(new_folder/Path(file_row["stored_path"]).name),int(file_row["id"])))
+                    image_path=new_folder/"preview.png"
+                    c.execute("UPDATE model_library SET image_path=? WHERE id=?",
+                              (str(image_path) if image_path.exists() else "",int(model["id"])))
 
             # v0.2 migration: preserve the single attachment used by v0.1.
             legacy = c.execute(
@@ -3247,9 +3305,7 @@ class App(tk.Tk):
 
     @staticmethod
     def _model_folder_name(value):
-        clean=re.sub(r"[^A-Za-z0-9._ -]+"," ",str(value or "")).strip()
-        clean=re.sub(r"\s+"," ",clean).rstrip(". ")
-        return (clean[:90] or "Unsorted Model")
+        return model_folder_name(value)
 
     def _library_rows(self):
         with self.db.connect() as c:
@@ -3267,7 +3323,8 @@ class App(tk.Tk):
         self.page_header("Model Library","Product inventory and source models organized by what they fit — G-code is never stored",
                          "Add Clipboard Link",self._library_import_clipboard,"Delete Entire Library",self._delete_entire_model_library)
         quick=self.card(self.main,12);quick.pack(fill="x",pady=(0,10))
-        ttk.Label(quick,text="Quick Add from a link",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,7))
+        ttk.Label(quick,text="Quick Add from a link",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,7))
+        ttk.Button(quick,text="+ Add My Files",style="Accent.TButton",command=self._add_my_model_files).grid(row=0,column=3,sticky="e",pady=(0,7))
         self.library_url_var=tk.StringVar()
         self.library_product_var=tk.StringVar()
         ttk.Label(quick,text="Model page link",style="Card.TLabel").grid(row=1,column=0,sticky="w")
@@ -3324,6 +3381,57 @@ class App(tk.Tk):
         self.library_tree.bind("<<TreeviewSelect>>",selected)
         refill();url_entry.focus_set()
 
+    def _add_my_model_files(self):
+        selected=filedialog.askopenfilenames(
+            parent=self,title="Add your source model files",
+            filetypes=[("3D source files","*.stl *.3mf *.step *.stp *.obj *.amf *.scad *.f3d")],
+        )
+        paths=[Path(value) for value in selected if self._model_source_allowed(value)]
+        if not paths:return
+        suggested=clean_model_item_name(re.sub(r"[_-]+"," ",paths[0].stem))
+        result={}
+        win=tk.Toplevel(self);win.title("Add My Files");win.transient(self);win.grab_set();win.resizable(False,False)
+        body=ttk.Frame(win,padding=16);body.pack(fill="both",expand=True)
+        ttk.Label(body,text=f"{len(paths)} source file(s) selected",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,12))
+        ttk.Label(body,text="Inventory item name").grid(row=1,column=0,sticky="w",pady=5)
+        name_var=tk.StringVar(value=suggested);name_entry=ttk.Entry(body,textvariable=name_var,width=52)
+        name_entry.grid(row=1,column=1,sticky="ew",padx=(12,0),pady=5)
+        ttk.Label(body,text="Product group").grid(row=2,column=0,sticky="w",pady=5)
+        group_var=tk.StringVar(value=detect_model_category(suggested))
+        groups=[row[0] for row in MODEL_CATEGORY_RULES]+["Other Models"]
+        ttk.Combobox(body,textvariable=group_var,values=groups,width=49).grid(row=2,column=1,sticky="ew",padx=(12,0),pady=5)
+        ttk.Label(body,text="Tool / model number").grid(row=3,column=0,sticky="w",pady=5)
+        number_var=tk.StringVar(value=detect_model_number(suggested))
+        ttk.Entry(body,textvariable=number_var,width=52).grid(row=3,column=1,sticky="ew",padx=(12,0),pady=5)
+        ttk.Label(body,text="You can add or change the product photo from its library card afterward.",style="Sub.TLabel").grid(row=4,column=0,columnspan=2,sticky="w",pady=(10,4))
+        buttons=ttk.Frame(body);buttons.grid(row=5,column=0,columnspan=2,sticky="e",pady=(12,0))
+        def save():
+            product=clean_model_item_name(name_var.get())
+            category=clean_model_item_name(group_var.get())
+            if not product or not category:
+                messagebox.showwarning("Add My Files","Enter an inventory item name and product group.",parent=win);return
+            result.update(product=product,category=category,model_number=(number_var.get() or "").strip()[:40]);win.destroy()
+        ttk.Button(buttons,text="Cancel",command=win.destroy).pack(side="right")
+        ttk.Button(buttons,text="Add to Model Library",style="Accent.TButton",command=save).pack(side="right",padx=(0,8))
+        name_entry.select_range(0,"end");name_entry.focus_set();win.bind("<Return>",lambda _e:save());win.bind("<Escape>",lambda _e:win.destroy())
+        win.wait_window()
+        if not result:return
+        now=datetime.now().isoformat(timespec="seconds")
+        folder=MODEL_LIBRARY_DIR/model_folder_name(result["category"])/model_folder_name(result["product"])
+        if folder.exists():folder=folder.with_name(folder.name+"-"+uuid.uuid4().hex[:6])
+        folder.mkdir(parents=True,exist_ok=True)
+        with self.db.connect() as c:
+            cur=c.execute("""INSERT INTO model_library(product_name,category,category_manual,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at)
+                             VALUES(?,?,1,?,?,?,?,?,?,?,?)""",
+                          (result["product"],result["category"],f"local:{uuid.uuid4().hex}",result["model_number"],result["product"],"","",str(folder),now,now))
+            model_id=int(cur.lastrowid)
+        added=0
+        for source in paths:
+            try:added+=self._store_model_library_bytes(model_id,folder,source.name,source.read_bytes(),"")
+            except Exception:continue
+        self.status_flash(f"Added {added} of your source file(s) • G-code excluded")
+        self.show_model_library(model_id)
+
     def _library_import_clipboard(self):
         try:text=(self.clipboard_get() or "").strip()
         except Exception:text=""
@@ -3370,7 +3478,7 @@ class App(tk.Tk):
             title=clean_model_item_name(Path(direct_name).stem or "Imported model")
             return {"url":url,"source_key":canonical_model_source_key(url),"title":title,"product":title,
                     "category":clean_model_item_name(category_override) if category_override else detect_model_category(title),
-                    "model_number":"","image_url":"","download_links":[url]}
+                    "category_manual":bool(category_override),"model_number":"","image_url":"","download_links":[url]}
         request=urllib.request.Request(url,headers={"User-Agent":f"Mozilla/5.0 PrintFlowCRM/{VERSION}","Accept":"text/html,application/xhtml+xml"})
         try:
             with urllib.request.urlopen(request,timeout=30) as response:
@@ -3382,11 +3490,10 @@ class App(tk.Tk):
             # and Add Local Files without retyping any product information.
             slug=Path(urllib.parse.urlparse(url).path).name
             slug=re.sub(r"^\d+-?","",slug);title=clean_model_item_name(re.sub(r"[-_]+"," ",slug).strip().title() or "Imported model")
-            number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",title,re.I)
-            number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
+            number=detect_model_number(title) or KNOWN_MODEL_SOURCE_NUMBERS.get(canonical_model_source_key(url),"")
             return {"url":url,"source_key":canonical_model_source_key(url),"title":title,"product":title,
                     "category":clean_model_item_name(category_override) if category_override else detect_model_category(title),
-                    "model_number":number[:40],"image_url":"","download_links":[]}
+                    "category_manual":bool(category_override),"model_number":number[:40],"image_url":"","download_links":[]}
         page=raw.decode(charset,errors="replace")
         title=self._page_meta(page,"og:title") or self._page_meta(page,"twitter:title")
         if not title:
@@ -3394,8 +3501,7 @@ class App(tk.Tk):
         image_url=self._page_meta(page,"og:image") or self._page_meta(page,"twitter:image")
         image_url=urllib.parse.urljoin(final_url,image_url) if image_url else ""
         title=clean_model_item_name(title)
-        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",title,re.I)
-        model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
+        model_number=detect_model_number(title)
         links=[]
         for match in re.findall(r'(?:href|data-url|download-url)=["\']([^"\']+)["\']',page,re.I):
             absolute=html_lib.unescape(urllib.parse.urljoin(final_url,match))
@@ -3407,7 +3513,23 @@ class App(tk.Tk):
             if absolute not in links:links.append(absolute)
         return {"url":final_url,"source_key":canonical_model_source_key(final_url),"title":title[:250],"product":title[:180],
                 "category":clean_model_item_name(category_override) if category_override else detect_model_category(title,page[:12000]),
-                "model_number":model_number[:40],"image_url":image_url,"download_links":list(dict.fromkeys(links))[:30]}
+                "category_manual":bool(category_override),"model_number":model_number[:40],"image_url":image_url,"download_links":list(dict.fromkeys(links))[:30]}
+
+    def _makerworld_public_page_context(self,url):
+        """Best-effort metadata supplement when Bambu's API omits description fields."""
+        parsed=urllib.parse.urlparse(url)
+        public_url=urllib.parse.urlunparse((parsed.scheme or "https",parsed.netloc,parsed.path,"","",""))
+        request=urllib.request.Request(public_url,headers={
+            "User-Agent":f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) PrintFlowCRM/{VERSION}",
+            "Accept":"text/html,application/xhtml+xml","Accept-Language":"en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(request,timeout=18) as response:
+            raw=response.read(4_000_000);charset=response.headers.get_content_charset() or "utf-8"
+        page=raw.decode(charset,errors="replace")
+        title=self._page_meta(page,"og:title") or self._page_meta(page,"twitter:title")
+        description=self._page_meta(page,"og:description") or self._page_meta(page,"twitter:description")
+        image=self._page_meta(page,"og:image") or self._page_meta(page,"twitter:image")
+        return clean_model_item_name(title) if title else "",description,image
 
     def _inspect_makerworld_library_link(self,url,category_override=""):
         client=self._client()
@@ -3416,6 +3538,17 @@ class App(tk.Tk):
         title=clean_model_item_name(design.get("title") or design.get("name") or "MakerWorld model")
         description=str(design.get("description") or design.get("summary") or design.get("content") or "")
         image_url=str(design.get("coverUrl") or design.get("cover_url") or design.get("thumbnail") or "").strip()
+        source_key=canonical_model_source_key(url)
+        model_number=detect_model_number(title,description)
+        if not model_number or not description or not image_url:
+            try:
+                page_title,page_description,page_image=self._makerworld_public_page_context(url)
+                if title.lower() in {"makerworld model","imported model"} and page_title:title=page_title
+                if page_description:description=(description+" "+page_description).strip()
+                if not image_url and page_image:image_url=page_image
+                model_number=model_number or detect_model_number(page_title,page_description)
+            except Exception:pass
+        model_number=model_number or KNOWN_MODEL_SOURCE_NUMBERS.get(source_key,"")
         profile_id=resolved.get("profile_id")
         instances=resolved.get("instances") or []
         if not profile_id:
@@ -3435,11 +3568,9 @@ class App(tk.Tk):
             try:value=int(value)
             except (TypeError,ValueError):continue
             if value>0 and value not in profile_candidates:profile_candidates.append(value)
-        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",title+" "+description,re.I)
-        model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
-        return {"url":url,"source_key":canonical_model_source_key(url),"title":title[:250],"product":title[:180],
+        return {"url":url,"source_key":source_key,"title":title[:250],"product":title[:180],
                 "category":clean_model_item_name(category_override) if category_override else detect_model_category(title,description),
-                "model_number":model_number[:40],"image_url":image_url,"download_links":[],
+                "category_manual":bool(category_override),"model_number":model_number[:40],"image_url":image_url,"download_links":[],
                 "makerworld_model_id":resolved.get("model_id"),"makerworld_profile_id":profile_id,
                 "makerworld_profile_candidates":profile_candidates}
 
@@ -3468,6 +3599,7 @@ class App(tk.Tk):
         now=datetime.now().isoformat(timespec="seconds")
         product=clean_model_item_name(data.get("product") or data.get("title"))
         category=clean_model_item_name(data.get("category") or detect_model_category(product,data.get("title")))
+        category_manual=1 if data.get("category_manual") else 0
         source_key=str(data.get("source_key") or canonical_model_source_key(data.get("url"))).strip()
         with self.db.connect() as c:
             existing=c.execute("SELECT * FROM model_library WHERE source_key=? ORDER BY id LIMIT 1",(source_key,)).fetchone() if source_key else None
@@ -3475,12 +3607,13 @@ class App(tk.Tk):
                 existing=c.execute("SELECT * FROM model_library WHERE LOWER(product_name)=LOWER(?) AND LOWER(category)=LOWER(?) ORDER BY id LIMIT 1",(product,category)).fetchone()
             if existing:
                 model_id=int(existing["id"]);folder=Path(existing["folder_path"])
-                c.execute("UPDATE model_library SET product_name=?,category=?,source_key=?,title=?,source_url=?,image_url=?,model_number=CASE WHEN model_number='' THEN ? ELSE model_number END,updated_at=? WHERE id=?",
-                          (product,category,source_key,data.get("title",""),data.get("url",""),data.get("image_url",""),data.get("model_number",""),now,model_id))
+                if int(existing["category_manual"] or 0) and not category_manual:category=existing["category"]
+                c.execute("UPDATE model_library SET product_name=?,category=?,category_manual=?,source_key=?,title=?,source_url=?,image_url=?,model_number=CASE WHEN model_number='' THEN ? ELSE model_number END,updated_at=? WHERE id=?",
+                          (product,category,max(category_manual,int(existing["category_manual"] or 0)),source_key,data.get("title",""),data.get("url",""),data.get("image_url",""),data.get("model_number",""),now,model_id))
             else:
                 folder=MODEL_LIBRARY_DIR/self._model_folder_name(category)/self._model_folder_name(product);folder.mkdir(parents=True,exist_ok=True)
-                cur=c.execute("INSERT INTO model_library(product_name,category,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                              (product,category,source_key,data.get("model_number",""),data.get("title",""),data.get("url",""),data.get("image_url",""),str(folder),now,now))
+                cur=c.execute("INSERT INTO model_library(product_name,category,category_manual,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                              (product,category,category_manual,source_key,data.get("model_number",""),data.get("title",""),data.get("url",""),data.get("image_url",""),str(folder),now,now))
                 model_id=int(cur.lastrowid)
         folder.mkdir(parents=True,exist_ok=True)
         image_path=""
@@ -3777,7 +3910,7 @@ class App(tk.Tk):
             try:new_folder.parent.mkdir(parents=True,exist_ok=True);old_folder.rename(new_folder)
             except Exception:new_folder=old_folder
         with self.db.connect() as c:
-            c.execute("UPDATE model_library SET category=?,folder_path=?,updated_at=? WHERE id=?",
+            c.execute("UPDATE model_library SET category=?,category_manual=1,folder_path=?,updated_at=? WHERE id=?",
                       (category,str(new_folder),datetime.now().isoformat(timespec="seconds"),model_id))
             if new_folder!=old_folder:
                 for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
