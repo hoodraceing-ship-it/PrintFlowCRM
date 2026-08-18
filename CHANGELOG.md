@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.79
+
+- Replaced successful MakerWorld fallback pop-ups with a status-bar message and a persistent Settings app log.
+- Added an App Log in Settings with time, severity, feature area, summary, full details, refresh, copy, and clear controls.
+- Logged Model Library import failures, MakerWorld warnings and fallback notices, and GitHub update check/install failures while retaining pop-ups for errors that require immediate action.
+- Limited the persistent log to the newest 500 entries so background diagnostics cannot grow the database indefinitely.
+- Changed the Model Library to open with every product group collapsed, while still expanding the correct group when PrintFlow deliberately navigates to a specific model.
+
 ## 0.7.78
 
 - Fixed manually renamed Model Library items being changed back to their original MakerWorld/page titles during startup or link refreshes.

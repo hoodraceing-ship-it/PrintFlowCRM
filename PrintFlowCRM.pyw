@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.78"
+VERSION = "0.7.79"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -496,6 +496,18 @@ class Database:
                     value TEXT NOT NULL DEFAULT ''
                 );
 
+                CREATE TABLE IF NOT EXISTS app_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    level TEXT NOT NULL DEFAULT 'Info',
+                    area TEXT NOT NULL DEFAULT 'General',
+                    summary TEXT NOT NULL,
+                    details TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_app_logs_created_at
+                    ON app_logs(created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS order_files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     order_id INTEGER NOT NULL,
@@ -715,6 +727,29 @@ class Database:
                 "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, str(value)),
             )
+
+    def add_app_log(self, level, area, summary, details=""):
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as c:
+            cur = c.execute(
+                "INSERT INTO app_logs(level,area,summary,details,created_at) VALUES(?,?,?,?,?)",
+                (str(level or "Info"), str(area or "General"), str(summary or "App event"), str(details or ""), now),
+            )
+            # Keep the log useful without allowing years of background errors to
+            # grow the customer database indefinitely.
+            c.execute("DELETE FROM app_logs WHERE id NOT IN (SELECT id FROM app_logs ORDER BY id DESC LIMIT 500)")
+            return int(cur.lastrowid)
+
+    def app_logs(self, limit=250):
+        with self.connect() as c:
+            return c.execute(
+                "SELECT * FROM app_logs ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit or 250), 500)),),
+            ).fetchall()
+
+    def clear_app_logs(self):
+        with self.connect() as c:
+            c.execute("DELETE FROM app_logs")
 
     def buyers(self):
         with self.connect() as c:
@@ -3501,21 +3536,24 @@ class App(tk.Tk):
                 hay=" ".join(str(row[k] or "") for k in ("category","product_name","model_number","title","source_url")).lower()
                 if q and q not in hay:continue
                 grouped.setdefault(row["category"] or "Other Models",[]).append(row)
-            first_model=None;wanted=f"model:{int(select_model_id)}" if select_model_id else None;wanted_group=None
+            first_group=None;wanted=f"model:{int(select_model_id)}" if select_model_id else None;wanted_group=None;wanted_parent=None
             for index,category in enumerate(sorted(grouped,key=str.lower)):
                 rows=grouped[category];parent=f"cat:{index}"
+                first_group=first_group or parent
                 self.library_group_map[parent]=category
                 if select_category and category.casefold()==str(select_category).casefold():wanted_group=parent
                 total_stock=sum(int(r["stock_qty"] or 0) for r in rows);total_files=sum(int(r["file_count"] or 0) for r in rows)
-                self.library_tree.insert("","end",iid=parent,text=category,values=(total_stock,total_files),open=True)
+                self.library_tree.insert("","end",iid=parent,text=category,values=(total_stock,total_files),open=False)
                 for row in rows:
-                    iid=f"model:{int(row['id'])}";first_model=first_model or iid
+                    iid=f"model:{int(row['id'])}"
+                    if iid==wanted:wanted_parent=parent
                     label=row["product_name"]+(f"  ({row['model_number']})" if row["model_number"] and row["model_number"] not in row["product_name"] else "")
                     self.library_tree.insert(parent,"end",iid=iid,text=label,values=(int(row["stock_qty"] or 0),row["file_count"]))
             if wanted_group and self.library_tree.exists(wanted_group):chosen=wanted_group
             elif wanted and self.library_tree.exists(wanted):chosen=wanted
-            else:chosen=first_model
+            else:chosen=first_group
             if chosen:
+                if wanted_parent and chosen==wanted:self.library_tree.item(wanted_parent,open=True)
                 self.library_tree.selection_set(chosen);self.library_tree.focus(chosen);self.library_tree.see(chosen)
                 if chosen.startswith("model:"):self._show_model_library_detail(int(chosen.split(":",1)[1]))
                 else:self._show_model_library_group_detail(self.library_group_map.get(chosen,""))
@@ -3726,9 +3764,11 @@ class App(tk.Tk):
         if hasattr(self,"library_add_btn") and self.library_add_btn.winfo_exists():self.library_add_btn.configure(state="normal")
         if error:
             self.library_status.configure(text="The page could not be imported.")
+            self._log_app_event("Error","Model Library","Model-page import failed",error)
             messagebox.showerror("Auto Add model",error,parent=self);return
         try:model_id,downloaded=self._save_model_library_import(data)
         except Exception as exc:
+            self._log_app_event("Error","Model Library","Saving the imported model failed",str(exc))
             messagebox.showerror("Auto Add model",str(exc),parent=self);return
         self.db.set_setting("model_library_last_category",data.get("category") or "Other Models")
         self.library_url_var.set("")
@@ -3736,11 +3776,13 @@ class App(tk.Tk):
         warning=str(data.get("makerworld_import_warning") or "").strip()
         notice=str(data.get("makerworld_import_notice") or "").strip()
         note=f"Added {downloaded} source file(s)." if downloaded else "Saved the model card and photo; no source file was downloaded."
-        self.status_flash(note);self.show_model_library(model_id)
         if warning:
-            messagebox.showwarning("MakerWorld model saved",warning,parent=self)
+            self._log_app_event("Warning","MakerWorld Import","Model saved, but its source download needs attention",warning)
+            note += " Warning saved in Settings → App Log."
         elif notice:
-            messagebox.showinfo("MakerWorld fallback used",notice,parent=self)
+            self._log_app_event("Info","MakerWorld Import","Fallback profile imported successfully",notice)
+            note += " Fallback details saved in Settings → App Log."
+        self.status_flash(note);self.show_model_library(model_id)
 
     def _save_model_library_import(self,data):
         now=datetime.now().isoformat(timespec="seconds")
@@ -9344,6 +9386,39 @@ class App(tk.Tk):
         self.feedback_status.grid(row=6,column=0,columnspan=3,sticky="w",pady=(7,0))
         feedback.columnconfigure(1,weight=1)
 
+        app_log = self.card(settings_inner, 12)
+        app_log.pack(fill="x", pady=(0, 9))
+        ttk.Label(app_log,text="App Log",style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            app_log,
+            text="Errors, warnings, and useful background notices are saved here instead of interrupting your work. Successful MakerWorld fallback imports now appear in this log and the status bar, not in a pop-up.",
+            style="Card.TLabel",wraplength=900,justify="left",
+        ).pack(anchor="w",pady=(5,8))
+        log_buttons=ttk.Frame(app_log,style="Card.TFrame");log_buttons.pack(fill="x",pady=(0,7))
+        ttk.Button(log_buttons,text="Refresh",command=self._refresh_app_log).pack(side="left",padx=(0,7))
+        ttk.Button(log_buttons,text="Copy Selected",command=self._copy_selected_app_log).pack(side="left",padx=(0,7))
+        ttk.Button(log_buttons,text="Clear Log",command=self._clear_app_log).pack(side="left")
+        log_table=ttk.Frame(app_log,style="Card.TFrame");log_table.pack(fill="x")
+        self.app_log_tree=ttk.Treeview(log_table,columns=("time","level","area","summary"),show="headings",height=8,selectmode="browse")
+        for column,label,width,stretch in [
+            ("time","Time",150,False),("level","Level",75,False),("area","Area",135,False),("summary","Summary",520,True),
+        ]:
+            self.app_log_tree.heading(column,text=label)
+            self.app_log_tree.column(column,width=width,minwidth=60,stretch=stretch,anchor="w")
+        log_scroll=ttk.Scrollbar(log_table,orient="vertical",command=self.app_log_tree.yview)
+        self.app_log_tree.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right",fill="y");self.app_log_tree.pack(side="left",fill="x",expand=True)
+        self.app_log_tree.tag_configure("error",foreground="#ff8d8d")
+        self.app_log_tree.tag_configure("warning",foreground="#ffd166")
+        self.app_log_tree.tag_configure("info",foreground="#8ec5ff")
+        self.app_log_tree.bind("<<TreeviewSelect>>",self._show_selected_app_log)
+        ttk.Label(app_log,text="Selected entry details",style="Card.TLabel").pack(anchor="w",pady=(8,4))
+        self.app_log_details=tk.Text(app_log,height=5,wrap="word",bg=self.INPUT,fg=self.TEXT,insertbackground=self.TEXT,relief="solid",bd=1,font=("Segoe UI",9),padx=7,pady=6)
+        self.app_log_details.pack(fill="x")
+        self.app_log_details.configure(state="disabled")
+        ttk.Label(app_log,text="The newest 250 entries are shown; PrintFlow automatically keeps the newest 500.",style="Sub.TLabel").pack(anchor="w",pady=(5,0))
+        self._refresh_app_log()
+
         u = self.card(settings_inner, 12)
         u.pack(fill="x", pady=(0, 9))
         ttk.Label(u, text="App Updates", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
@@ -9382,6 +9457,67 @@ class App(tk.Tk):
         ttk.Button(dbf, text="Open Backups", command=lambda: self.open_folder(BACKUP_DIR)).pack(side="left")
 
         self.after(150, self.test_bambuddy_silent)
+
+    def _log_app_event(self,level,area,summary,details=""):
+        """Best-effort persistent diagnostics that must never interrupt the task that raised them."""
+        try:
+            entry_id=self.db.add_app_log(level,area,summary,details)
+            if self.current_page=="settings" and hasattr(self,"app_log_tree"):
+                self.after_idle(self._refresh_app_log)
+            return entry_id
+        except Exception:
+            return None
+
+    def _refresh_app_log(self):
+        tree=getattr(self,"app_log_tree",None)
+        if tree is None:
+            return
+        try:
+            if not tree.winfo_exists():return
+            tree.delete(*tree.get_children())
+            self._app_log_rows={}
+            for row in self.db.app_logs(250):
+                entry=dict(row);iid=str(entry["id"]);self._app_log_rows[iid]=entry
+                shown_time=str(entry.get("created_at") or "").replace("T"," ")
+                level=str(entry.get("level") or "Info")
+                tree.insert("","end",iid=iid,values=(shown_time,level,entry.get("area") or "",entry.get("summary") or ""),tags=(level.lower(),))
+            children=tree.get_children()
+            if children:
+                tree.selection_set(children[0]);tree.focus(children[0]);self._show_selected_app_log()
+            else:self._set_app_log_details("No app log entries yet.")
+        except Exception as exc:
+            self._set_app_log_details(f"The app log could not be displayed: {exc}")
+
+    def _set_app_log_details(self,text):
+        details=getattr(self,"app_log_details",None)
+        if details is None:return
+        try:
+            details.configure(state="normal");details.delete("1.0","end");details.insert("1.0",str(text or ""));details.configure(state="disabled")
+        except Exception:pass
+
+    def _show_selected_app_log(self,_event=None):
+        tree=getattr(self,"app_log_tree",None)
+        if tree is None:return
+        selected=tree.selection()
+        if not selected:return
+        row=getattr(self,"_app_log_rows",{}).get(selected[0])
+        if not row:return
+        header=f"{str(row.get('created_at') or '').replace('T',' ')}  •  {row.get('level') or 'Info'}  •  {row.get('area') or 'General'}"
+        body=str(row.get("details") or "").strip()
+        self._set_app_log_details(header+"\n"+str(row.get("summary") or "")+("\n\n"+body if body else ""))
+
+    def _copy_selected_app_log(self):
+        tree=getattr(self,"app_log_tree",None);selected=tree.selection() if tree is not None else ()
+        row=getattr(self,"_app_log_rows",{}).get(selected[0]) if selected else None
+        if not row:
+            self.status_flash("Select an app log entry first.");return
+        value=(f"{row.get('created_at','')} | {row.get('level','Info')} | {row.get('area','General')}\n"
+               f"{row.get('summary','')}\n{row.get('details','')}").strip()
+        self.clipboard_clear();self.clipboard_append(value);self.status_flash("App log entry copied.")
+
+    def _clear_app_log(self):
+        if not messagebox.askyesno("Clear app log","Remove all saved app log entries?",parent=self):return
+        self.db.clear_app_logs();self._refresh_app_log();self.status_flash("App log cleared.")
 
     def run_setup_wizard(self):
         wizard = Path(sys.argv[0]).resolve().parent / "SetupWizard.pyw"
@@ -9644,6 +9780,7 @@ class App(tk.Tk):
     def _remote_update_failed(self,message):
         self._close_busy()
         self._set_update_status("Update failed: "+message)
+        self._log_app_event("Error","App Updates","Automatic update failed",message)
         try:
             if self._available_update_info:
                 self.update_banner_button.configure(text="Retry Update", state="normal")
@@ -9701,6 +9838,7 @@ class App(tk.Tk):
 
     def _update_check_failed(self,message,interactive=False):
         self._set_update_status("Update check failed: "+message)
+        self._log_app_event("Error","App Updates","GitHub update check failed",message)
         if interactive:
             messagebox.showerror("PrintFlow updates",message,parent=self)
 
