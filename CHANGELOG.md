@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.74
+
+- Added automatic stockable-item detection from model-page titles so each MakerWorld design keeps its own inventory count.
+- Added automatic product groups, including Batteries & Chargers, Sockets & Organizers, Impact Wrenches & Drivers, Packout Storage & Mounts, and more.
+- Changed Model Library and the customer Product Inventory picker to show expandable group → item hierarchies with per-item and group stock totals.
+- Added a Group Override field and Change Group button for correcting an automatic category without renaming the item.
+- Made repeated links to a different MakerWorld profile update the same item by design ID instead of creating or merging the wrong stock record.
+
 ## 0.7.73
 
 - Added ready-to-ship stock counts to every Model Library product, with quick +1, −1, and Set controls.

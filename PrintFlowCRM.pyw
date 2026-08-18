@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.73"
+VERSION = "0.7.74"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -39,6 +39,51 @@ BUILD_PLATE_TYPES = (
     "Cool Plate (SuperTack)",
     "Supertack Plate",
 )
+
+
+def canonical_model_source_key(url):
+    """Stable identity for one design page, ignoring profile/hash/search noise."""
+    try:
+        parsed=urllib.parse.urlparse(str(url or "").strip())
+        host=(parsed.hostname or "").lower().removeprefix("www.")
+        path=urllib.parse.unquote(parsed.path or "").rstrip("/")
+        maker=re.search(r"/models/(\d+)",path,re.I)
+        if "makerworld.com" in host and maker:return f"makerworld:{maker.group(1)}"
+        printable=re.search(r"/model/(\d+)",path,re.I)
+        if "printables.com" in host and printable:return f"printables:{printable.group(1)}"
+        thing=re.search(r"/thing:(\d+)",path,re.I)
+        if "thingiverse.com" in host and thing:return f"thingiverse:{thing.group(1)}"
+        return f"{host}{path}".lower() if host else ""
+    except Exception:
+        return ""
+
+
+def clean_model_item_name(value):
+    text=html_lib.unescape(str(value or "")).strip()
+    text=re.sub(r"\s*[|–—-]\s*(?:MakerWorld|Printables|Thingiverse).*$","",text,flags=re.I)
+    text=re.sub(r"\s+"," ",text).strip(" .-_|")
+    return (text[:180] or "Imported model")
+
+
+def detect_model_category(*values):
+    """Fast local category detection; an optional UI override always wins."""
+    text=" ".join(str(v or "") for v in values).lower()
+    rules=(
+        ("Batteries & Chargers",("battery","batteries","charger","charging")),
+        ("Sockets & Organizers",("socket","sockets")),
+        ("Impact Wrenches & Drivers",("impact wrench","impact driver","stubby impact","mid torque","high torque")),
+        ("Drills & Drivers",("drill","driver","screwdriver")),
+        ("Wrenches",("wrench","ratchet","spanner")),
+        ("Saws & Cutting",("saw","jigsaw","circular saw","bandsaw","cutting tool")),
+        ("Grinders & Sanders",("grinder","sander","sanding","polisher")),
+        ("Vacuums & Dust Collection",("vacuum","dust extractor","dust collection")),
+        ("Lights",("work light","flashlight","lantern","light mount")),
+        ("Packout Storage & Mounts",("packout","toolbox","tool box","storage bin")),
+        ("Measuring Tools",("tape measure","level","laser","measuring")),
+    )
+    for category,keywords in rules:
+        if any(keyword in text for keyword in keywords):return category
+    return "Other Models"
 
 
 def app_data_dir() -> Path:
@@ -396,6 +441,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS model_library (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     product_name TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'Other Models',
+                    source_key TEXT DEFAULT '',
                     model_number TEXT DEFAULT '',
                     title TEXT DEFAULT '',
                     source_url TEXT DEFAULT '',
@@ -484,6 +531,22 @@ class Database:
             model_columns = {r["name"] for r in c.execute("PRAGMA table_info(model_library)").fetchall()}
             if "stock_qty" not in model_columns:
                 c.execute("ALTER TABLE model_library ADD COLUMN stock_qty INTEGER NOT NULL DEFAULT 0")
+            if "category" not in model_columns:
+                c.execute("ALTER TABLE model_library ADD COLUMN category TEXT NOT NULL DEFAULT 'Other Models'")
+            if "source_key" not in model_columns:
+                c.execute("ALTER TABLE model_library ADD COLUMN source_key TEXT DEFAULT ''")
+            # Imported links used to treat the broad Fits/Product text as the item.
+            # Upgrade them to one stockable item per design while preserving stock/files.
+            for model in c.execute("SELECT id,product_name,title,source_url,category,source_key FROM model_library").fetchall():
+                title=clean_model_item_name(model["title"])
+                product=clean_model_item_name(model["product_name"])
+                has_specific_title=bool(model["source_url"] and title.lower() not in {"", "imported model", "makerworld model"})
+                item=title if has_specific_title else product
+                category=(model["category"] or "").strip()
+                if not category or category=="Other Models":category=detect_model_category(product,title)
+                source_key=(model["source_key"] or "").strip() or canonical_model_source_key(model["source_url"])
+                c.execute("UPDATE model_library SET product_name=?,category=?,source_key=? WHERE id=?",
+                          (item,category,source_key,int(model["id"])))
 
             # v0.2 migration: preserve the single attachment used by v0.1.
             legacy = c.execute(
@@ -3193,7 +3256,7 @@ class App(tk.Tk):
             return c.execute(
                 """SELECT m.*,COUNT(f.id) AS file_count FROM model_library m
                    LEFT JOIN model_library_files f ON f.model_id=m.id
-                   GROUP BY m.id ORDER BY LOWER(m.product_name),LOWER(m.title)"""
+                   GROUP BY m.id ORDER BY LOWER(m.category),LOWER(m.product_name),LOWER(m.title)"""
             ).fetchall()
 
     def show_model_library(self,select_model_id=None):
@@ -3206,16 +3269,16 @@ class App(tk.Tk):
         quick=self.card(self.main,12);quick.pack(fill="x",pady=(0,10))
         ttk.Label(quick,text="Quick Add from a link",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,7))
         self.library_url_var=tk.StringVar()
-        self.library_product_var=tk.StringVar(value=self.db.get_setting("model_library_last_product",""))
+        self.library_product_var=tk.StringVar()
         ttk.Label(quick,text="Model page link",style="Card.TLabel").grid(row=1,column=0,sticky="w")
-        ttk.Label(quick,text="Fits / product (optional)",style="Card.TLabel").grid(row=1,column=2,sticky="w",padx=(10,0))
+        ttk.Label(quick,text="Group override (optional)",style="Card.TLabel").grid(row=1,column=2,sticky="w",padx=(10,0))
         url_entry=ttk.Entry(quick,textvariable=self.library_url_var)
         url_entry.grid(row=2,column=0,columnspan=2,sticky="ew",padx=(0,10))
         product_entry=ttk.Entry(quick,textvariable=self.library_product_var)
         product_entry.grid(row=2,column=2,sticky="ew",padx=(0,10))
         self.library_add_btn=ttk.Button(quick,text="Auto Add",style="Accent.TButton",command=self.start_model_library_import)
         self.library_add_btn.grid(row=2,column=3,sticky="ew")
-        self.library_status=ttk.Label(quick,text="Paste a MakerWorld, Printables, Thingiverse, or other model-page link. Example product: Milwaukee M12 3/8 Impact 2562-20",style="Card.TLabel")
+        self.library_status=ttk.Label(quick,text="Paste a model link. PrintFlow detects the individual item and groups related designs automatically; use the override only when you want a different group.",style="Card.TLabel")
         self.library_status.grid(row=3,column=0,columnspan=4,sticky="w",pady=(7,0))
         quick.columnconfigure(0,weight=2);quick.columnconfigure(1,weight=1);quick.columnconfigure(2,weight=2)
         url_entry.bind("<Return>",lambda _e:self.start_model_library_import())
@@ -3225,7 +3288,7 @@ class App(tk.Tk):
         search_var=tk.StringVar()
         ttk.Entry(left,textvariable=search_var).pack(fill="x",pady=(0,8))
         self.library_tree=ttk.Treeview(left,columns=("stock","files"),show="tree headings",selectmode="browse")
-        self.library_tree.heading("#0",text="Fits / Product");self.library_tree.column("#0",width=310,anchor="w")
+        self.library_tree.heading("#0",text="Group / Stockable Item");self.library_tree.column("#0",width=340,anchor="w")
         self.library_tree.heading("stock",text="In Stock");self.library_tree.column("stock",width=70,anchor="center",stretch=False)
         self.library_tree.heading("files",text="Files");self.library_tree.column("files",width=55,anchor="center",stretch=False)
         sy=ttk.Scrollbar(left,orient="vertical",command=self.library_tree.yview);self.library_tree.configure(yscrollcommand=sy.set)
@@ -3234,17 +3297,31 @@ class App(tk.Tk):
 
         def refill(*_args):
             q=search_var.get().strip().lower();self.library_tree.delete(*self.library_tree.get_children())
+            grouped={}
             for row in self._library_rows():
-                hay=" ".join(str(row[k] or "") for k in ("product_name","model_number","title","source_url")).lower()
+                hay=" ".join(str(row[k] or "") for k in ("category","product_name","model_number","title","source_url")).lower()
                 if q and q not in hay:continue
-                label=row["product_name"]+(f"  ({row['model_number']})" if row["model_number"] and row["model_number"] not in row["product_name"] else "")
-                self.library_tree.insert("","end",iid=str(row["id"]),text=label,values=(int(row["stock_qty"] or 0),row["file_count"]))
-            items=self.library_tree.get_children()
-            wanted=str(select_model_id) if select_model_id and str(select_model_id) in items else (items[0] if items else None)
-            if wanted:self.library_tree.selection_set(wanted);self.library_tree.focus(wanted);self._show_model_library_detail(int(wanted))
+                grouped.setdefault(row["category"] or "Other Models",[]).append(row)
+            first_model=None;wanted=f"model:{int(select_model_id)}" if select_model_id else None
+            for index,category in enumerate(sorted(grouped,key=str.lower)):
+                rows=grouped[category];parent=f"cat:{index}"
+                total_stock=sum(int(r["stock_qty"] or 0) for r in rows);total_files=sum(int(r["file_count"] or 0) for r in rows)
+                self.library_tree.insert("","end",iid=parent,text=category,values=(total_stock,total_files),open=True)
+                for row in rows:
+                    iid=f"model:{int(row['id'])}";first_model=first_model or iid
+                    label=row["product_name"]+(f"  ({row['model_number']})" if row["model_number"] and row["model_number"] not in row["product_name"] else "")
+                    self.library_tree.insert(parent,"end",iid=iid,text=label,values=(int(row["stock_qty"] or 0),row["file_count"]))
+            if wanted and self.library_tree.exists(wanted):chosen=wanted
+            else:chosen=first_model
+            if chosen:
+                self.library_tree.selection_set(chosen);self.library_tree.focus(chosen);self.library_tree.see(chosen)
+                self._show_model_library_detail(int(chosen.split(":",1)[1]))
             else:self._show_model_library_detail(None)
         search_var.trace_add("write",refill)
-        self.library_tree.bind("<<TreeviewSelect>>",lambda _e:self._show_model_library_detail(int(self.library_tree.selection()[0])) if self.library_tree.selection() else None)
+        def selected(_event=None):
+            choice=self.library_tree.selection()
+            if choice and choice[0].startswith("model:"):self._show_model_library_detail(int(choice[0].split(":",1)[1]))
+        self.library_tree.bind("<<TreeviewSelect>>",selected)
         refill();url_entry.focus_set()
 
     def _library_import_clipboard(self):
@@ -3264,11 +3341,11 @@ class App(tk.Tk):
         url=(self.library_url_var.get() or "").strip()
         if not re.match(r"^https?://",url,re.I):
             messagebox.showwarning("Model link","Paste the full model-page link beginning with http:// or https://.",parent=self);return
-        product=(self.library_product_var.get() or "").strip()
+        category_override=(self.library_product_var.get() or "").strip()
         self._library_importing=True;self.library_add_btn.configure(state="disabled")
         self.library_status.configure(text="Reading the model page, preview photo, and available source downloads…")
         def work():
-            try:data=self._inspect_model_library_link(url,product);error=None
+            try:data=self._inspect_model_library_link(url,category_override);error=None
             except Exception as exc:data=None;error=str(exc)
             self.after(0,lambda:self._finish_model_library_import(data,error))
         threading.Thread(target=work,daemon=True,name="PrintFlowModelLibraryImport").start()
@@ -3285,14 +3362,15 @@ class App(tk.Tk):
             if found:return html_lib.unescape(found.group(1).strip())
         return ""
 
-    def _inspect_model_library_link(self,url,product_hint=""):
+    def _inspect_model_library_link(self,url,category_override=""):
         if "makerworld.com" in (urllib.parse.urlparse(url).hostname or "").lower():
-            return self._inspect_makerworld_library_link(url,product_hint)
+            return self._inspect_makerworld_library_link(url,category_override)
         direct_name=Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
         if self._model_source_allowed(direct_name) or direct_name.lower().endswith(".zip"):
-            title=Path(direct_name).stem or "Imported model"
-            return {"url":url,"title":title,"product":(product_hint or title)[:180],"model_number":"",
-                    "image_url":"","download_links":[url]}
+            title=clean_model_item_name(Path(direct_name).stem or "Imported model")
+            return {"url":url,"source_key":canonical_model_source_key(url),"title":title,"product":title,
+                    "category":clean_model_item_name(category_override) if category_override else detect_model_category(title),
+                    "model_number":"","image_url":"","download_links":[url]}
         request=urllib.request.Request(url,headers={"User-Agent":f"Mozilla/5.0 PrintFlowCRM/{VERSION}","Accept":"text/html,application/xhtml+xml"})
         try:
             with urllib.request.urlopen(request,timeout=30) as response:
@@ -3303,20 +3381,21 @@ class App(tk.Tk):
             # Still create the organized entry instantly; the user can use Open Source
             # and Add Local Files without retyping any product information.
             slug=Path(urllib.parse.urlparse(url).path).name
-            slug=re.sub(r"^\d+-?","",slug);title=re.sub(r"[-_]+"," ",slug).strip().title() or "Imported model"
-            number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",product_hint or title,re.I)
+            slug=re.sub(r"^\d+-?","",slug);title=clean_model_item_name(re.sub(r"[-_]+"," ",slug).strip().title() or "Imported model")
+            number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",title,re.I)
             number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
-            return {"url":url,"title":title,"product":(product_hint or title)[:180],"model_number":number[:40],
-                    "image_url":"","download_links":[]}
+            return {"url":url,"source_key":canonical_model_source_key(url),"title":title,"product":title,
+                    "category":clean_model_item_name(category_override) if category_override else detect_model_category(title),
+                    "model_number":number[:40],"image_url":"","download_links":[]}
         page=raw.decode(charset,errors="replace")
         title=self._page_meta(page,"og:title") or self._page_meta(page,"twitter:title")
         if not title:
             m=re.search(r"<title[^>]*>(.*?)</title>",page,re.I|re.S);title=html_lib.unescape(re.sub(r"\s+"," ",m.group(1)).strip()) if m else "Imported model"
         image_url=self._page_meta(page,"og:image") or self._page_meta(page,"twitter:image")
         image_url=urllib.parse.urljoin(final_url,image_url) if image_url else ""
-        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",product_hint or title,re.I)
+        title=clean_model_item_name(title)
+        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",title,re.I)
         model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
-        product=(product_hint or title).strip()
         links=[]
         for match in re.findall(r'(?:href|data-url|download-url)=["\']([^"\']+)["\']',page,re.I):
             absolute=html_lib.unescape(urllib.parse.urljoin(final_url,match))
@@ -3326,14 +3405,16 @@ class App(tk.Tk):
         for match in re.findall(r'https?:\\?/\\?/[^"\'<> ]+?\.(?:stl|3mf|step|stp|obj|amf|scad|f3d|zip)(?:\?[^"\'<> ]*)?',page,re.I):
             absolute=html_lib.unescape(match.replace("\\/","/"))
             if absolute not in links:links.append(absolute)
-        return {"url":final_url,"title":title[:250],"product":product[:180],"model_number":model_number[:40],
-                "image_url":image_url,"download_links":list(dict.fromkeys(links))[:30]}
+        return {"url":final_url,"source_key":canonical_model_source_key(final_url),"title":title[:250],"product":title[:180],
+                "category":clean_model_item_name(category_override) if category_override else detect_model_category(title,page[:12000]),
+                "model_number":model_number[:40],"image_url":image_url,"download_links":list(dict.fromkeys(links))[:30]}
 
-    def _inspect_makerworld_library_link(self,url,product_hint=""):
+    def _inspect_makerworld_library_link(self,url,category_override=""):
         client=self._client()
         resolved=client.resolve_makerworld(url)
         design=resolved.get("design") or {}
-        title=str(design.get("title") or design.get("name") or "MakerWorld model").strip()
+        title=clean_model_item_name(design.get("title") or design.get("name") or "MakerWorld model")
+        description=str(design.get("description") or design.get("summary") or design.get("content") or "")
         image_url=str(design.get("coverUrl") or design.get("cover_url") or design.get("thumbnail") or "").strip()
         profile_id=resolved.get("profile_id")
         instances=resolved.get("instances") or []
@@ -3354,9 +3435,10 @@ class App(tk.Tk):
             try:value=int(value)
             except (TypeError,ValueError):continue
             if value>0 and value not in profile_candidates:profile_candidates.append(value)
-        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",product_hint or title,re.I)
+        number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",title+" "+description,re.I)
         model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
-        return {"url":url,"title":title[:250],"product":str(product_hint or title)[:180],
+        return {"url":url,"source_key":canonical_model_source_key(url),"title":title[:250],"product":title[:180],
+                "category":clean_model_item_name(category_override) if category_override else detect_model_category(title,description),
                 "model_number":model_number[:40],"image_url":image_url,"download_links":[],
                 "makerworld_model_id":resolved.get("model_id"),"makerworld_profile_id":profile_id,
                 "makerworld_profile_candidates":profile_candidates}
@@ -3370,8 +3452,9 @@ class App(tk.Tk):
         try:model_id,downloaded=self._save_model_library_import(data)
         except Exception as exc:
             messagebox.showerror("Auto Add model",str(exc),parent=self);return
-        self.db.set_setting("model_library_last_product",data["product"])
+        self.db.set_setting("model_library_last_category",data.get("category") or "Other Models")
         self.library_url_var.set("")
+        self.library_product_var.set("")
         warning=str(data.get("makerworld_import_warning") or "").strip()
         notice=str(data.get("makerworld_import_notice") or "").strip()
         note=f"Added {downloaded} source file(s)." if downloaded else "Saved the model card and photo; no source file was downloaded."
@@ -3383,17 +3466,21 @@ class App(tk.Tk):
 
     def _save_model_library_import(self,data):
         now=datetime.now().isoformat(timespec="seconds")
-        product=self._model_folder_name(data.get("product") or data.get("title"))
+        product=clean_model_item_name(data.get("product") or data.get("title"))
+        category=clean_model_item_name(data.get("category") or detect_model_category(product,data.get("title")))
+        source_key=str(data.get("source_key") or canonical_model_source_key(data.get("url"))).strip()
         with self.db.connect() as c:
-            existing=c.execute("SELECT * FROM model_library WHERE LOWER(product_name)=LOWER(?)",(product,)).fetchone()
+            existing=c.execute("SELECT * FROM model_library WHERE source_key=? ORDER BY id LIMIT 1",(source_key,)).fetchone() if source_key else None
+            if not existing and not source_key:
+                existing=c.execute("SELECT * FROM model_library WHERE LOWER(product_name)=LOWER(?) AND LOWER(category)=LOWER(?) ORDER BY id LIMIT 1",(product,category)).fetchone()
             if existing:
                 model_id=int(existing["id"]);folder=Path(existing["folder_path"])
-                c.execute("UPDATE model_library SET title=?,source_url=?,image_url=?,model_number=CASE WHEN model_number='' THEN ? ELSE model_number END,updated_at=? WHERE id=?",
-                          (data.get("title",""),data.get("url",""),data.get("image_url",""),data.get("model_number",""),now,model_id))
+                c.execute("UPDATE model_library SET product_name=?,category=?,source_key=?,title=?,source_url=?,image_url=?,model_number=CASE WHEN model_number='' THEN ? ELSE model_number END,updated_at=? WHERE id=?",
+                          (product,category,source_key,data.get("title",""),data.get("url",""),data.get("image_url",""),data.get("model_number",""),now,model_id))
             else:
-                folder=MODEL_LIBRARY_DIR/self._model_folder_name(product);folder.mkdir(parents=True,exist_ok=True)
-                cur=c.execute("INSERT INTO model_library(product_name,model_number,title,source_url,image_url,folder_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                              (product,data.get("model_number",""),data.get("title",""),data.get("url",""),data.get("image_url",""),str(folder),now,now))
+                folder=MODEL_LIBRARY_DIR/self._model_folder_name(category)/self._model_folder_name(product);folder.mkdir(parents=True,exist_ok=True)
+                cur=c.execute("INSERT INTO model_library(product_name,category,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                              (product,category,source_key,data.get("model_number",""),data.get("title",""),data.get("url",""),data.get("image_url",""),str(folder),now,now))
                 model_id=int(cur.lastrowid)
         folder.mkdir(parents=True,exist_ok=True)
         image_path=""
@@ -3421,7 +3508,7 @@ class App(tk.Tk):
                 downloaded+=self._import_makerworld_library_source(model_id,folder,data)
             except Exception as exc:
                 data["makerworld_import_warning"]=(
-                    "PrintFlow saved the model name, photo, product group, and MakerWorld link, but Bambu Lab rejected every available print profile, so no source file was downloaded.\n\n"
+                    "PrintFlow saved the item name, group, photo, and MakerWorld link, but Bambu Lab rejected every available print profile, so no source file was downloaded.\n\n"
                     f"BambuBuddy reported: {exc}\n\n"
                     "You can select this model and click Retry Auto Download later. If it keeps failing, click Open Source, download the STL or design 3MF in your signed-in browser, then use Add Local Files."
                 )
@@ -3557,6 +3644,7 @@ class App(tk.Tk):
             except Exception:pass
         body=ttk.Frame(top,style="Card.TFrame");body.pack(side="left",fill="both",expand=True)
         ttk.Label(body,text=row["product_name"],style="CardTitle.TLabel",wraplength=520).pack(anchor="w")
+        ttk.Label(body,text="Group: "+(row["category"] or "Other Models"),style="Card.TLabel").pack(anchor="w",pady=(4,0))
         if row["model_number"]:ttk.Label(body,text="Model: "+row["model_number"],style="Card.TLabel").pack(anchor="w",pady=(4,0))
         stockline=ttk.Frame(body,style="Card.TFrame");stockline.pack(fill="x",pady=(5,2))
         ttk.Label(stockline,text=f"Ready-to-ship stock: {int(row['stock_qty'] or 0)}",style="CardTitle.TLabel").pack(side="left")
@@ -3565,11 +3653,13 @@ class App(tk.Tk):
         ttk.Button(stockline,text="Set",width=5,command=lambda:self._set_library_stock(model_id)).pack(side="left")
         if latest_job and not int(latest_job["inventory_adjusted"] or 0):
             ttk.Label(body,text="Restock print: "+self._order_live_print_status(int(latest_job["id"]),latest_job["status"]),style="Card.TLabel").pack(anchor="w",pady=(2,0))
-        ttk.Label(body,text=row["title"] or "Imported model",style="Card.TLabel",wraplength=520,justify="left").pack(anchor="w",pady=(4,8))
+        if row["title"] and row["title"].strip().lower()!=row["product_name"].strip().lower():
+            ttk.Label(body,text=row["title"],style="Card.TLabel",wraplength=520,justify="left").pack(anchor="w",pady=(4,8))
         actions=ttk.Frame(body,style="Card.TFrame");actions.pack(fill="x")
         ttk.Button(actions,text="Add Local Files",style="Accent.TButton",command=lambda:self._library_add_local_files(model_id)).pack(side="left",padx=(0,6))
         ttk.Button(actions,text="Open Folder",command=lambda:self._open_library_folder(row["folder_path"])).pack(side="left",padx=(0,6))
         ttk.Button(actions,text="Rename",command=lambda:self._rename_library_product(model_id)).pack(side="left",padx=(0,6))
+        ttk.Button(actions,text="Change Group",command=lambda:self._change_library_category(model_id)).pack(side="left",padx=(0,6))
         ttk.Button(actions,text="Change Photo",command=lambda:self._library_change_photo(model_id)).pack(side="left",padx=(0,6))
         if row["source_url"]:
             ttk.Button(actions,text="Open Source",command=lambda:webbrowser.open(row["source_url"])).pack(side="left",padx=(0,6))
@@ -3636,7 +3726,7 @@ class App(tk.Tk):
         with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
         if not row or not row["source_url"]:return
         self.library_url_var.set(row["source_url"])
-        self.library_product_var.set(row["product_name"])
+        self.library_product_var.set(row["category"] or "")
         self.start_model_library_import()
 
     def _library_add_local_files(self,model_id):
@@ -3655,14 +3745,15 @@ class App(tk.Tk):
     def _rename_library_product(self,model_id):
         with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
         if not row:return
-        value=simpledialog.askstring("Rename product","What do these models fit?",initialvalue=row["product_name"],parent=self)
+        value=simpledialog.askstring("Rename inventory item","Inventory item name:",initialvalue=row["product_name"],parent=self)
         if not value or not value.strip():return
         value=self._model_folder_name(value)
         number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",value,re.I)
         model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else row["model_number"]
-        old_folder=Path(row["folder_path"]);new_folder=MODEL_LIBRARY_DIR/self._model_folder_name(value)
-        if new_folder!=old_folder and not new_folder.exists():
-            try:old_folder.rename(new_folder)
+        old_folder=Path(row["folder_path"]);new_folder=MODEL_LIBRARY_DIR/self._model_folder_name(row["category"] or "Other Models")/self._model_folder_name(value)
+        if new_folder!=old_folder:
+            if new_folder.exists():new_folder=new_folder.with_name(new_folder.name+f"-{model_id}")
+            try:new_folder.parent.mkdir(parents=True,exist_ok=True);old_folder.rename(new_folder)
             except Exception:new_folder=old_folder
         with self.db.connect() as c:
             c.execute("UPDATE model_library SET product_name=?,model_number=?,folder_path=?,updated_at=? WHERE id=?",
@@ -3672,7 +3763,28 @@ class App(tk.Tk):
                     c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",(str(new_folder/Path(file_row["stored_path"]).name),file_row["id"]))
                 image_path=new_folder/"preview.png"
                 c.execute("UPDATE model_library SET image_path=? WHERE id=?",(str(image_path) if image_path.exists() else "",model_id))
-        self.db.set_setting("model_library_last_product",value);self.show_model_library(model_id)
+        self.show_model_library(model_id)
+
+    def _change_library_category(self,model_id):
+        with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
+        if not row:return
+        value=simpledialog.askstring("Change product group","Group name:",initialvalue=row["category"] or detect_model_category(row["product_name"],row["title"]),parent=self)
+        if not value or not value.strip():return
+        category=clean_model_item_name(value)
+        old_folder=Path(row["folder_path"]);new_folder=MODEL_LIBRARY_DIR/self._model_folder_name(category)/self._model_folder_name(row["product_name"])
+        if new_folder!=old_folder:
+            if new_folder.exists():new_folder=new_folder.with_name(new_folder.name+f"-{model_id}")
+            try:new_folder.parent.mkdir(parents=True,exist_ok=True);old_folder.rename(new_folder)
+            except Exception:new_folder=old_folder
+        with self.db.connect() as c:
+            c.execute("UPDATE model_library SET category=?,folder_path=?,updated_at=? WHERE id=?",
+                      (category,str(new_folder),datetime.now().isoformat(timespec="seconds"),model_id))
+            if new_folder!=old_folder:
+                for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
+                    c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",(str(new_folder/Path(file_row["stored_path"]).name),file_row["id"]))
+                image_path=new_folder/"preview.png"
+                c.execute("UPDATE model_library SET image_path=? WHERE id=?",(str(image_path) if image_path.exists() else "",model_id))
+        self.status_flash(f"Moved item to {category}");self.show_model_library(model_id)
 
     def _library_change_photo(self,model_id):
         selected=filedialog.askopenfilename(parent=self,title="Choose product/model photo",filetypes=[("Images","*.png *.jpg *.jpeg *.gif *.bmp *.webp"),("All files","*.*")])
@@ -5137,7 +5249,7 @@ class App(tk.Tk):
         pane=ttk.Panedwindow(outer,orient="horizontal");pane.pack(fill="both",expand=True)
         left=ttk.Frame(pane);right=ttk.Frame(pane);pane.add(left,weight=3);pane.add(right,weight=4)
         products=ttk.Treeview(left,columns=("stock","files"),show="tree headings",selectmode="browse")
-        products.heading("#0",text="Product");products.column("#0",width=300,stretch=True)
+        products.heading("#0",text="Group / Product");products.column("#0",width=330,stretch=True)
         products.heading("stock",text="In Stock");products.column("stock",width=70,anchor="center",stretch=False)
         products.heading("files",text="Files");products.column("files",width=55,anchor="center",stretch=False)
         pscroll=ttk.Scrollbar(left,orient="vertical",command=products.yview);products.configure(yscrollcommand=pscroll.set)
@@ -5153,15 +5265,21 @@ class App(tk.Tk):
         def fill_products(*_args):
             products.delete(*products.get_children());model_rows.clear()
             q=search.get().strip().lower()
-            rows=self._library_rows()
-            for row in rows:
-                hay=" ".join(str(row[k] or "") for k in ("product_name","model_number","title")).lower()
+            grouped={}
+            for row in self._library_rows():
+                hay=" ".join(str(row[k] or "") for k in ("category","product_name","model_number","title")).lower()
                 if q and q not in hay:continue
-                iid=str(row["id"]);model_rows[iid]=row
-                products.insert("","end",iid=iid,text=row["product_name"],values=(int(row["stock_qty"] or 0),int(row["file_count"] or 0)))
-            choices=products.get_children()
-            if choices:
-                products.selection_set(choices[0]);products.focus(choices[0]);fill_files()
+                grouped.setdefault(row["category"] or "Other Models",[]).append(row)
+            first_model=None
+            for index,category in enumerate(sorted(grouped,key=str.lower)):
+                rows=grouped[category];parent=f"cat:{index}"
+                products.insert("","end",iid=parent,text=category,
+                                values=(sum(int(x["stock_qty"] or 0) for x in rows),sum(int(x["file_count"] or 0) for x in rows)),open=True)
+                for row in rows:
+                    iid=f"model:{int(row['id'])}";first_model=first_model or iid;model_rows[iid]=row
+                    products.insert(parent,"end",iid=iid,text=row["product_name"],values=(int(row["stock_qty"] or 0),int(row["file_count"] or 0)))
+            if first_model:
+                products.selection_set(first_model);products.focus(first_model);products.see(first_model);fill_files()
             else:
                 product_title.configure(text="No matching products");files.delete(*files.get_children())
 
@@ -5169,7 +5287,10 @@ class App(tk.Tk):
             files.delete(*files.get_children());file_rows.clear()
             selected=products.selection()
             if not selected:return
-            model_id=int(selected[0]);model=model_rows.get(selected[0])
+            model=model_rows.get(selected[0])
+            if not model:
+                product_title.configure(text="Choose an item inside this group");return
+            model_id=int(model["id"])
             product_title.configure(text=f"{model['product_name']}  •  {int(model['stock_qty'] or 0)} in stock")
             with self.db.connect() as c:rows=c.execute("SELECT * FROM model_library_files WHERE model_id=? ORDER BY LOWER(original_name)",(model_id,)).fetchall()
             for row in rows:
