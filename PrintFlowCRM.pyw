@@ -7,6 +7,7 @@ import itertools
 import io
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import sys
@@ -27,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.79"
+VERSION = "0.7.80"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -185,6 +186,7 @@ def read_today_openai_usage():
             pass
     return {"requests":requests,"input_tokens":total_in,"output_tokens":total_out,"web_search_calls":web_calls,"estimated_standard_cost":est}
 DB_PATH = DATA_DIR / "printflow.db"
+SOURCE_APP_DIR = Path(__file__).resolve().parent
 FILES_DIR = DATA_DIR / "files"
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
@@ -2004,6 +2006,8 @@ class App(tk.Tk):
         self._model_search_generation = 0
         self._library_photos = []
         self._library_importing = False
+        self._backup_running = False
+        self._backup_stop = False
         self._messenger_capture_seen = ""
         self._pirateship_result_seen = ""
         self._pirateship_label_seen = ""
@@ -2051,6 +2055,10 @@ class App(tk.Tk):
         # v0.7.45 beta: optionally check a configured GitHub Releases feed after the UI is usable.
         # Manual update installation remains available at all times as the rollback path.
         self.after(2600, self._schedule_update_check)
+        # Full disaster-recovery backups are due independently: Proxmox/server
+        # every 2 hours and OneDrive every 24 hours. The first check waits for
+        # Tailscale and the desktop UI to finish starting.
+        self.after(12000, self._schedule_full_backup_check)
 
     def _remote_network_provider(self):
         return (self.db.get_setting("remote_network_provider", "Tailscale") or "Tailscale").strip()
@@ -2330,6 +2338,18 @@ class App(tk.Tk):
         )
         self.update_banner_button.pack(side="right", padx=(12,0))
         self._available_update_info = None
+
+        self.backup_banner = tk.Frame(self.content_shell, bg="#6b1d24", highlightthickness=1,
+                                      highlightbackground="#ef4444", padx=14, pady=9)
+        self.backup_banner_message = tk.Label(self.backup_banner, text="", bg="#6b1d24", fg="#ffe4e6",
+                                              font=("Segoe UI Semibold", 10), anchor="w")
+        self.backup_banner_message.pack(side="left", fill="x", expand=True)
+        self.backup_banner_button = tk.Button(
+            self.backup_banner, text="Backup Settings", command=self.show_settings,
+            bg="#ef4444", fg="white", activebackground="#f87171", activeforeground="white",
+            relief="flat", font=("Segoe UI Semibold", 9), padx=14, pady=5, cursor="hand2"
+        )
+        self.backup_banner_button.pack(side="right", padx=(12,0))
 
         # Persistent printer telemetry. This frame is outside self.main, so it
         # stays visible while the user moves between every PrintFlow page.
@@ -9443,18 +9463,59 @@ class App(tk.Tk):
 
         d = self.card(settings_inner, 12)
         d.pack(fill="x")
-        ttk.Label(d, text="Data & Backups", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(d, text=f"Saved data: {DATA_DIR}", style="Card.TLabel", wraplength=780).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 3))
+        ttk.Label(d, text="Complete Disaster-Recovery Backups", style="CardTitle.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(d, text=f"Saved data: {DATA_DIR}", style="Card.TLabel", wraplength=900).grid(row=1, column=0, columnspan=3, sticky="w", pady=(7, 3))
         ttk.Label(
             d,
-            text="Your database and customer print files are stored separately from the replaceable app files. Manual backups include the database, attached files, and Pirate Ship exports.",
-            style="Card.TLabel", wraplength=780, justify="left"
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 7))
+            text="Each ZIP contains a verified SQLite snapshot, customer files, Model Library, labels, packing lists, settings, installed app files, and a standalone Windows restore tool. The destination filename stays the same, so every successful run atomically replaces the previous latest backup.",
+            style="Card.TLabel", wraplength=900, justify="left"
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 9))
+
+        self.backup_proxmox_enabled_var=tk.BooleanVar(value=self.db.get_setting("backup_proxmox_enabled","1")!="0")
+        default_backup_host=self._default_backup_server_host()
+        self.backup_proxmox_host_var=tk.StringVar(value=self.db.get_setting("backup_proxmox_host",default_backup_host) or default_backup_host)
+        self.backup_proxmox_user_var=tk.StringVar(value=self.db.get_setting("backup_proxmox_user","") or "")
+        self.backup_proxmox_port_var=tk.StringVar(value=self.db.get_setting("backup_proxmox_port","22") or "22")
+        self.backup_proxmox_dir_var=tk.StringVar(value=self.db.get_setting("backup_proxmox_dir","~/printflow-backups") or "~/printflow-backups")
+        default_key=str(Path.home()/".ssh"/"id_ed25519") if (Path.home()/".ssh"/"id_ed25519").exists() else ""
+        self.backup_proxmox_key_var=tk.StringVar(value=self.db.get_setting("backup_proxmox_key",default_key) or default_key)
+        ttk.Checkbutton(d,text="Proxmox/server backup every 2 hours",variable=self.backup_proxmox_enabled_var).grid(row=3,column=0,columnspan=3,sticky="w",pady=(2,5))
+        ttk.Label(d,text="SSH server",style="Card.TLabel").grid(row=4,column=0,sticky="w",pady=3)
+        server_row=ttk.Frame(d,style="Card.TFrame");server_row.grid(row=4,column=1,columnspan=2,sticky="ew",padx=(10,0),pady=3)
+        ttk.Entry(server_row,textvariable=self.backup_proxmox_host_var,width=28).pack(side="left",fill="x",expand=True)
+        ttk.Label(server_row,text="SSH user",style="Card.TLabel").pack(side="left",padx=(10,5))
+        ttk.Entry(server_row,textvariable=self.backup_proxmox_user_var,width=18).pack(side="left")
+        ttk.Label(server_row,text="Port",style="Card.TLabel").pack(side="left",padx=(10,5))
+        ttk.Entry(server_row,textvariable=self.backup_proxmox_port_var,width=7).pack(side="left")
+        ttk.Label(d,text="Remote folder",style="Card.TLabel").grid(row=5,column=0,sticky="w",pady=3)
+        ttk.Entry(d,textvariable=self.backup_proxmox_dir_var).grid(row=5,column=1,columnspan=2,sticky="ew",padx=(10,0),pady=3)
+        ttk.Label(d,text="SSH private key",style="Card.TLabel").grid(row=6,column=0,sticky="w",pady=3)
+        ttk.Entry(d,textvariable=self.backup_proxmox_key_var).grid(row=6,column=1,sticky="ew",padx=(10,7),pady=3)
+        ttk.Button(d,text="Browse…",command=self._browse_backup_ssh_key).grid(row=6,column=2,sticky="ew",pady=3)
+        ttk.Label(d,text="Uses Windows OpenSSH with your normal key and VPN/Tailscale connection. SSH user may be left blank when it is already saved in your SSH config. Uploads to a temporary remote filename, verifies its SHA-256 on the server, then replaces the previous backup.",style="Card.TLabel",wraplength=900,justify="left").grid(row=7,column=0,columnspan=3,sticky="w",pady=(3,9))
+
+        default_onedrive=str(self._default_onedrive_backup_folder())
+        self.backup_onedrive_enabled_var=tk.BooleanVar(value=self.db.get_setting("backup_onedrive_enabled","1")!="0")
+        self.backup_onedrive_dir_var=tk.StringVar(value=self.db.get_setting("backup_onedrive_dir",default_onedrive) or default_onedrive)
+        ttk.Checkbutton(d,text="OneDrive backup every 24 hours",variable=self.backup_onedrive_enabled_var).grid(row=8,column=0,columnspan=3,sticky="w",pady=(2,5))
+        ttk.Label(d,text="OneDrive folder",style="Card.TLabel").grid(row=9,column=0,sticky="w",pady=3)
+        ttk.Entry(d,textvariable=self.backup_onedrive_dir_var).grid(row=9,column=1,sticky="ew",padx=(10,7),pady=3)
+        ttk.Button(d,text="Browse…",command=self._browse_onedrive_backup_folder).grid(row=9,column=2,sticky="ew",pady=3)
+        ttk.Label(d,text="PrintFlow verifies the replacement file in your local OneDrive folder; the Microsoft OneDrive desktop client handles cloud upload and sync status.",style="Card.TLabel",wraplength=900,justify="left").grid(row=10,column=0,columnspan=3,sticky="w",pady=(3,9))
+
         dbf = ttk.Frame(d, style="Card.TFrame")
-        dbf.grid(row=3, column=0, columnspan=2, sticky="w")
-        ttk.Button(dbf, text="Backup Data Now", command=self.backup_data_manual).pack(side="left", padx=(0, 8))
-        ttk.Button(dbf, text="Open Data Folder", command=lambda: self.open_folder(DATA_DIR)).pack(side="left", padx=(0, 8))
-        ttk.Button(dbf, text="Open Backups", command=lambda: self.open_folder(BACKUP_DIR)).pack(side="left")
+        dbf.grid(row=11, column=0, columnspan=3, sticky="w")
+        ttk.Button(dbf,text="Save Backup Settings",style="Accent.TButton",command=self.save_backup_settings).pack(side="left",padx=(0,8))
+        ttk.Button(dbf,text="Run Both Backups Now",command=self.run_all_backups_now).pack(side="left",padx=(0,8))
+        ttk.Button(dbf,text="Test Proxmox Now",command=lambda:self._run_one_backup_now("proxmox")).pack(side="left",padx=(0,8))
+        ttk.Button(dbf,text="Test OneDrive Now",command=lambda:self._run_one_backup_now("onedrive")).pack(side="left",padx=(0,8))
+        local_buttons=ttk.Frame(d,style="Card.TFrame");local_buttons.grid(row=12,column=0,columnspan=3,sticky="w",pady=(7,0))
+        ttk.Button(local_buttons, text="Create Full Local Backup", command=self.backup_data_manual).pack(side="left", padx=(0, 8))
+        ttk.Button(local_buttons, text="Open Data Folder", command=lambda: self.open_folder(DATA_DIR)).pack(side="left", padx=(0, 8))
+        ttk.Button(local_buttons, text="Open Backups", command=lambda: self.open_folder(BACKUP_DIR)).pack(side="left")
+        self.backup_status_label=ttk.Label(d,text=self._backup_status_text(),style="Card.TLabel",wraplength=900,justify="left")
+        self.backup_status_label.grid(row=13,column=0,columnspan=3,sticky="w",pady=(9,0))
+        d.columnconfigure(1,weight=1)
 
         self.after(150, self.test_bambuddy_silent)
 
@@ -9561,30 +9622,413 @@ class App(tk.Tk):
         self._sqlite_backup(path)
         return path
 
+    @staticmethod
+    def _default_onedrive_backup_folder():
+        for name in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+            value=(os.getenv(name) or "").strip()
+            if value:return Path(value)/"PrintFlow Backups"
+        return Path.home()/"OneDrive"/"PrintFlow Backups"
+
+    def _default_backup_server_host(self):
+        raw=(self.db.get_setting("bambuddy_url","") or "").strip()
+        if not raw:return ""
+        try:
+            parsed=urllib.parse.urlparse(raw if "://" in raw else "//"+raw)
+            return str(parsed.hostname or "").strip()
+        except Exception:return ""
+
+    @staticmethod
+    def _file_sha256(path):
+        digest=hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda:stream.read(1024*1024),b""):digest.update(chunk)
+        return digest.hexdigest()
+
+    def _browse_backup_ssh_key(self):
+        initial=Path(self.backup_proxmox_key_var.get()).expanduser() if self.backup_proxmox_key_var.get().strip() else Path.home()/".ssh"
+        chosen=filedialog.askopenfilename(parent=self,title="Choose SSH private key",initialdir=str(initial.parent if initial.is_file() else initial),filetypes=[("SSH private keys","id_* *.pem *.key"),("All files","*.*")])
+        if chosen:self.backup_proxmox_key_var.set(chosen)
+
+    def _browse_onedrive_backup_folder(self):
+        initial=self.backup_onedrive_dir_var.get().strip() or str(self._default_onedrive_backup_folder())
+        chosen=filedialog.askdirectory(parent=self,title="Choose OneDrive backup folder",initialdir=initial)
+        if chosen:self.backup_onedrive_dir_var.set(chosen)
+
+    def _backup_settings_from_vars(self):
+        host=self.backup_proxmox_host_var.get().strip()
+        user=self.backup_proxmox_user_var.get().strip()
+        remote_dir=self.backup_proxmox_dir_var.get().strip().rstrip("/")
+        key=self.backup_proxmox_key_var.get().strip().strip('"')
+        try:port=int(self.backup_proxmox_port_var.get().strip() or "22")
+        except ValueError:raise ValueError("The Proxmox SSH port must be a number.")
+        if not 1<=port<=65535:raise ValueError("The Proxmox SSH port must be between 1 and 65535.")
+        if self.backup_proxmox_enabled_var.get():
+            if not re.fullmatch(r"[A-Za-z0-9._:-]+",host):raise ValueError("Enter a valid Proxmox/server hostname or IP address.")
+            if user and not re.fullmatch(r"[A-Za-z0-9._-]+",user):raise ValueError("Enter a valid SSH username, or leave it blank to use your SSH config.")
+            if not (remote_dir.startswith("/") or remote_dir.startswith("~/")) or any(value in remote_dir for value in ("\n","\r","\0")):raise ValueError("Enter an absolute Linux folder or a home-folder path beginning with ~/.")
+            if key and not Path(key).expanduser().is_file():raise ValueError("The selected SSH private key does not exist.")
+        onedrive=self.backup_onedrive_dir_var.get().strip().strip('"')
+        if self.backup_onedrive_enabled_var.get() and not onedrive:raise ValueError("Choose the OneDrive backup folder.")
+        return {
+            "backup_proxmox_enabled":"1" if self.backup_proxmox_enabled_var.get() else "0",
+            "backup_proxmox_host":host,"backup_proxmox_user":user,"backup_proxmox_port":str(port),
+            "backup_proxmox_dir":remote_dir,"backup_proxmox_key":key,
+            "backup_onedrive_enabled":"1" if self.backup_onedrive_enabled_var.get() else "0",
+            "backup_onedrive_dir":onedrive,
+        }
+
+    def save_backup_settings(self,show_feedback=True):
+        try:settings=self._backup_settings_from_vars()
+        except Exception as exc:
+            messagebox.showerror("Backup settings",str(exc),parent=self)
+            return False
+        for key,value in settings.items():self.db.set_setting(key,value)
+        self._refresh_backup_status_ui()
+        if show_feedback:self.status_flash("Automatic backup settings saved.")
+        return True
+
+    def _format_backup_time(self,value):
+        if not value:return "never"
+        try:return datetime.fromisoformat(str(value)).astimezone().strftime("%b %d, %Y %I:%M %p")
+        except Exception:return str(value).replace("T"," ")
+
+    def _backup_status_text(self):
+        lines=[]
+        for target,label,enabled_key in (
+            ("proxmox","Proxmox/server (2-hour)","backup_proxmox_enabled"),
+            ("onedrive","OneDrive (24-hour)","backup_onedrive_enabled"),
+        ):
+            enabled=self.db.get_setting(enabled_key,"1")!="0"
+            if not enabled:
+                lines.append(f"{label}: Disabled")
+                continue
+            success=self._format_backup_time(self.db.get_setting(f"backup_{target}_last_success",""))
+            error=self.db.get_setting(f"backup_{target}_last_error","").strip()
+            line=f"{label}: Last verified backup {success}"
+            if error:line+=f" • ERROR: {error}"
+            lines.append(line)
+        latest=BACKUP_DIR/"PrintFlowCRM-Latest-Full-Backup.zip"
+        if latest.exists():
+            try:lines.append(f"Local latest recovery ZIP: {latest} ({latest.stat().st_size/1024/1024:.1f} MB)")
+            except Exception:lines.append(f"Local latest recovery ZIP: {latest}")
+        else:lines.append(f"Local latest recovery ZIP: not created yet ({latest})")
+        return "\n".join(lines)
+
+    def _refresh_backup_banner(self):
+        problems=[]
+        for target,label,enabled_key in (
+            ("proxmox","Proxmox/server","backup_proxmox_enabled"),("onedrive","OneDrive","backup_onedrive_enabled"),
+        ):
+            if self.db.get_setting(enabled_key,"1")=="0":continue
+            error=self.db.get_setting(f"backup_{target}_last_error","").strip()
+            if error:problems.append(f"{label}: {error}")
+        try:
+            if problems:
+                self.backup_banner_message.configure(text="Backup needs attention — "+" | ".join(problems[:2]))
+                if not self.backup_banner.winfo_ismapped():self.backup_banner.pack(fill="x",before=self.printer_strip)
+            else:self.backup_banner.pack_forget()
+        except Exception:pass
+
+    def _refresh_backup_status_ui(self):
+        try:
+            if hasattr(self,"backup_status_label") and self.backup_status_label.winfo_exists():self.backup_status_label.configure(text=self._backup_status_text())
+        except Exception:pass
+        self._refresh_backup_banner()
+
+    def _backup_due_targets(self):
+        now=time.time();targets=[]
+        for target,enabled_key,interval in (
+            ("proxmox","backup_proxmox_enabled",2*60*60),("onedrive","backup_onedrive_enabled",24*60*60),
+        ):
+            if self.db.get_setting(enabled_key,"1")=="0":continue
+            try:last=float(self.db.get_setting(f"backup_{target}_last_success_epoch","0") or 0)
+            except Exception:last=0
+            if now-last>=interval:targets.append(target)
+        return targets
+
+    def _schedule_full_backup_check(self):
+        if self._backup_stop:return
+        try:
+            self._refresh_backup_status_ui()
+            due=self._backup_due_targets()
+            if due and not self._backup_running:self._start_full_backup(due,interactive=False)
+        finally:
+            try:self.after(60000,self._schedule_full_backup_check)
+            except Exception:pass
+
+    def _full_backup_restore_files(self):
+        bat="""@echo off\r\nsetlocal\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Restore-PrintFlowCRM.ps1"\r\npause\r\n"""
+        ps1=r'''$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName PresentationFramework
+$BackupRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$AppSource = Join-Path $BackupRoot 'app'
+$DataSource = Join-Path $BackupRoot 'data'
+$InstallRoot = Join-Path $env:LOCALAPPDATA 'PrintFlowCRM'
+$AppDest = Join-Path $InstallRoot 'App'
+$BackupsDest = Join-Path $InstallRoot 'backups'
+
+if (-not (Test-Path (Join-Path $AppSource 'PrintFlowCRM.pyw'))) { throw 'Backup app files are missing.' }
+if (-not (Test-Path (Join-Path $DataSource 'printflow.db'))) { throw 'Backup database is missing.' }
+New-Item -ItemType Directory -Force -Path $InstallRoot,$BackupsDest | Out-Null
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+if (Test-Path (Join-Path $InstallRoot 'printflow.db')) {
+    Copy-Item (Join-Path $InstallRoot 'printflow.db') (Join-Path $BackupsDest ("before-restore-$stamp.db")) -Force
+}
+if (Test-Path $AppDest) {
+    $oldApp = Join-Path $BackupsDest ("App-before-restore-$stamp")
+    Move-Item $AppDest $oldApp -Force
+}
+New-Item -ItemType Directory -Force -Path $AppDest | Out-Null
+Copy-Item (Join-Path $AppSource '*') $AppDest -Recurse -Force
+Copy-Item (Join-Path $DataSource '*') $InstallRoot -Recurse -Force
+
+function Find-PythonW {
+    foreach ($name in @('pyw.exe','pythonw.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    foreach ($pattern in @((Join-Path $env:LOCALAPPDATA 'Programs\Python\Python*\pythonw.exe'),(Join-Path $env:ProgramFiles 'Python*\pythonw.exe'))) {
+        $found = Get-ChildItem $pattern -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+    return $null
+}
+$python = Find-PythonW
+if (-not $python) {
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget) { throw 'Python is not installed and Windows Package Manager was not found. Install Python 3, then run this restore again.' }
+    Start-Process $winget.Source -ArgumentList @('install','-e','--id','Python.Python.3.13','--scope','user','--accept-package-agreements','--accept-source-agreements','--silent') -Wait
+    $python = Find-PythonW
+    if (-not $python) { throw 'Python installation did not complete. Install Python 3, then run this restore again.' }
+}
+$appArgument = '"' + (Join-Path $AppDest 'PrintFlowCRM.pyw') + '"'
+if ([IO.Path]::GetFileName($python).ToLowerInvariant() -eq 'pyw.exe') { $appArgument = '-3 ' + $appArgument }
+$shell = New-Object -ComObject WScript.Shell
+foreach ($shortcutPath in @((Join-Path ([Environment]::GetFolderPath('Desktop')) 'PrintFlow CRM.lnk'),(Join-Path ([Environment]::GetFolderPath('Programs')) 'PrintFlow CRM\PrintFlow CRM.lnk'))) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $shortcutPath) | Out-Null
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $python
+    $shortcut.Arguments = $appArgument
+    $shortcut.WorkingDirectory = $AppDest
+    $shortcut.Description = 'PrintFlow CRM - restored backup'
+    $shortcut.Save()
+}
+[System.Windows.MessageBox]::Show("PrintFlow CRM was restored successfully.`n`nApp: $AppDest`nData: $InstallRoot",'PrintFlow CRM Restore','OK','Information') | Out-Null
+Start-Process -FilePath $python -ArgumentList $appArgument -WorkingDirectory $AppDest
+'''
+        instructions=(
+            "PRINTFLOW CRM COMPLETE RECOVERY BACKUP\n\n"
+            "1. Extract this entire ZIP to a normal Windows folder.\n"
+            "2. Close PrintFlow CRM if it is running.\n"
+            "3. Double-click 'Restore PrintFlow CRM.bat'.\n"
+            "4. The restore tool reinstalls the app and all saved data, creates shortcuts, and opens PrintFlow.\n\n"
+            "The restore keeps a safety copy of the database and previous app folder under LocalAppData\\PrintFlowCRM\\backups.\n"
+        )
+        return bat,ps1,instructions
+
+    @staticmethod
+    def _backup_source_file_allowed(path,root,kind):
+        try:relative=path.relative_to(root)
+        except Exception:return False
+        parts=set(relative.parts)
+        excluded_parts={".git",".github","__pycache__",".pytest_cache","dist","build"}
+        if kind=="data":excluded_parts|={"backups","App","updates","thumb_cache","python_packages_staging","python_packages_previous","preflight"}
+        if parts & excluded_parts:return False
+        if path.name in {"printflow.db","printflow.db-wal","printflow.db-shm","messenger_capture.json","messenger_payment_request.json","pirateship_scan_request.json","pirateship_scan_result.json","pirateship_label_result.json"}:return False
+        if path.name.endswith((".tmp",".part",".pyc")):return False
+        return path.is_file()
+
+    def _create_full_backup_archive(self,destination):
+        destination=Path(destination);destination.parent.mkdir(parents=True,exist_ok=True)
+        token=uuid.uuid4().hex
+        temp_db=Path(tempfile.gettempdir())/f"printflow-full-{token}.db"
+        temp_zip=destination.parent/f".{destination.name}.{token}.tmp"
+        file_count=0
+        try:
+            self._sqlite_backup(temp_db)
+            with sqlite3.connect(temp_db) as check:
+                integrity=check.execute("PRAGMA integrity_check").fetchone()[0]
+            if str(integrity).lower()!="ok":raise RuntimeError(f"Database integrity check failed: {integrity}")
+            created=datetime.now().astimezone().isoformat(timespec="seconds")
+            manifest={"product":APP_NAME,"version":VERSION,"created_at":created,"format":1,
+                      "original_app_dir":str(SOURCE_APP_DIR),"original_data_dir":str(DATA_DIR),
+                      "database_integrity":"ok","restore":"Restore PrintFlow CRM.bat"}
+            bat,ps1,instructions=self._full_backup_restore_files()
+            with zipfile.ZipFile(temp_zip,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
+                archive.write(temp_db,"data/printflow.db");file_count+=1
+                for root,kind,prefix in ((SOURCE_APP_DIR,"app","app"),(DATA_DIR,"data","data")):
+                    if not root.exists():continue
+                    for source in root.rglob("*"):
+                        if not self._backup_source_file_allowed(source,root,kind):continue
+                        try:archive.write(source,str(Path(prefix)/source.relative_to(root)));file_count+=1
+                        except FileNotFoundError:continue
+                manifest["file_count"]=file_count
+                archive.writestr("recovery-manifest.json",json.dumps(manifest,indent=2))
+                archive.writestr("Restore PrintFlow CRM.bat",bat)
+                archive.writestr("Restore-PrintFlowCRM.ps1",ps1)
+                archive.writestr("RESTORE-INSTRUCTIONS.txt",instructions)
+            with zipfile.ZipFile(temp_zip,"r") as archive:
+                bad=archive.testzip()
+                names=set(archive.namelist())
+            if bad:raise RuntimeError(f"Backup ZIP verification failed at {bad}")
+            required={"data/printflow.db","app/PrintFlowCRM.pyw","recovery-manifest.json","Restore PrintFlow CRM.bat","Restore-PrintFlowCRM.ps1"}
+            missing=required-names
+            if missing:raise RuntimeError("Backup is missing required recovery files: "+", ".join(sorted(missing)))
+            os.replace(temp_zip,destination)
+            sha=self._file_sha256(destination)
+            return {"path":destination,"sha256":sha,"size":destination.stat().st_size,"files":file_count,"created_at":created}
+        finally:
+            for path in (temp_db,temp_zip):
+                try:path.unlink(missing_ok=True)
+                except Exception:pass
+
+    def _copy_backup_to_onedrive(self,backup,folder):
+        folder=Path(folder).expanduser();folder.mkdir(parents=True,exist_ok=True)
+        destination=folder/"PrintFlowCRM-Latest-Full-Backup.zip"
+        temporary=folder/f".{destination.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with Path(backup["path"]).open("rb") as source,temporary.open("wb") as target:
+                shutil.copyfileobj(source,target,1024*1024);target.flush();os.fsync(target.fileno())
+            copied=self._file_sha256(temporary)
+            if copied!=backup["sha256"]:raise RuntimeError("OneDrive copy failed SHA-256 verification.")
+            os.replace(temporary,destination)
+            return f"Verified {destination} ({backup['size']/1024/1024:.1f} MB)"
+        finally:
+            try:temporary.unlink(missing_ok=True)
+            except Exception:pass
+
+    def _ssh_backup_args(self,program,host,user,port,key):
+        executable=shutil.which(program)
+        if not executable:raise RuntimeError(f"Windows OpenSSH {program}.exe was not found. Install the Windows OpenSSH Client feature.")
+        args=[executable]
+        if program=="ssh":args += ["-p",str(port)]
+        else:args += ["-P",str(port)]
+        args += ["-o","BatchMode=yes","-o","ConnectTimeout=20","-o","ServerAliveInterval=15"]
+        if key:args += ["-i",str(Path(key).expanduser())]
+        if program=="ssh":args.append(f"{user}@{host}" if user else host)
+        return args
+
+    @staticmethod
+    def _remote_backup_shell_path(path):
+        value=str(path or "").strip().rstrip("/")
+        if value=="~":return '"$HOME"'
+        if value.startswith("~/"):return '"$HOME"/'+shlex.quote(value[2:])
+        return shlex.quote(value)
+
+    def _run_backup_command(self,args,timeout=180):
+        flags=subprocess.CREATE_NO_WINDOW if os.name=="nt" and hasattr(subprocess,"CREATE_NO_WINDOW") else 0
+        result=subprocess.run(args,capture_output=True,text=True,timeout=timeout,creationflags=flags)
+        if result.returncode:
+            detail=(result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+            raise RuntimeError(detail[-700:])
+        return (result.stdout or "").strip()
+
+    def _upload_backup_to_proxmox(self,backup):
+        host=self.db.get_setting("backup_proxmox_host",self._default_backup_server_host()).strip()
+        user=self.db.get_setting("backup_proxmox_user","").strip()
+        port=int(self.db.get_setting("backup_proxmox_port","22") or 22)
+        remote_dir=self.db.get_setting("backup_proxmox_dir","~/printflow-backups").strip().rstrip("/")
+        key=self.db.get_setting("backup_proxmox_key","").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:-]+",host) or (user and not re.fullmatch(r"[A-Za-z0-9._-]+",user)):raise RuntimeError("Configure a valid SSH server and optional username in Backup Settings.")
+        if not (remote_dir.startswith("/") or remote_dir.startswith("~/")):raise RuntimeError("The remote backup folder must begin with / or ~/.")
+        remote_dir_shell=self._remote_backup_shell_path(remote_dir)
+        final_shell=f"{remote_dir_shell}/PrintFlowCRM-Latest-Full-Backup.zip"
+        temporary_name=f".PrintFlowCRM-Latest-Full-Backup.{uuid.uuid4().hex}.tmp"
+        temporary_shell=f"{remote_dir_shell}/{temporary_name}"
+        temporary_scp=f"{remote_dir}/{temporary_name}"
+        ssh=self._ssh_backup_args("ssh",host,user,port,key)
+        self._run_backup_command(ssh+[f"mkdir -p -- {remote_dir_shell}"],60)
+        scp=self._ssh_backup_args("scp",host,user,port,key)
+        remote_target=f"{user}@{host}" if user else host
+        self._run_backup_command(scp+[str(backup["path"]),f"{remote_target}:{temporary_scp}"],600)
+        try:
+            remote_hash=self._run_backup_command(ssh+[f"sha256sum -- {temporary_shell}"],120).split()[0].lower()
+            if remote_hash!=backup["sha256"].lower():raise RuntimeError("The uploaded Proxmox backup failed SHA-256 verification.")
+            self._run_backup_command(ssh+[f"mv -f -- {temporary_shell} {final_shell}"],60)
+        except Exception:
+            try:self._run_backup_command(ssh+[f"rm -f -- {temporary_shell}"],30)
+            except Exception:pass
+            raise
+        shown_target=f"{user}@{host}" if user else host
+        return f"Verified {shown_target}:{remote_dir}/PrintFlowCRM-Latest-Full-Backup.zip ({backup['size']/1024/1024:.1f} MB)"
+
+    def _record_backup_result(self,target,success,message,backup=None):
+        now=datetime.now().astimezone().isoformat(timespec="seconds")
+        self.db.set_setting(f"backup_{target}_last_attempt",now)
+        if success:
+            self.db.set_setting(f"backup_{target}_last_success",now)
+            self.db.set_setting(f"backup_{target}_last_success_epoch",str(time.time()))
+            self.db.set_setting(f"backup_{target}_last_error","")
+            if backup:
+                self.db.set_setting(f"backup_{target}_last_sha256",backup["sha256"])
+                self.db.set_setting(f"backup_{target}_last_size",str(backup["size"]))
+            try:self.db.add_app_log("Info","Backups",f"{target.title()} backup completed",message)
+            except Exception:pass
+        else:
+            self.db.set_setting(f"backup_{target}_last_error",str(message))
+            try:self.db.add_app_log("Error","Backups",f"{target.title()} backup failed",message)
+            except Exception:pass
+
+    def _start_full_backup(self,targets,interactive=False,local_destination=None):
+        if self._backup_running:
+            if interactive:messagebox.showinfo("Backup already running","A complete PrintFlow backup is already running.",parent=self)
+            return
+        targets=list(dict.fromkeys(targets or []));self._backup_running=True
+        if hasattr(self,"backup_status_label"):
+            try:self.backup_status_label.configure(text="Creating a verified complete recovery ZIP…")
+            except Exception:pass
+        def worker():
+            results=[];backup=None
+            destination=Path(local_destination) if local_destination else BACKUP_DIR/"PrintFlowCRM-Latest-Full-Backup.zip"
+            try:backup=self._create_full_backup_archive(destination)
+            except Exception as exc:
+                for target in targets:self._record_backup_result(target,False,f"Could not create the complete recovery ZIP: {exc}")
+                results.append(("local",False,str(exc)))
+            if backup:
+                results.append(("local",True,f"Verified {backup['path']}"))
+                for target in targets:
+                    try:
+                        if target=="proxmox":message=self._upload_backup_to_proxmox(backup)
+                        elif target=="onedrive":message=self._copy_backup_to_onedrive(backup,self.db.get_setting("backup_onedrive_dir",str(self._default_onedrive_backup_folder())))
+                        else:continue
+                        self._record_backup_result(target,True,message,backup);results.append((target,True,message))
+                    except Exception as exc:
+                        self._record_backup_result(target,False,str(exc),backup);results.append((target,False,str(exc)))
+            try:self.after(0,lambda:self._finish_full_backup(results,interactive))
+            except Exception:self._backup_running=False
+        threading.Thread(target=worker,daemon=True,name="PrintFlowFullBackup").start()
+
+    def _finish_full_backup(self,results,interactive):
+        self._backup_running=False;self._refresh_backup_status_ui()
+        failures=[f"{target}: {message}" for target,ok,message in results if not ok]
+        successes=[target for target,ok,_message in results if ok and target!="local"]
+        if failures:
+            self.status_flash("Backup needs attention — open Settings.")
+            if interactive:messagebox.showerror("Backup incomplete","The local recovery ZIP was kept safely, but one or more steps failed:\n\n"+"\n".join(failures),parent=self)
+        else:
+            text="Complete backup verified"+(" and copied to "+" + ".join(successes) if successes else " locally")+"."
+            self.status_flash(text)
+            if interactive:messagebox.showinfo("Backup complete",text+"\n\n"+(results[0][2] if results else ""),parent=self)
+
+    def run_all_backups_now(self):
+        if not self.save_backup_settings(show_feedback=False):return
+        targets=[]
+        if self.db.get_setting("backup_proxmox_enabled","1")!="0":targets.append("proxmox")
+        if self.db.get_setting("backup_onedrive_enabled","1")!="0":targets.append("onedrive")
+        if not targets:
+            messagebox.showwarning("Backups disabled","Enable at least one automatic backup destination first.",parent=self);return
+        self._start_full_backup(targets,interactive=True)
+
+    def _run_one_backup_now(self,target):
+        if not self.save_backup_settings(show_feedback=False):return
+        if self.db.get_setting(f"backup_{target}_enabled","1")=="0":
+            messagebox.showwarning("Backup disabled",f"Enable the {target.title()} backup first.",parent=self);return
+        self._start_full_backup([target],interactive=True)
+
     def backup_data_manual(self):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out = BACKUP_DIR / f"PrintFlowCRM-data-{stamp}.zip"
-        temp_db = None
-        try:
-            temp_db = Path(tempfile.gettempdir()) / f"printflow-backup-{uuid.uuid4().hex}.db"
-            self._sqlite_backup(temp_db)
-            with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                z.write(temp_db, "printflow.db")
-                for folder_name in ("files", "exports"):
-                    folder = DATA_DIR / folder_name
-                    if folder.exists():
-                        for f in folder.rglob("*"):
-                            if f.is_file():
-                                z.write(f, str(Path(folder_name) / f.relative_to(folder)))
-            messagebox.showinfo("Backup complete", f"Your PrintFlow data was backed up to:\n\n{out}", parent=self)
-        except Exception as e:
-            messagebox.showerror("Backup failed", str(e), parent=self)
-        finally:
-            if temp_db:
-                try:
-                    temp_db.unlink()
-                except Exception:
-                    pass
+        out=BACKUP_DIR/f"PrintFlowCRM-Full-Backup-{stamp}.zip"
+        self._start_full_backup([],interactive=True,local_destination=out)
 
     @staticmethod
     def _version_tuple(value):
@@ -10216,6 +10660,7 @@ finally:
 
     def on_close(self):
         self._printer_camera_stopping = True
+        self._backup_stop = True
         self._printer_camera_generation += 1
         for attr in ("_top_printer_after_id",):
             after_id = getattr(self, attr, None)

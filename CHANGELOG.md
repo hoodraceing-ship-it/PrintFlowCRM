@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.80
+
+- Added complete disaster-recovery backups containing a consistency-checked database snapshot, customer files, Model Library inventory, shipping labels, packing lists, settings, installed dependencies, and the full app installation.
+- Added a standalone Windows restore launcher inside every backup so an extracted ZIP can reinstall PrintFlow, restore all saved data, recreate shortcuts, and reopen the app even when the installed copy will not start.
+- Added automatic Proxmox/server backups every 2 hours using a configurable VPN/Tailscale hostname, Windows OpenSSH key, optional SSH-config username, and remote folder; PrintFlow can prefill the host from the saved BambuBuddy URL without publishing private connection details.
+- Added automatic OneDrive backups every 24 hours with automatic Windows OneDrive-folder detection and an editable destination.
+- Made local, Proxmox, and OneDrive destinations use one fixed latest-backup filename and atomic replacement so a failed copy never destroys the last successful backup.
+- Added end-to-end ZIP, database, and SHA-256 verification, including a remote server hash check before the Proxmox backup is promoted to the current backup.
+- Added Settings controls to save destinations, select an SSH key, run both backups, test either destination, create a dated local full backup, and view the last verified success or error.
+- Added an app-wide backup warning banner and persistent App Log entries so failed background backups cannot remain silent.
+
 ## 0.7.79
 
 - Replaced successful MakerWorld fallback pop-ups with a status-bar message and a persistent Settings app log.
