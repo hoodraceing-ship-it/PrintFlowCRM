@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.75"
+VERSION = "0.7.76"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -3315,11 +3315,37 @@ class App(tk.Tk):
                    GROUP BY m.id ORDER BY LOWER(m.category),LOWER(m.product_name),LOWER(m.title)"""
             ).fetchall()
 
-    def show_model_library(self,select_model_id=None):
+    def _library_group_aliases(self):
+        try:
+            data=json.loads(self.db.get_setting("model_library_group_aliases","{}") or "{}")
+            return {str(key):clean_model_item_name(value) for key,value in data.items() if str(key).strip() and str(value).strip()} if isinstance(data,dict) else {}
+        except Exception:return {}
+
+    def _resolved_library_category(self,category):
+        current=clean_model_item_name(category or "Other Models");aliases=self._library_group_aliases();seen=set()
+        for _ in range(20):
+            if current in seen:break
+            seen.add(current)
+            replacement=next((value for key,value in aliases.items() if key.casefold()==current.casefold()),"")
+            if not replacement or replacement==current:break
+            current=replacement
+        return current
+
+    def _remember_library_group_rename(self,old_category,new_category):
+        aliases=self._library_group_aliases()
+        # Remove a previous mapping *from* the destination to avoid a cycle when
+        # someone renames a group back to an earlier name.
+        aliases={key:value for key,value in aliases.items() if key.casefold()!=new_category.casefold()}
+        for key,value in list(aliases.items()):
+            if value.casefold()==old_category.casefold():aliases[key]=new_category
+        aliases[old_category]=new_category
+        self.db.set_setting("model_library_group_aliases",json.dumps(aliases,sort_keys=True))
+
+    def show_model_library(self,select_model_id=None,select_category=None):
         if self.compact:
             self.toggle_compact();return
         self.current_page="model_library"
-        self.clear_main();self._library_photos=[]
+        self.clear_main();self._library_photos=[];self.library_group_map={}
         self.page_header("Model Library","Product inventory and source models organized by what they fit — G-code is never stored",
                          "Add Clipboard Link",self._library_import_clipboard,"Delete Entire Library",self._delete_entire_model_library)
         quick=self.card(self.main,12);quick.pack(fill="x",pady=(0,10))
@@ -3359,25 +3385,30 @@ class App(tk.Tk):
                 hay=" ".join(str(row[k] or "") for k in ("category","product_name","model_number","title","source_url")).lower()
                 if q and q not in hay:continue
                 grouped.setdefault(row["category"] or "Other Models",[]).append(row)
-            first_model=None;wanted=f"model:{int(select_model_id)}" if select_model_id else None
+            first_model=None;wanted=f"model:{int(select_model_id)}" if select_model_id else None;wanted_group=None
             for index,category in enumerate(sorted(grouped,key=str.lower)):
                 rows=grouped[category];parent=f"cat:{index}"
+                self.library_group_map[parent]=category
+                if select_category and category.casefold()==str(select_category).casefold():wanted_group=parent
                 total_stock=sum(int(r["stock_qty"] or 0) for r in rows);total_files=sum(int(r["file_count"] or 0) for r in rows)
                 self.library_tree.insert("","end",iid=parent,text=category,values=(total_stock,total_files),open=True)
                 for row in rows:
                     iid=f"model:{int(row['id'])}";first_model=first_model or iid
                     label=row["product_name"]+(f"  ({row['model_number']})" if row["model_number"] and row["model_number"] not in row["product_name"] else "")
                     self.library_tree.insert(parent,"end",iid=iid,text=label,values=(int(row["stock_qty"] or 0),row["file_count"]))
-            if wanted and self.library_tree.exists(wanted):chosen=wanted
+            if wanted_group and self.library_tree.exists(wanted_group):chosen=wanted_group
+            elif wanted and self.library_tree.exists(wanted):chosen=wanted
             else:chosen=first_model
             if chosen:
                 self.library_tree.selection_set(chosen);self.library_tree.focus(chosen);self.library_tree.see(chosen)
-                self._show_model_library_detail(int(chosen.split(":",1)[1]))
+                if chosen.startswith("model:"):self._show_model_library_detail(int(chosen.split(":",1)[1]))
+                else:self._show_model_library_group_detail(self.library_group_map.get(chosen,""))
             else:self._show_model_library_detail(None)
         search_var.trace_add("write",refill)
         def selected(_event=None):
             choice=self.library_tree.selection()
             if choice and choice[0].startswith("model:"):self._show_model_library_detail(int(choice[0].split(":",1)[1]))
+            elif choice:self._show_model_library_group_detail(self.library_group_map.get(choice[0],""))
         self.library_tree.bind("<<TreeviewSelect>>",selected)
         refill();url_entry.focus_set()
 
@@ -3397,8 +3428,9 @@ class App(tk.Tk):
         name_var=tk.StringVar(value=suggested);name_entry=ttk.Entry(body,textvariable=name_var,width=52)
         name_entry.grid(row=1,column=1,sticky="ew",padx=(12,0),pady=5)
         ttk.Label(body,text="Product group").grid(row=2,column=0,sticky="w",pady=5)
-        group_var=tk.StringVar(value=detect_model_category(suggested))
-        groups=[row[0] for row in MODEL_CATEGORY_RULES]+["Other Models"]
+        group_var=tk.StringVar(value=self._resolved_library_category(detect_model_category(suggested)))
+        current_groups=[row["category"] for row in self._library_rows() if row["category"]]
+        groups=list(dict.fromkeys([self._resolved_library_category(row[0]) for row in MODEL_CATEGORY_RULES]+current_groups+["Other Models"]))
         ttk.Combobox(body,textvariable=group_var,values=groups,width=49).grid(row=2,column=1,sticky="ew",padx=(12,0),pady=5)
         ttk.Label(body,text="Tool / model number").grid(row=3,column=0,sticky="w",pady=5)
         number_var=tk.StringVar(value=detect_model_number(suggested))
@@ -3600,6 +3632,7 @@ class App(tk.Tk):
         product=clean_model_item_name(data.get("product") or data.get("title"))
         category=clean_model_item_name(data.get("category") or detect_model_category(product,data.get("title")))
         category_manual=1 if data.get("category_manual") else 0
+        if not category_manual:category=self._resolved_library_category(category)
         source_key=str(data.get("source_key") or canonical_model_source_key(data.get("url"))).strip()
         with self.db.connect() as c:
             existing=c.execute("SELECT * FROM model_library WHERE source_key=? ORDER BY id LIMIT 1",(source_key,)).fetchone() if source_key else None
@@ -3755,6 +3788,85 @@ class App(tk.Tk):
             c.execute("INSERT INTO model_library_files(model_id,stored_path,original_name,source_url,sha256,added_at) VALUES(?,?,?,?,?,?)",
                       (model_id,str(destination),safe,source_url,digest,datetime.now().isoformat(timespec="seconds")))
         return 1
+
+    def _show_model_library_group_detail(self,category):
+        for widget in self.library_detail.winfo_children():widget.destroy()
+        if not category:
+            ttk.Label(self.library_detail,text="Choose a product group or inventory item.",style="CardTitle.TLabel").pack(anchor="w");return
+        with self.db.connect() as c:
+            rows=c.execute(
+                """SELECT m.*,COUNT(f.id) AS file_count FROM model_library m
+                   LEFT JOIN model_library_files f ON f.model_id=m.id
+                   WHERE m.category=? GROUP BY m.id ORDER BY LOWER(m.product_name)""",(category,)
+            ).fetchall()
+        total_stock=sum(int(row["stock_qty"] or 0) for row in rows)
+        total_files=sum(int(row["file_count"] or 0) for row in rows)
+        ttk.Label(self.library_detail,text=category,style="Title.TLabel",wraplength=650).pack(anchor="w")
+        ttk.Label(self.library_detail,text=f"{len(rows)} stockable item(s)  •  {total_stock} total in stock  •  {total_files} source file(s)",style="Card.TLabel").pack(anchor="w",pady=(5,12))
+        actions=ttk.Frame(self.library_detail,style="Card.TFrame");actions.pack(fill="x",pady=(0,14))
+        ttk.Button(actions,text="Rename Group",style="Accent.TButton",command=lambda:self._rename_library_group(category)).pack(side="left")
+        group_folder=MODEL_LIBRARY_DIR/model_folder_name(category)
+        if group_folder.exists():ttk.Button(actions,text="Open Group Folder",command=lambda:self._open_library_folder(group_folder)).pack(side="left",padx=(7,0))
+        ttk.Label(self.library_detail,text="Products in this group",style="CardTitle.TLabel").pack(anchor="w",pady=(0,7))
+        tree=ttk.Treeview(self.library_detail,columns=("model","stock","files"),show="headings")
+        for key,label,width,anchor in (("model","Inventory item",390,"w"),("stock","In stock",80,"center"),("files","Files",65,"center")):
+            tree.heading(key,text=label);tree.column(key,width=width,anchor=anchor,stretch=key=="model")
+        for row in rows:
+            label=row["product_name"]+(f"  ({row['model_number']})" if row["model_number"] and row["model_number"] not in row["product_name"] else "")
+            tree.insert("","end",iid=str(int(row["id"])),values=(label,int(row["stock_qty"] or 0),int(row["file_count"] or 0)))
+        tree.pack(fill="both",expand=True)
+        def open_item(_event=None):
+            chosen=tree.selection()
+            if chosen:self.show_model_library(int(chosen[0]))
+        tree.bind("<Double-1>",open_item)
+
+    def _rename_library_group_records(self,old_category,new_category):
+        with self.db.connect() as c:
+            rows=c.execute("SELECT * FROM model_library WHERE category=? ORDER BY id",(old_category,)).fetchall()
+        now=datetime.now().isoformat(timespec="seconds")
+        moved=0
+        for row in rows:
+            model_id=int(row["id"]);old_folder=Path(row["folder_path"]);new_folder=old_folder
+            candidate=MODEL_LIBRARY_DIR/model_folder_name(new_category)/model_folder_name(row["product_name"])
+            if candidate!=old_folder:
+                if candidate.exists():candidate=candidate.with_name(candidate.name+f"-{model_id}")
+                try:
+                    candidate.parent.mkdir(parents=True,exist_ok=True)
+                    if old_folder.exists():old_folder.rename(candidate)
+                    else:candidate.mkdir(parents=True,exist_ok=True)
+                    new_folder=candidate
+                except Exception:new_folder=old_folder
+            with self.db.connect() as c:
+                c.execute("UPDATE model_library SET category=?,category_manual=1,folder_path=?,updated_at=? WHERE id=?",
+                          (new_category,str(new_folder),now,model_id))
+                if new_folder!=old_folder:
+                    for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
+                        c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",
+                                  (str(new_folder/Path(file_row["stored_path"]).name),int(file_row["id"])))
+                    image_path=new_folder/"preview.png"
+                    c.execute("UPDATE model_library SET image_path=? WHERE id=?",
+                              (str(image_path) if image_path.exists() else "",model_id))
+            moved+=1
+        old_group_folder=MODEL_LIBRARY_DIR/model_folder_name(old_category)
+        try:
+            if old_group_folder.exists() and not any(old_group_folder.iterdir()):old_group_folder.rmdir()
+        except Exception:pass
+        return moved
+
+    def _rename_library_group(self,category):
+        value=simpledialog.askstring("Rename product group","New group name:",initialvalue=category,parent=self)
+        if not value or not value.strip():return
+        new_category=clean_model_item_name(value)
+        if new_category==category:return
+        with self.db.connect() as c:
+            existing=c.execute("SELECT COUNT(*) FROM model_library WHERE LOWER(category)=LOWER(?) AND category<>?",(new_category,category)).fetchone()[0]
+        if existing and not messagebox.askyesno(
+            "Merge product groups",f'A group named "{new_category}" already exists.\n\nMove every item from "{category}" into that group?',parent=self
+        ):return
+        moved=self._rename_library_group_records(category,new_category)
+        self._remember_library_group_rename(category,new_category)
+        self.status_flash(f'Renamed group to "{new_category}" • {moved} item(s) moved')
+        self.show_model_library(select_category=new_category)
 
     def _show_model_library_detail(self,model_id):
         for widget in self.library_detail.winfo_children():widget.destroy()

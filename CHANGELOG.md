@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.76
+
+- Added a group detail screen when a Model Library group is selected, including product, stock, and source-file totals.
+- Added Rename Group to rename or merge a group after it has been created.
+- Moved every product folder and saved source-file path with the renamed group while preserving product photos and inventory counts.
+- Saved renamed groups as aliases so existing products, refreshed links, and future automatic imports keep using the new group name.
+
 ## 0.7.75
 
 - Fixed oscillating and multi-tool MakerWorld designs being grouped under Batteries & Chargers when their descriptions merely mentioned a battery.
