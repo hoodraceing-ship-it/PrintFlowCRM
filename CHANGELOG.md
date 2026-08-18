@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.72
+
+- Added a guarded Send Anyway override after Messenger detects a customer-name mismatch, allowing known spelling mistakes to be bypassed without weakening the normal automatic name check.
+- Kept the message unsent until the user explicitly clicks the override button, and retained the existing exact-message and duplicate-send protections.
+
 ## 0.7.71
 
 - Changed View Packing List to open a native PrintFlow window instead of a web browser.

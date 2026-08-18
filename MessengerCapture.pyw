@@ -271,7 +271,8 @@ INJECT = r'''
     panel.innerHTML = `<div style="font-weight:700;color:#fbbf24;margin-bottom:6px">Payment reminder armed</div>
       <div>Click <b>${String(payment.buyer_first_name || payment.buyer_name || 'the buyer')}</b> in the conversation list.</div>
       <div style="font-size:12px;color:#cbd5e1;margin-top:7px">${String(payment.message || '')}</div>
-      <div id="printflow-payment-status" style="font-size:12px;color:#93c5fd;margin-top:8px">Waiting for the matching conversation…</div>`;
+      <div id="printflow-payment-status" style="font-size:12px;color:#93c5fd;margin-top:8px">Waiting for the matching conversation…</div>
+      <button id="printflow-send-anyway" type="button" style="display:none;width:100%;margin-top:10px;padding:8px 10px;border:1px solid #fca5a5;border-radius:7px;background:#7f1d1d;color:#fff;font:700 12px Segoe UI,Arial,sans-serif;cursor:pointer">Send Anyway to This Conversation</button>`;
     document.documentElement.appendChild(panel);
 
     const normalize = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -282,6 +283,9 @@ INJECT = r'''
       const el = document.getElementById('printflow-payment-status');
       if (el) { el.textContent = text; el.style.color = color; }
     };
+
+    const overrideButton = document.getElementById('printflow-send-anyway');
+    const hideOverride = () => { if (overrideButton) overrideButton.style.display = 'none'; };
 
     const fillAndSend = async () => {
       const requestId = String(payment.request_id || '');
@@ -340,6 +344,16 @@ INJECT = r'''
       setTimeout(() => panel.remove(), 4500);
     };
 
+    if (overrideButton) {
+      overrideButton.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        hideOverride();
+        setStatus('Name mismatch overridden. Sending to the open conversation…', '#fbbf24');
+        fillAndSend();
+      });
+    }
+
     document.addEventListener('click', event => {
       if (sending || !window.__PRINTFLOW_PAYMENT_REQUEST__ || event.clientX > innerWidth * .42) return;
       let el=event.target, text='';
@@ -349,9 +363,11 @@ INJECT = r'''
       }
       const clicked=normalize(text);
       if (!expected || !clicked.split(' ').includes(expected)) {
-        setStatus(`That does not look like ${payment.buyer_first_name || payment.buyer_name}. Reminder not sent.`, '#fca5a5');
+        setStatus(`That does not look like ${payment.buyer_first_name || payment.buyer_name}. Nothing was sent. If this is the right person, use Send Anyway below.`, '#fca5a5');
+        if (overrideButton) overrideButton.style.display = 'block';
         return;
       }
+      hideOverride();
       setStatus(`Matched ${payment.buyer_first_name || payment.buyer_name}. Sending…`);
       fillAndSend();
     }, true);
