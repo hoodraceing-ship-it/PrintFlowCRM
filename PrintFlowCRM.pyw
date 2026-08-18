@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.72"
+VERSION = "0.7.73"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -322,6 +322,7 @@ class Database:
                     state TEXT DEFAULT '',
                     postal_code TEXT DEFAULT '',
                     country TEXT DEFAULT 'US',
+                    is_internal INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
 
@@ -347,6 +348,9 @@ class Database:
                     attached_file TEXT DEFAULT '',
                     attached_file_hash TEXT DEFAULT '',
                     bambuddy_library_file_id INTEGER,
+                    is_inventory_job INTEGER NOT NULL DEFAULT 0,
+                    inventory_model_id INTEGER,
+                    inventory_adjusted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY (buyer_id) REFERENCES buyers(id) ON DELETE RESTRICT
@@ -368,6 +372,9 @@ class Database:
                     print_status TEXT NOT NULL DEFAULT 'Not queued',
                     bambuddy_queue_id INTEGER,
                     print_status_updated_at TEXT DEFAULT '',
+                    model_library_id INTEGER,
+                    model_library_file_id INTEGER,
+                    fulfilled_from_stock INTEGER NOT NULL DEFAULT 0,
                     added_at TEXT NOT NULL,
                     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
                 );
@@ -395,6 +402,7 @@ class Database:
                     image_url TEXT DEFAULT '',
                     image_path TEXT DEFAULT '',
                     folder_path TEXT NOT NULL,
+                    stock_qty INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -448,11 +456,34 @@ class Database:
             buyer_columns = {r["name"] for r in c.execute("PRAGMA table_info(buyers)").fetchall()}
             if "print_files_folder" not in buyer_columns:
                 c.execute("ALTER TABLE buyers ADD COLUMN print_files_folder TEXT DEFAULT ''")
+            if "is_internal" not in buyer_columns:
+                c.execute("ALTER TABLE buyers ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0")
 
             # v0.7.23 migration: remember the exact BambuBuddy library file used by a queue item.
             file_columns = {r["name"] for r in c.execute("PRAGMA table_info(order_files)").fetchall()}
             if "bambuddy_queue_library_file_id" not in file_columns:
                 c.execute("ALTER TABLE order_files ADD COLUMN bambuddy_queue_library_file_id INTEGER")
+
+            # v0.7.73 migration: ready-to-ship product inventory and Model Library links.
+            order_columns = {r["name"] for r in c.execute("PRAGMA table_info(orders)").fetchall()}
+            for col, ddl in [
+                ("is_inventory_job", "INTEGER NOT NULL DEFAULT 0"),
+                ("inventory_model_id", "INTEGER"),
+                ("inventory_adjusted", "INTEGER NOT NULL DEFAULT 0"),
+            ]:
+                if col not in order_columns:
+                    c.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
+            file_columns = {r["name"] for r in c.execute("PRAGMA table_info(order_files)").fetchall()}
+            for col, ddl in [
+                ("model_library_id", "INTEGER"),
+                ("model_library_file_id", "INTEGER"),
+                ("fulfilled_from_stock", "INTEGER NOT NULL DEFAULT 0"),
+            ]:
+                if col not in file_columns:
+                    c.execute(f"ALTER TABLE order_files ADD COLUMN {col} {ddl}")
+            model_columns = {r["name"] for r in c.execute("PRAGMA table_info(model_library)").fetchall()}
+            if "stock_qty" not in model_columns:
+                c.execute("ALTER TABLE model_library ADD COLUMN stock_qty INTEGER NOT NULL DEFAULT 0")
 
             # v0.2 migration: preserve the single attachment used by v0.1.
             legacy = c.execute(
@@ -489,7 +520,7 @@ class Database:
 
     def buyers(self):
         with self.connect() as c:
-            return c.execute("SELECT * FROM buyers ORDER BY name COLLATE NOCASE").fetchall()
+            return c.execute("SELECT * FROM buyers WHERE COALESCE(is_internal,0)=0 ORDER BY name COLLATE NOCASE").fetchall()
 
     def buyer(self, buyer_id):
         with self.connect() as c:
@@ -513,7 +544,7 @@ class Database:
 
     def find_buyer_by_name(self, name):
         with self.connect() as c:
-            return c.execute("SELECT * FROM buyers WHERE lower(trim(name))=lower(trim(?)) LIMIT 1", (name,)).fetchone()
+            return c.execute("SELECT * FROM buyers WHERE COALESCE(is_internal,0)=0 AND lower(trim(name))=lower(trim(?)) LIMIT 1", (name,)).fetchone()
 
     def delete_buyer(self, buyer_id):
         with self.connect() as c:
@@ -544,10 +575,10 @@ class Database:
 
     def orders(self, active_only=False):
         q = """SELECT o.*, b.name AS buyer_name, b.email AS buyer_email, b.phone AS buyer_phone
-               FROM orders o JOIN buyers b ON b.id=o.buyer_id"""
+               FROM orders o JOIN buyers b ON b.id=o.buyer_id WHERE COALESCE(o.is_inventory_job,0)=0"""
         params = []
         if active_only:
-            q += " WHERE o.status NOT IN ('Complete','Shipped','Delivered','Cancelled')"
+            q += " AND o.status NOT IN ('Complete','Shipped','Delivered','Cancelled')"
         q += " ORDER BY o.queue_position ASC, o.id DESC"
         with self.connect() as c:
             return c.execute(q, params).fetchall()
@@ -575,9 +606,40 @@ class Database:
             )
             return cur.lastrowid
 
+    def create_inventory_order(self, model_id, item, material="PLA"):
+        """Create a hidden order so stock prints use the normal safe preflight/slicer/queue path."""
+        now = datetime.now().isoformat(timespec="seconds")
+        order_no = self.next_order_no()
+        queue_position = self.next_queue_position()
+        with self.connect() as c:
+            buyer = c.execute("SELECT id FROM buyers WHERE COALESCE(is_internal,0)=1 ORDER BY id LIMIT 1").fetchone()
+            if buyer:
+                buyer_id = int(buyer["id"])
+            else:
+                buyer_id = int(c.execute(
+                    "INSERT INTO buyers(name,is_internal,created_at) VALUES(?,1,?)",
+                    ("PrintFlow Product Inventory", now),
+                ).lastrowid)
+            cur = c.execute(
+                """INSERT INTO orders(order_no,buyer_id,item,quantity,queue_position,source,material,status,
+                   is_inventory_job,inventory_model_id,inventory_adjusted,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,'Order Received',1,?,0,?,?)""",
+                (order_no, buyer_id, item, 1, queue_position, "Product Inventory", material or "PLA",
+                 int(model_id), now, now),
+            )
+            return int(cur.lastrowid)
+
     def delete_order(self, order_id):
         """Delete the CRM order and its attachment records, never the files on disk."""
         with self.connect() as c:
+            consumed = c.execute(
+                """SELECT model_library_id,SUM(fulfilled_from_stock) AS qty FROM order_files
+                   WHERE order_id=? AND fulfilled_from_stock>0 AND model_library_id IS NOT NULL
+                   GROUP BY model_library_id""", (order_id,)
+            ).fetchall()
+            for row in consumed:
+                c.execute("UPDATE model_library SET stock_qty=stock_qty+?,updated_at=? WHERE id=?",
+                          (int(row["qty"]), datetime.now().isoformat(timespec="seconds"), int(row["model_library_id"])))
             c.execute("DELETE FROM orders WHERE id=?", (order_id,))
 
     def schedule_message(self,order_id,purpose,provider,message,balance,send_at):
@@ -658,7 +720,7 @@ class Database:
         with self.connect() as c:
             return c.execute("SELECT * FROM order_files WHERE id=?", (file_id,)).fetchone()
 
-    def add_order_file(self, order_id, path, original_name, sha256):
+    def add_order_file(self, order_id, path, original_name, sha256, model_library_id=None, model_library_file_id=None):
         now = datetime.now().isoformat(timespec="seconds")
         with self.connect() as c:
             duplicate = c.execute(
@@ -666,11 +728,16 @@ class Database:
                 (order_id, sha256, original_name),
             ).fetchone()
             if duplicate:
+                if model_library_id is not None:
+                    c.execute("UPDATE order_files SET model_library_id=?,model_library_file_id=COALESCE(?,model_library_file_id) WHERE id=?",
+                              (int(model_library_id), int(model_library_file_id) if model_library_file_id is not None else None, int(duplicate["id"])))
                 return duplicate["id"], False
             cur = c.execute(
-                """INSERT INTO order_files(order_id,stored_path,original_name,sha256,added_at)
-                   VALUES(?,?,?,?,?)""",
-                (order_id, str(path), original_name, sha256, now),
+                """INSERT INTO order_files(order_id,stored_path,original_name,sha256,model_library_id,model_library_file_id,added_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (order_id, str(path), original_name, sha256,
+                 int(model_library_id) if model_library_id is not None else None,
+                 int(model_library_file_id) if model_library_file_id is not None else None, now),
             )
             c.execute("UPDATE orders SET updated_at=? WHERE id=?", (now, order_id))
             return cur.lastrowid, True
@@ -679,12 +746,95 @@ class Database:
         with self.connect() as c:
             row = c.execute("SELECT * FROM order_files WHERE id=?", (file_id,)).fetchone()
             if row:
+                used=int(row["fulfilled_from_stock"] or 0)
+                if used and row["model_library_id"] is not None:
+                    c.execute("UPDATE model_library SET stock_qty=stock_qty+?,updated_at=? WHERE id=?",
+                              (used, datetime.now().isoformat(timespec="seconds"), int(row["model_library_id"])))
                 c.execute("DELETE FROM order_files WHERE id=?", (file_id,))
                 c.execute(
                     "UPDATE orders SET updated_at=? WHERE id=?",
                     (datetime.now().isoformat(timespec="seconds"), row["order_id"]),
                 )
             return row
+
+    def model_library_item(self, model_id):
+        with self.connect() as c:
+            return c.execute("SELECT * FROM model_library WHERE id=?", (int(model_id),)).fetchone()
+
+    def adjust_model_stock(self, model_id, delta):
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as c:
+            row = c.execute("SELECT stock_qty FROM model_library WHERE id=?", (int(model_id),)).fetchone()
+            if not row:
+                return None
+            value = max(0, int(row["stock_qty"] or 0) + int(delta))
+            c.execute("UPDATE model_library SET stock_qty=?,updated_at=? WHERE id=?", (value, now, int(model_id)))
+            return value
+
+    def set_model_stock(self, model_id, quantity):
+        now = datetime.now().isoformat(timespec="seconds")
+        value = max(0, int(quantity))
+        with self.connect() as c:
+            if not c.execute("SELECT 1 FROM model_library WHERE id=?", (int(model_id),)).fetchone():
+                return None
+            c.execute("UPDATE model_library SET stock_qty=?,updated_at=? WHERE id=?", (value, now, int(model_id)))
+        return value
+
+    def fulfill_order_file_from_stock(self, file_id, model_id, quantity=1):
+        """Atomically consume stock and complete the linked customer file."""
+        now = datetime.now().isoformat(timespec="seconds")
+        qty = max(1, int(quantity))
+        with self.connect() as c:
+            stock = c.execute("SELECT stock_qty FROM model_library WHERE id=?", (int(model_id),)).fetchone()
+            row = c.execute("SELECT order_id,fulfilled_from_stock FROM order_files WHERE id=?", (int(file_id),)).fetchone()
+            if not stock or not row or int(row["fulfilled_from_stock"] or 0) or int(stock["stock_qty"] or 0) < qty:
+                return False
+            c.execute("UPDATE model_library SET stock_qty=stock_qty-?,updated_at=? WHERE id=?", (qty, now, int(model_id)))
+            c.execute("""UPDATE order_files SET fulfilled_from_stock=?,print_status='Complete',printed=1,
+                       bambuddy_queue_id=NULL,bambuddy_queue_library_file_id=NULL,print_status_updated_at=? WHERE id=?""",
+                      (qty, now, int(file_id)))
+            order_id = int(row["order_id"])
+            incomplete = c.execute("SELECT COUNT(*) FROM order_files WHERE order_id=? AND printed=0", (order_id,)).fetchone()[0]
+            c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=?",
+                      ("Done Printing" if int(incomplete)==0 else "Queued", now, order_id))
+            return True
+
+    def restore_fulfilled_stock(self, file_id):
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as c:
+            row = c.execute("SELECT model_library_id,fulfilled_from_stock FROM order_files WHERE id=?", (int(file_id),)).fetchone()
+            used=int(row["fulfilled_from_stock"] or 0) if row else 0
+            if not row or not used or row["model_library_id"] is None:
+                return False
+            c.execute("UPDATE model_library SET stock_qty=stock_qty+?,updated_at=? WHERE id=?", (used, now, int(row["model_library_id"])))
+            c.execute("UPDATE order_files SET fulfilled_from_stock=0 WHERE id=?", (int(file_id),))
+            return True
+
+    def consume_partial_stock_for_file(self,file_id,model_id,quantity):
+        """Reserve some finished units for an order that still needs the remainder printed."""
+        now=datetime.now().isoformat(timespec="seconds");qty=max(1,int(quantity))
+        with self.connect() as c:
+            stock=c.execute("SELECT stock_qty FROM model_library WHERE id=?",(int(model_id),)).fetchone()
+            row=c.execute("SELECT fulfilled_from_stock FROM order_files WHERE id=?",(int(file_id),)).fetchone()
+            if not stock or not row or int(stock["stock_qty"] or 0)<qty:return False
+            c.execute("UPDATE model_library SET stock_qty=stock_qty-?,updated_at=? WHERE id=?",(qty,now,int(model_id)))
+            c.execute("UPDATE order_files SET fulfilled_from_stock=fulfilled_from_stock+? WHERE id=?",(qty,int(file_id)))
+            return True
+
+    def complete_inventory_job(self, order_id):
+        """Add one finished restock print exactly once, even across app restarts."""
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.connect() as c:
+            row = c.execute("SELECT inventory_model_id,inventory_adjusted,quantity FROM orders WHERE id=? AND is_inventory_job=1",
+                            (int(order_id),)).fetchone()
+            if not row or int(row["inventory_adjusted"] or 0) or row["inventory_model_id"] is None:
+                return None
+            model_id = int(row["inventory_model_id"])
+            qty = max(1, int(row["quantity"] or 1))
+            c.execute("UPDATE model_library SET stock_qty=stock_qty+?,updated_at=? WHERE id=?", (qty, now, model_id))
+            c.execute("UPDATE orders SET inventory_adjusted=1,status='Done Printing',updated_at=? WHERE id=?", (now, int(order_id)))
+            stock = c.execute("SELECT stock_qty FROM model_library WHERE id=?", (model_id,)).fetchone()
+            return (model_id, int(stock["stock_qty"] or 0)) if stock else None
 
     def set_order_file_bambuddy_id(self, file_id, library_file_id):
         with self.connect() as c:
@@ -761,10 +911,10 @@ class Database:
 
     def dashboard_stats(self):
         with self.connect() as c:
-            open_orders = c.execute("SELECT COUNT(*) FROM orders WHERE status NOT IN ('Complete','Shipped','Delivered','Cancelled')").fetchone()[0]
-            printing = c.execute("SELECT COUNT(*) FROM orders WHERE status='Printing'").fetchone()[0]
-            due = c.execute("SELECT COALESCE(SUM(total_price-amount_paid),0) FROM orders WHERE total_price>amount_paid").fetchone()[0]
-            revenue = c.execute("SELECT COALESCE(SUM(amount_paid),0) FROM orders").fetchone()[0]
+            open_orders = c.execute("SELECT COUNT(*) FROM orders WHERE COALESCE(is_inventory_job,0)=0 AND status NOT IN ('Complete','Shipped','Delivered','Cancelled')").fetchone()[0]
+            printing = c.execute("SELECT COUNT(*) FROM orders WHERE COALESCE(is_inventory_job,0)=0 AND status='Printing'").fetchone()[0]
+            due = c.execute("SELECT COALESCE(SUM(total_price-amount_paid),0) FROM orders WHERE COALESCE(is_inventory_job,0)=0 AND total_price>amount_paid").fetchone()[0]
+            revenue = c.execute("SELECT COALESCE(SUM(amount_paid),0) FROM orders WHERE COALESCE(is_inventory_job,0)=0").fetchone()[0]
         return open_orders, printing, due, revenue
 
 
@@ -3051,7 +3201,7 @@ class App(tk.Tk):
             self.toggle_compact();return
         self.current_page="model_library"
         self.clear_main();self._library_photos=[]
-        self.page_header("Model Library","Source models organized by what they fit — G-code is never stored",
+        self.page_header("Model Library","Product inventory and source models organized by what they fit — G-code is never stored",
                          "Add Clipboard Link",self._library_import_clipboard,"Delete Entire Library",self._delete_entire_model_library)
         quick=self.card(self.main,12);quick.pack(fill="x",pady=(0,10))
         ttk.Label(quick,text="Quick Add from a link",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,7))
@@ -3074,8 +3224,9 @@ class App(tk.Tk):
         left=self.card(pane,10);right=self.card(pane,14);pane.add(left,weight=3);pane.add(right,weight=4)
         search_var=tk.StringVar()
         ttk.Entry(left,textvariable=search_var).pack(fill="x",pady=(0,8))
-        self.library_tree=ttk.Treeview(left,columns=("files",),show="tree headings",selectmode="browse")
+        self.library_tree=ttk.Treeview(left,columns=("stock","files"),show="tree headings",selectmode="browse")
         self.library_tree.heading("#0",text="Fits / Product");self.library_tree.column("#0",width=310,anchor="w")
+        self.library_tree.heading("stock",text="In Stock");self.library_tree.column("stock",width=70,anchor="center",stretch=False)
         self.library_tree.heading("files",text="Files");self.library_tree.column("files",width=55,anchor="center",stretch=False)
         sy=ttk.Scrollbar(left,orient="vertical",command=self.library_tree.yview);self.library_tree.configure(yscrollcommand=sy.set)
         sy.pack(side="right",fill="y");self.library_tree.pack(side="left",fill="both",expand=True)
@@ -3087,7 +3238,7 @@ class App(tk.Tk):
                 hay=" ".join(str(row[k] or "") for k in ("product_name","model_number","title","source_url")).lower()
                 if q and q not in hay:continue
                 label=row["product_name"]+(f"  ({row['model_number']})" if row["model_number"] and row["model_number"] not in row["product_name"] else "")
-                self.library_tree.insert("","end",iid=str(row["id"]),text=label,values=(row["file_count"],))
+                self.library_tree.insert("","end",iid=str(row["id"]),text=label,values=(int(row["stock_qty"] or 0),row["file_count"]))
             items=self.library_tree.get_children()
             wanted=str(select_model_id) if select_model_id and str(select_model_id) in items else (items[0] if items else None)
             if wanted:self.library_tree.selection_set(wanted);self.library_tree.focus(wanted);self._show_model_library_detail(int(wanted))
@@ -3190,11 +3341,25 @@ class App(tk.Tk):
             for instance in instances:
                 profile_id=instance.get("profileId") or instance.get("profile_id")
                 if profile_id:break
+        # Keep every profile returned for this design. Bambu's signed-download
+        # endpoint occasionally rejects one valid MakerWorld profile with 400,
+        # even though another profile for the same source design downloads. For
+        # a source-only library the alternate still contains the model geometry;
+        # embedded G-code is stripped below regardless of which profile worked.
+        profile_candidates=[]
+        for value in [profile_id]+[
+            instance.get("profileId") or instance.get("profile_id")
+            for instance in instances if isinstance(instance,dict)
+        ]:
+            try:value=int(value)
+            except (TypeError,ValueError):continue
+            if value>0 and value not in profile_candidates:profile_candidates.append(value)
         number_match=re.search(r"\b(?:[A-Z]{0,3}\s*)?\d{3,5}-\d{2}\b",product_hint or title,re.I)
         model_number=re.sub(r"\s+","",number_match.group(0)) if number_match else ""
         return {"url":url,"title":title[:250],"product":str(product_hint or title)[:180],
                 "model_number":model_number[:40],"image_url":image_url,"download_links":[],
-                "makerworld_model_id":resolved.get("model_id"),"makerworld_profile_id":profile_id}
+                "makerworld_model_id":resolved.get("model_id"),"makerworld_profile_id":profile_id,
+                "makerworld_profile_candidates":profile_candidates}
 
     def _finish_model_library_import(self,data,error):
         self._library_importing=False
@@ -3207,8 +3372,14 @@ class App(tk.Tk):
             messagebox.showerror("Auto Add model",str(exc),parent=self);return
         self.db.set_setting("model_library_last_product",data["product"])
         self.library_url_var.set("")
-        note=f"Added {downloaded} source file(s)." if downloaded else "Saved the page and photo. This site did not expose a direct source download; use Add Local Files after downloading it."
+        warning=str(data.get("makerworld_import_warning") or "").strip()
+        notice=str(data.get("makerworld_import_notice") or "").strip()
+        note=f"Added {downloaded} source file(s)." if downloaded else "Saved the model card and photo; no source file was downloaded."
         self.status_flash(note);self.show_model_library(model_id)
+        if warning:
+            messagebox.showwarning("MakerWorld model saved",warning,parent=self)
+        elif notice:
+            messagebox.showinfo("MakerWorld fallback used",notice,parent=self)
 
     def _save_model_library_import(self,data):
         now=datetime.now().isoformat(timespec="seconds")
@@ -3239,9 +3410,21 @@ class App(tk.Tk):
                         with Image.open(raw) as source:source.convert("RGB").save(folder/"preview.png","PNG")
                         raw.unlink(missing_ok=True);image_path=str(folder/"preview.png")
                     except Exception:pass
+        # Save the preview before attempting the profile download. A temporary
+        # MakerWorld/Bambu API failure should never discard the useful library
+        # card, source link, and photo that were already resolved successfully.
+        if image_path:
+            with self.db.connect() as c:c.execute("UPDATE model_library SET image_path=?,updated_at=? WHERE id=?",(image_path,now,model_id))
         downloaded=0
         if data.get("makerworld_model_id"):
-            downloaded+=self._import_makerworld_library_source(model_id,folder,data)
+            try:
+                downloaded+=self._import_makerworld_library_source(model_id,folder,data)
+            except Exception as exc:
+                data["makerworld_import_warning"]=(
+                    "PrintFlow saved the model name, photo, product group, and MakerWorld link, but Bambu Lab rejected every available print profile, so no source file was downloaded.\n\n"
+                    f"BambuBuddy reported: {exc}\n\n"
+                    "You can select this model and click Retry Auto Download later. If it keeps failing, click Open Source, download the STL or design 3MF in your signed-in browser, then use Add Local Files."
+                )
         for link in data.get("download_links",[]):
             try:downloaded+=self._download_model_library_source(model_id,folder,link)
             except Exception:continue
@@ -3256,7 +3439,38 @@ class App(tk.Tk):
             if status.get("sign_in_expired"):
                 raise RuntimeError("BambuBuddy's Bambu Cloud sign-in has expired. Sign in again in BambuBuddy, then retry this link.")
             raise RuntimeError("MakerWorld downloads need Bambu Cloud sign-in in BambuBuddy. Open BambuBuddy → Settings → Bambu Cloud, sign in once, then retry.")
-        imported=client.import_makerworld(data["makerworld_model_id"],data.get("makerworld_profile_id"))
+        preferred=data.get("makerworld_profile_id")
+        candidates=list(data.get("makerworld_profile_candidates") or [])
+        if preferred:
+            try:preferred=int(preferred)
+            except (TypeError,ValueError):preferred=None
+        if preferred and preferred not in candidates:candidates.insert(0,preferred)
+        # Final automatic attempt lets BambuBuddy choose from design.instances,
+        # which can contain a working profile omitted by MakerWorld's separate
+        # /instances listing.
+        if candidates:candidates.append(None)
+        else:candidates=[None]
+        imported=None;used_profile=None;failures=[]
+        for candidate in candidates:
+            try:
+                imported=client.import_makerworld(data["makerworld_model_id"],candidate)
+                used_profile=imported.get("profile_id") or candidate
+                break
+            except RuntimeError as exc:
+                message=str(exc);failures.append((candidate,message))
+                retryable=(
+                    "unexpected status 400" in message.lower() or
+                    "profile not found" in message.lower() or
+                    ("http 502" in message.lower() and "profile" in message.lower())
+                )
+                if not retryable:raise
+        if imported is None:
+            detail="; ".join(f"profile {pid or 'automatic'}: {message}" for pid,message in failures)
+            raise RuntimeError(detail or "MakerWorld did not return a downloadable profile.")
+        if preferred and used_profile and str(used_profile)!=str(preferred):
+            data["makerworld_import_notice"]=(
+                f"Bambu Lab rejected linked profile {preferred}, so PrintFlow automatically imported profile {used_profile} from the same MakerWorld design instead. The Model Library keeps source geometry only and removed embedded G-code."
+            )
         library_id=imported.get("library_file_id")
         if not library_id:raise RuntimeError("BambuBuddy imported the MakerWorld model but did not return its library file ID.")
         filename=Path(str(imported.get("filename") or f"{data.get('title') or 'makerworld-model'}.3mf")).name
@@ -3329,6 +3543,7 @@ class App(tk.Tk):
         with self.db.connect() as c:
             row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
             files=c.execute("SELECT * FROM model_library_files WHERE model_id=? ORDER BY LOWER(original_name)",(model_id,)).fetchall()
+            latest_job=c.execute("SELECT id,inventory_adjusted,status FROM orders WHERE is_inventory_job=1 AND inventory_model_id=? ORDER BY id DESC LIMIT 1",(model_id,)).fetchone()
         if not row:return
         top=ttk.Frame(self.library_detail,style="Card.TFrame");top.pack(fill="x")
         preview=tk.Label(top,text="No preview",bg=self.INPUT,fg=self.MUTED,width=24,height=9)
@@ -3343,13 +3558,23 @@ class App(tk.Tk):
         body=ttk.Frame(top,style="Card.TFrame");body.pack(side="left",fill="both",expand=True)
         ttk.Label(body,text=row["product_name"],style="CardTitle.TLabel",wraplength=520).pack(anchor="w")
         if row["model_number"]:ttk.Label(body,text="Model: "+row["model_number"],style="Card.TLabel").pack(anchor="w",pady=(4,0))
+        stockline=ttk.Frame(body,style="Card.TFrame");stockline.pack(fill="x",pady=(5,2))
+        ttk.Label(stockline,text=f"Ready-to-ship stock: {int(row['stock_qty'] or 0)}",style="CardTitle.TLabel").pack(side="left")
+        ttk.Button(stockline,text="− 1",width=5,command=lambda:self._adjust_library_stock(model_id,-1)).pack(side="left",padx=(10,4))
+        ttk.Button(stockline,text="+ 1",width=5,command=lambda:self._adjust_library_stock(model_id,1)).pack(side="left",padx=(0,4))
+        ttk.Button(stockline,text="Set",width=5,command=lambda:self._set_library_stock(model_id)).pack(side="left")
+        if latest_job and not int(latest_job["inventory_adjusted"] or 0):
+            ttk.Label(body,text="Restock print: "+self._order_live_print_status(int(latest_job["id"]),latest_job["status"]),style="Card.TLabel").pack(anchor="w",pady=(2,0))
         ttk.Label(body,text=row["title"] or "Imported model",style="Card.TLabel",wraplength=520,justify="left").pack(anchor="w",pady=(4,8))
         actions=ttk.Frame(body,style="Card.TFrame");actions.pack(fill="x")
         ttk.Button(actions,text="Add Local Files",style="Accent.TButton",command=lambda:self._library_add_local_files(model_id)).pack(side="left",padx=(0,6))
         ttk.Button(actions,text="Open Folder",command=lambda:self._open_library_folder(row["folder_path"])).pack(side="left",padx=(0,6))
         ttk.Button(actions,text="Rename",command=lambda:self._rename_library_product(model_id)).pack(side="left",padx=(0,6))
         ttk.Button(actions,text="Change Photo",command=lambda:self._library_change_photo(model_id)).pack(side="left",padx=(0,6))
-        if row["source_url"]:ttk.Button(actions,text="Open Source",command=lambda:webbrowser.open(row["source_url"])).pack(side="left")
+        if row["source_url"]:
+            ttk.Button(actions,text="Open Source",command=lambda:webbrowser.open(row["source_url"])).pack(side="left",padx=(0,6))
+            if "makerworld.com" in str(row["source_url"]).lower() and not files:
+                ttk.Button(actions,text="Retry Auto Download",command=lambda:self._retry_model_library_source(model_id)).pack(side="left")
         ttk.Label(self.library_detail,text=f"Source files ({len(files)})",style="CardTitle.TLabel").pack(anchor="w",pady=(18,7))
         tree=ttk.Treeview(self.library_detail,columns=("type",),show="headings",height=max(5,min(12,len(files)+1)))
         tree.heading("type",text="File type");tree.column("type",width=90,stretch=False)
@@ -3358,7 +3583,61 @@ class App(tk.Tk):
         tree.pack(fill="both",expand=True)
         bottom=ttk.Frame(self.library_detail,style="Card.TFrame");bottom.pack(fill="x",pady=(8,0))
         ttk.Button(bottom,text="Delete Selected File",style="Danger.TButton",command=lambda:self._delete_library_file(model_id,tree)).pack(side="left")
+        ttk.Button(bottom,text="Print 1 for Stock",style="Accent.TButton",command=lambda:self._print_library_file_for_stock(model_id,tree)).pack(side="left",padx=(7,0))
         ttk.Button(bottom,text="Delete Product",style="Danger.TButton",command=lambda:self._delete_library_product(model_id)).pack(side="right")
+
+    def _adjust_library_stock(self,model_id,delta):
+        value=self.db.adjust_model_stock(model_id,delta)
+        if value is not None:
+            self.status_flash(f"Product stock updated to {value}")
+            self.show_model_library(model_id)
+
+    def _set_library_stock(self,model_id):
+        row=self.db.model_library_item(model_id)
+        if not row:return
+        value=simpledialog.askinteger("Set product stock",f"How many ready-to-ship {row['product_name']} items are in stock?",initialvalue=int(row["stock_qty"] or 0),minvalue=0,parent=self)
+        if value is None:return
+        self.db.set_model_stock(model_id,value)
+        self.status_flash(f"Product stock set to {value}")
+        self.show_model_library(model_id)
+
+    def _print_library_file_for_stock(self,model_id,tree):
+        selected=tree.selection()
+        if not selected:
+            messagebox.showinfo("Print for stock","Select the STL or 3MF you want to print for product inventory first.",parent=self);return
+        file_id=int(selected[0])
+        with self.db.connect() as c:
+            source=c.execute("SELECT * FROM model_library_files WHERE id=? AND model_id=?",(file_id,model_id)).fetchone()
+            model=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
+        if not source or not model:return
+        name=(source["original_name"] or Path(source["stored_path"]).name).lower()
+        if not (name.endswith(".stl") or (name.endswith(".3mf") and not name.endswith(".gcode.3mf"))):
+            messagebox.showwarning("Print for stock","Product inventory prints require an STL or unsliced 3MF source file.",parent=self);return
+        material=simpledialog.askstring("Print 1 for stock","Material for this inventory print:",initialvalue=self.db.get_setting("inventory_print_material","PLA") or "PLA",parent=self)
+        if material is None:return
+        material=(material.strip() or "PLA")[:40]
+        self.db.set_setting("inventory_print_material",material)
+        order_id=self.db.create_inventory_order(model_id,model["product_name"],material)
+        attached=self._attach_model_library_files_to_order(order_id,[file_id],refresh=False)
+        if not attached:
+            self.db.delete_order(order_id)
+            messagebox.showerror("Print for stock","PrintFlow could not attach that Model Library file.",parent=self);return
+        started=self.print_order(order_id,attached[0])
+        if started is False:
+            self.db.delete_order(order_id)
+            try:shutil.rmtree(FILES_DIR/str(order_id),ignore_errors=True)
+            except Exception:pass
+            return
+        self.status_flash("Inventory print queued • stock will increase only after a successful completion")
+
+    def _retry_model_library_source(self,model_id):
+        if self._library_importing:
+            messagebox.showinfo("Retry Auto Download","Another model is already being added. Let it finish, then retry.",parent=self);return
+        with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
+        if not row or not row["source_url"]:return
+        self.library_url_var.set(row["source_url"])
+        self.library_product_var.set(row["product_name"])
+        self.start_model_library_import()
 
     def _library_add_local_files(self,model_id):
         paths=filedialog.askopenfilenames(parent=self,title="Add source models (no G-code)",filetypes=[("3D source models","*.stl *.3mf *.step *.stp *.obj *.amf *.scad *.f3d"),("All files","*.*")])
@@ -3931,7 +4210,7 @@ class App(tk.Tk):
         fb.grid(row=3,column=0,sticky="ew",pady=(7,0))
         file_buttons = [
             ttk.Button(fb,text="+ Add Files",style="Accent.TButton",command=lambda:self.attach_files(order_id)),
-            ttk.Button(fb,text="Customer Folder",command=lambda:self.browse_order_buyer_folder(order_id)),
+            ttk.Button(fb,text="Product Inventory",command=lambda:self.show_product_inventory_picker(order_id)),
             ttk.Button(fb,text="Change Folder",command=lambda:self.change_order_buyer_folder(order_id)),
             ttk.Button(fb,text="Open",command=lambda:self.open_selected_file(order_id)),
             ttk.Button(fb,text="Remove",style="Danger.TButton",command=lambda:self.remove_selected_file(order_id)),
@@ -4259,6 +4538,9 @@ class App(tk.Tk):
             name = main["original_name"] or p.name
             missing = "  [missing]" if not p.exists() else ""
             status = self._aggregate_print_file_status(members, main)
+            stock_used=sum(int(f["fulfilled_from_stock"] or 0) for f in members if "fulfilled_from_stock" in f.keys())
+            if stock_used:
+                status=(f"From stock ({stock_used})" if status=="Complete" else f"{status} • {stock_used} from stock")
             split_parts = []
             for f in members:
                 n = f["original_name"] or Path(f["stored_path"]).name
@@ -4291,6 +4573,8 @@ class App(tk.Tk):
     def _set_file_printed(self, order_id, file_id, printed):
         # v0.7.22: legacy/manual fallback now maps to the live status model.
         status = "Complete" if printed else "Not queued"
+        if not printed:
+            self.db.restore_fulfilled_stock(file_id)
         if self.db.set_order_file_print_status(file_id, status, clear_queue=not printed):
             self.refresh_order_files(order_id, file_id)
             self.status_flash("File marked complete" if printed else "File status reset")
@@ -4418,6 +4702,7 @@ class App(tk.Tk):
     def _sync_print_statuses_once(self):
         active = list(self.db.files_with_active_print_status())
         if not active:
+            self._reconcile_inventory_jobs()
             return
         try:
             client = self._client()
@@ -4489,6 +4774,23 @@ class App(tk.Tk):
                     if self._order_live_print_status(order_id, saved) == "Done Printing":
                         self.db.set_order_status(order_id, "Done Printing")
             self.after(0, lambda orders=changed_orders: self._refresh_live_file_status_ui(orders))
+        self._reconcile_inventory_jobs()
+
+    def _reconcile_inventory_jobs(self):
+        """Turn completed hidden stock prints into inventory exactly once."""
+        with self.db.connect() as c:
+            jobs=c.execute("SELECT id,status,inventory_model_id FROM orders WHERE is_inventory_job=1 AND inventory_adjusted=0 ORDER BY id").fetchall()
+        updated=[]
+        for job in jobs:
+            if self._order_live_print_status(int(job["id"]),job["status"])!="Done Printing":continue
+            result=self.db.complete_inventory_job(int(job["id"]))
+            if result:updated.append(result)
+        if not updated:return
+        def refresh():
+            model_id,stock=updated[-1]
+            self.status_flash(f"Inventory print completed • product stock is now {stock}")
+            if self.current_page=="model_library":self.show_model_library(model_id)
+        self.after(0,refresh)
 
     @staticmethod
     def _carrier_status_from_17track(item):
@@ -4784,6 +5086,115 @@ class App(tk.Tk):
             self.status_flash("Files already attached")
         return added
 
+    def _attach_model_library_files_to_order(self,order_id,file_ids,parent=None,refresh=True):
+        """Copy selected source files into the order while preserving their inventory link."""
+        ids=[]
+        for value in file_ids:
+            try:ids.append(int(value))
+            except Exception:pass
+        if not ids:return []
+        placeholders=",".join("?" for _ in ids)
+        with self.db.connect() as c:
+            rows=c.execute(
+                f"""SELECT f.*,m.product_name,m.stock_qty FROM model_library_files f
+                    JOIN model_library m ON m.id=f.model_id WHERE f.id IN ({placeholders})""",ids
+            ).fetchall()
+        by_id={int(r["id"]):r for r in rows}
+        target_dir=FILES_DIR/str(order_id);target_dir.mkdir(parents=True,exist_ok=True)
+        attached=[];added=0
+        for file_id in ids:
+            row=by_id.get(file_id)
+            if not row:continue
+            source=Path(row["stored_path"] or "")
+            try:
+                if not source.is_file():
+                    raise FileNotFoundError(f"The saved Model Library file is missing:\n{source}")
+                digest=(row["sha256"] or "").strip() or hashlib.sha256(source.read_bytes()).hexdigest()
+                destination=target_dir/source.name
+                if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest()!=digest:
+                    stamp=datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    destination=target_dir/f"{source.stem}_{stamp}{source.suffix}"
+                if not destination.exists():shutil.copy2(source,destination)
+                order_file_id,created=self.db.add_order_file(order_id,destination,row["original_name"] or source.name,digest,row["model_id"],file_id)
+                attached.append(int(order_file_id));added+=1 if created else 0
+            except Exception as exc:
+                messagebox.showerror("Could not attach inventory file",f"{source.name}\n\n{exc}",parent=parent or self)
+        if refresh:self.refresh_order_files(order_id,attached[-1] if attached else None)
+        if attached:
+            self.status_flash(f"{added or len(attached)} Model Library file{'s' if len(attached)!=1 else ''} ready for this order")
+        return attached
+
+    def show_product_inventory_picker(self,order_id):
+        order=self.db.order(order_id)
+        if not order:return
+        win=tk.Toplevel(self);win.title(f"Product Inventory — {order['buyer_name']}")
+        win.geometry("1040x650");win.minsize(760,460);win.transient(self)
+        outer=ttk.Frame(win,padding=12);outer.pack(fill="both",expand=True)
+        ttk.Label(outer,text="Choose from Product Inventory",style="Title.TLabel").pack(anchor="w")
+        help_text=ttk.Label(outer,text="Select a product, then select one or more STL/3MF source files. The file is copied into this customer order and stays linked to its ready-to-ship stock count.",justify="left")
+        help_text.pack(fill="x",pady=(3,9));outer.bind("<Configure>",lambda e:help_text.configure(wraplength=max(420,e.width-28)),add="+")
+        search=tk.StringVar();ttk.Entry(outer,textvariable=search).pack(fill="x",pady=(0,8))
+        pane=ttk.Panedwindow(outer,orient="horizontal");pane.pack(fill="both",expand=True)
+        left=ttk.Frame(pane);right=ttk.Frame(pane);pane.add(left,weight=3);pane.add(right,weight=4)
+        products=ttk.Treeview(left,columns=("stock","files"),show="tree headings",selectmode="browse")
+        products.heading("#0",text="Product");products.column("#0",width=300,stretch=True)
+        products.heading("stock",text="In Stock");products.column("stock",width=70,anchor="center",stretch=False)
+        products.heading("files",text="Files");products.column("files",width=55,anchor="center",stretch=False)
+        pscroll=ttk.Scrollbar(left,orient="vertical",command=products.yview);products.configure(yscrollcommand=pscroll.set)
+        pscroll.pack(side="right",fill="y");products.pack(side="left",fill="both",expand=True)
+        product_title=ttk.Label(right,text="Select a product",style="CardTitle.TLabel");product_title.pack(anchor="w",pady=(0,7))
+        files=ttk.Treeview(right,columns=("type",),show="tree headings",selectmode="extended")
+        files.heading("#0",text="Source file");files.column("#0",width=410,stretch=True)
+        files.heading("type",text="Type");files.column("type",width=90,anchor="center",stretch=False)
+        fscroll=ttk.Scrollbar(right,orient="vertical",command=files.yview);files.configure(yscrollcommand=fscroll.set)
+        fscroll.pack(side="right",fill="y");files.pack(side="left",fill="both",expand=True)
+        model_rows={};file_rows={}
+
+        def fill_products(*_args):
+            products.delete(*products.get_children());model_rows.clear()
+            q=search.get().strip().lower()
+            rows=self._library_rows()
+            for row in rows:
+                hay=" ".join(str(row[k] or "") for k in ("product_name","model_number","title")).lower()
+                if q and q not in hay:continue
+                iid=str(row["id"]);model_rows[iid]=row
+                products.insert("","end",iid=iid,text=row["product_name"],values=(int(row["stock_qty"] or 0),int(row["file_count"] or 0)))
+            choices=products.get_children()
+            if choices:
+                products.selection_set(choices[0]);products.focus(choices[0]);fill_files()
+            else:
+                product_title.configure(text="No matching products");files.delete(*files.get_children())
+
+        def fill_files(_event=None):
+            files.delete(*files.get_children());file_rows.clear()
+            selected=products.selection()
+            if not selected:return
+            model_id=int(selected[0]);model=model_rows.get(selected[0])
+            product_title.configure(text=f"{model['product_name']}  •  {int(model['stock_qty'] or 0)} in stock")
+            with self.db.connect() as c:rows=c.execute("SELECT * FROM model_library_files WHERE model_id=? ORDER BY LOWER(original_name)",(model_id,)).fetchall()
+            for row in rows:
+                name=row["original_name"] or Path(row["stored_path"]).name
+                if not (name.lower().endswith(".stl") or (name.lower().endswith(".3mf") and not name.lower().endswith(".gcode.3mf"))):continue
+                iid=str(row["id"]);file_rows[iid]=row;files.insert("","end",iid=iid,text=name,values=(self._file_type_label(name),))
+            choices=files.get_children()
+            if len(choices)==1:files.selection_set(choices[0]);files.focus(choices[0])
+
+        def attach_selected():
+            selected=files.selection()
+            if not selected:
+                messagebox.showinfo("Choose source files","Select one or more STL/3MF files first.",parent=win);return
+            attached=self._attach_model_library_files_to_order(order_id,[int(x) for x in selected],parent=win)
+            if attached:
+                win.destroy()
+                messagebox.showinfo("Product files added",f"Added {len(attached)} source file{'s' if len(attached)!=1 else ''} to {order['buyer_name']}'s order.\n\nPrintFlow will check ready-to-ship stock before it queues each linked file.",parent=self)
+
+        products.bind("<<TreeviewSelect>>",fill_files);search.trace_add("write",fill_products)
+        files.bind("<Double-1>",lambda _e:attach_selected())
+        actions=ttk.Frame(outer);actions.pack(fill="x",pady=(9,0))
+        ttk.Button(actions,text="Cancel",command=win.destroy).pack(side="right")
+        ttk.Button(actions,text="Add Selected to Order",style="Accent.TButton",command=attach_selected).pack(side="right",padx=(0,7))
+        fill_products()
+
     def attach_files(self, order_id):
         sources = filedialog.askopenfilenames(
             parent=self, title="Choose one or more print/model files",
@@ -4930,8 +5341,8 @@ class App(tk.Tk):
         names = context.get("queued_names") or []
         listing = "\n".join(f"• {name}" for name in names)
         messagebox.showinfo(
-            "Prints queued",
-            f"Successfully queued {completed} of {total} selected prints for this customer. Each item requires Manual Start in BambuBuddy."
+            "Customer files handled",
+            f"Handled {completed} of {total} selected customer files. Newly queued jobs still require Manual Start in BambuBuddy; items filled from stock were not printed again."
             + (f"\n\n{listing}" if listing else ""),
             parent=self,
         )
@@ -6869,6 +7280,53 @@ class App(tk.Tk):
         if not (is_sliced or is_source):
             messagebox.showinfo("Unsupported print file","Queue Selected supports STL, unsliced 3MF, and sliced .gcode.3mf files.",parent=self); return False
 
+        # Linked customer files check finished-product stock before creating another
+        # physical print. A partial match reserves the existing units only after the
+        # remaining print job has been queued successfully.
+        print_quantity=max(1,int(row["quantity"] or 1))
+        partial_stock_to_consume=0
+        linked_order_file_id=int(attachment["id"])
+        linked_model_id=attachment["model_library_id"] if "model_library_id" in attachment.keys() else None
+        already_from_stock=int(attachment["fulfilled_from_stock"] or 0) if "fulfilled_from_stock" in attachment.keys() else 0
+        if linked_model_id is not None and not int(row["is_inventory_job"] or 0) and not already_from_stock:
+            model=self.db.model_library_item(int(linked_model_id))
+            stock=int(model["stock_qty"] or 0) if model else 0
+            if stock>0:
+                if stock>=print_quantity:
+                    answer=messagebox.askyesnocancel(
+                        "Use product inventory?",
+                        f"{model['product_name']} has {stock} ready-to-ship in stock.\n\nUse {print_quantity} from stock for this order instead of printing another one?\n\nYes = use stock   •   No = print anyway   •   Cancel = stop",
+                        parent=self,
+                    )
+                    if answer is None:return False
+                    if answer:
+                        if not self.db.fulfill_order_file_from_stock(int(attachment["id"]),int(linked_model_id),print_quantity):
+                            messagebox.showwarning("Product inventory","Stock changed before PrintFlow could reserve it. Check Product Inventory and try again.",parent=self);return False
+                        self.refresh_order_files(order_id,int(attachment["id"]))
+                        updated_order=self.db.order(order_id)
+                        if updated_order:self._update_order_tree_row(updated_order)
+                        ctx=getattr(self,"_autosave_context",None)
+                        if ctx and int(ctx.get("order_id") or 0)==int(order_id) and updated_order:
+                            try:ctx["vars"]["status"].set(updated_order["status"])
+                            except Exception:pass
+                        self.status_flash(f"Used {print_quantity} from product inventory • {stock-print_quantity} remaining")
+                        messagebox.showinfo("Filled from product inventory",f"Used {print_quantity} ready-made {model['product_name']} item{'s' if print_quantity!=1 else ''}. No new print was queued.",parent=self)
+                        if batch_context is not None:
+                            batch_context["completed"]=int(batch_context.get("completed",0))+1
+                            batch_context.setdefault("queued_names",[]).append(f"{display_name} — used stock")
+                            self.after(100,lambda:self._print_next_batch_item(batch_context))
+                        return True
+                else:
+                    answer=messagebox.askyesnocancel(
+                        "Use available product inventory?",
+                        f"This order needs {print_quantity}, and {stock} {model['product_name']} item{'s are' if stock!=1 else ' is'} already in stock.\n\nUse the {stock} in stock and print only the remaining {print_quantity-stock}?\n\nYes = use stock + print remainder   •   No = print all {print_quantity}   •   Cancel = stop",
+                        parent=self,
+                    )
+                    if answer is None:return False
+                    if answer:
+                        partial_stock_to_consume=stock
+                        print_quantity-=stock
+
         printer_id = self.db.get_setting("bambuddy_printer_id","")
         if not printer_id:
             messagebox.showwarning("Choose a printer","Open Settings, connect to BambuBuddy, and choose the default printer.",parent=self); return False
@@ -6935,7 +7393,7 @@ class App(tk.Tk):
                         and (batch_context is None or int(batch_context.get("completed", 0)) == 0)
                     )
                     try:
-                        result = client.queue_print(int(file_id), int(printer_id), quantity=int(row["quantity"] or 1), insert_at_top=insert_top)
+                        result = client.queue_print(int(file_id), int(printer_id), quantity=print_quantity, insert_at_top=insert_top)
                     except Exception as exc:
                         if self._is_missing_bambuddy_library_error(exc):
                             up = client.upload_file(Path(active_attachment["stored_path"]))
@@ -6946,7 +7404,7 @@ class App(tk.Tk):
                                 active_attachment_id = None
                             if active_attachment_id:
                                 self.db.set_order_file_bambuddy_id(active_attachment_id, file_id)
-                            result = client.queue_print(int(file_id), int(printer_id), quantity=int(row["quantity"] or 1), insert_at_top=insert_top)
+                            result = client.queue_print(int(file_id), int(printer_id), quantity=print_quantity, insert_at_top=insert_top)
                         else:
                             raise
                     queue_id = self._queue_result_id(result)
@@ -6964,6 +7422,9 @@ class App(tk.Tk):
                             self.db.set_order_file_print_status(int(source_attachment["id"]), "Queued", queue_library_file_id=int(file_id))
                     results.append(result)
                     generated_names.append(active_attachment["original_name"] or Path(active_attachment["stored_path"]).name)
+                if partial_stock_to_consume:
+                    if not self.db.consume_partial_stock_for_file(linked_order_file_id,int(linked_model_id),partial_stock_to_consume):
+                        self.after(0,lambda:messagebox.showwarning("Product inventory","The remaining print was queued, but PrintFlow could not reserve the existing stock because its count changed. Please correct the stock count in Model Library.",parent=self))
                 with self.db.connect() as c:
                     c.execute("UPDATE orders SET status='Queued', updated_at=? WHERE id=?",(datetime.now().isoformat(timespec="seconds"),order_id))
                 if split_attachments:

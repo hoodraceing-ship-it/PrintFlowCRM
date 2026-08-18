@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.73
+
+- Added ready-to-ship stock counts to every Model Library product, with quick +1, −1, and Set controls.
+- Added Print 1 for Stock; inventory increases only after BambuBuddy reports a successful completed print, and never for failed/cancelled jobs.
+- Replaced the order editor's Customer Folder shortcut with an in-app Product Inventory picker that attaches selected STL/3MF files while preserving their product link.
+- Added a pre-queue stock check that can fill an order from existing stock, combine available stock with a smaller print run, or print the full quantity anyway.
+- Made stock reservations reversible when a linked order file is reset, removed, or its order is deleted.
+- Added automatic MakerWorld profile fallback when Bambu Lab rejects the profile linked in the pasted URL with HTTP 400.
+- Preserved the resolved model card, product group, source link, and preview photo even when every MakerWorld profile download fails.
+- Added Retry Auto Download to MakerWorld library entries that do not yet have a source file.
+- Kept all MakerWorld imports source-only by removing embedded G-code from whichever same-design profile successfully downloads.
+
 ## 0.7.72
 
 - Added a guarded Send Anyway override after Messenger detects a customer-name mismatch, allowing known spelling mistakes to be bypassed without weakening the normal automatic name check.
