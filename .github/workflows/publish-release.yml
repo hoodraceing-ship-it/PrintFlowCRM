@@ -8,6 +8,7 @@ on:
       - 'MessengerCapture.pyw'
       - 'PirateShipCapture.pyw'
       - 'SetupWizard.pyw'
+      - 'hood-layerworks-label.png'
       - 'requirements.txt'
       - 'update_manifest.json'
       - 'Install-PrintFlowCRM.ps1'
@@ -78,6 +79,7 @@ jobs:
             'MessengerCapture.pyw',
             'PirateShipCapture.pyw',
             'SetupWizard.pyw',
+            'hood-layerworks-label.png',
             'requirements.txt',
             'update_manifest.json',
             'Install-PrintFlowCRM.ps1',

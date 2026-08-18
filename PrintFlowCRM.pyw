@@ -26,7 +26,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.67"
+VERSION = "0.7.68"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2205,13 +2205,185 @@ class App(tk.Tk):
             self.view_shipping_label(order_id);return
         if os.name!="nt":
             self.view_shipping_label(order_id);return
-        if not messagebox.askyesno("Print 4×6 shipping label",f"Send the saved 4×6 PDF to your Windows default printer?\n\n{path.name}\n\nMake sure your thermal label printer is the default printer and is loaded with 4×6 labels.",parent=self):return
         try:
-            os.startfile(str(path),"print")
-            self.status_flash("4×6 shipping label sent to the default printer")
+            try:
+                print_path = self._build_shipping_label_bundle(path)
+            except ModuleNotFoundError:
+                self._install_label_print_dependencies(order_id)
+                return
+            edge = self._find_microsoft_edge()
+            if not edge:
+                raise RuntimeError("Microsoft Edge could not be found on this computer.")
+            # A separate app-style Edge window gives us a reliable print target even
+            # when the user already has other browser windows open. The PDF itself is
+            # a 4×6 portrait page, which lets the Windows dialog preselect Portrait.
+            existing = self._visible_window_handles()
+            subprocess.Popen(
+                [str(edge), "--new-window", "--no-first-run", print_path.resolve().as_uri()],
+                creationflags=0x08000000,
+            )
+            threading.Thread(
+                target=self._open_edge_system_print_dialog,
+                args=(print_path, existing), daemon=True, name="PrintFlowLabelPrintDialog"
+            ).start()
+            self.status_flash("Opening shipping label + Hood Layerworks label…")
         except Exception as exc:
-            messagebox.showerror("Print shipping label",f"Windows could not print the PDF automatically. PrintFlow will open it so you can choose Print manually.\n\n{exc}",parent=self)
-            self.view_shipping_label(order_id)
+            messagebox.showerror(
+                "Print shipping label",
+                f"PrintFlow could not open the Windows print window.\n\n{exc}",
+                parent=self,
+            )
+
+    def _build_shipping_label_bundle(self, shipping_pdf):
+        """Create one two-page PDF: shipping label, then the branded box label."""
+        from PIL import Image
+        from pypdf import PdfReader, PdfWriter
+
+        app_dir = Path(sys.argv[0]).resolve().parent
+        logo_path = app_dir / "hood-layerworks-label.png"
+        if not logo_path.is_file():
+            raise RuntimeError("The Hood Layerworks label artwork is missing. Reinstall the latest PrintFlow update.")
+        output_dir = DATA_DIR / "shipping_labels" / "print_jobs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logo_pdf = output_dir / "hood-layerworks-4x6.pdf"
+        bundled_pdf = output_dir / f"{Path(shipping_pdf).stem}_SHIPPING_AND_LOGO.pdf"
+
+        # 6×4 inches at 300 DPI. The shipping page remains portrait, while this
+        # second page is deliberately landscape so the wide logo fills its label.
+        with Image.open(logo_path) as source:
+            artwork = source.convert("RGB")
+            max_w, max_h = 1680, 1080
+            ratio = min(max_w / artwork.width, max_h / artwork.height)
+            artwork = artwork.resize(
+                (max(1, int(artwork.width * ratio)), max(1, int(artwork.height * ratio))),
+                Image.Resampling.LANCZOS,
+            )
+            page = Image.new("RGB", (1800, 1200), "white")
+            page.paste(artwork, ((page.width - artwork.width) // 2, (page.height - artwork.height) // 2))
+            page.save(logo_pdf, "PDF", resolution=300.0)
+
+        writer = PdfWriter()
+        shipping_reader = PdfReader(str(shipping_pdf))
+        for page in shipping_reader.pages:
+            writer.add_page(page)
+        logo_reader = PdfReader(str(logo_pdf))
+        writer.add_page(logo_reader.pages[0])
+        with bundled_pdf.open("wb") as output:
+            writer.write(output)
+        return bundled_pdf
+
+    def _install_label_print_dependencies(self, order_id):
+        """One-time lightweight setup for combining both 4×6 labels."""
+        if getattr(self, "_label_dependencies_installing", False):
+            self.status_flash("Preparing the two-label print feature…")
+            return
+        self._label_dependencies_installing = True
+        self.status_flash("One-time setup: preparing two-label printing…")
+        def work():
+            try:
+                creationflags = 0x08000000 if os.name == "nt" else 0
+                cmd = [sys.executable, "-m", "pip", "install", "--user", "--disable-pip-version-check", "Pillow>=11.0", "pypdf>=6.0"]
+                run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     timeout=240, creationflags=creationflags)
+                if run.returncode != 0:
+                    subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   timeout=120, creationflags=creationflags)
+                    run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                         timeout=240, creationflags=creationflags)
+                if run.returncode != 0:
+                    raise RuntimeError((run.stderr or run.stdout or "Dependency setup failed")[-1800:])
+                self.after(0, lambda: self.print_shipping_label(order_id))
+            except Exception as exc:
+                self.after(0, lambda error=str(exc): messagebox.showerror(
+                    "Two-label printing setup failed", error, parent=self
+                ))
+            finally:
+                self._label_dependencies_installing = False
+        threading.Thread(target=work, daemon=True, name="PrintFlowLabelDependencies").start()
+
+    @staticmethod
+    def _find_microsoft_edge():
+        """Return Edge's executable without relying on PDF file associations."""
+        roots = [os.getenv("PROGRAMFILES(X86)"), os.getenv("PROGRAMFILES"), os.getenv("LOCALAPPDATA")]
+        candidates = []
+        for root in roots:
+            if root:
+                candidates.append(Path(root) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+        command = shutil.which("msedge") or shutil.which("msedge.exe")
+        if command:
+            candidates.append(Path(command))
+        return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+    @staticmethod
+    def _visible_window_handles():
+        if os.name != "nt":
+            return set()
+        handles = set()
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        @callback_type
+        def collect(hwnd, _lparam):
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                handles.add(int(hwnd))
+            return True
+        ctypes.windll.user32.EnumWindows(collect, 0)
+        return handles
+
+    def _open_edge_system_print_dialog(self, label_path, existing_handles):
+        """Open Edge print preview, then its Windows system-print window."""
+        if os.name != "nt":
+            return
+        user32 = ctypes.windll.user32
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        target = None
+        label_stem = Path(label_path).stem.lower()
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and target is None:
+            candidates = []
+            @callback_type
+            def find_window(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                title = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, title, length + 1)
+                text = title.value.lower()
+                if int(hwnd) not in existing_handles and (label_stem in text or "microsoft edge" in text):
+                    candidates.append(int(hwnd))
+                return True
+            user32.EnumWindows(find_window, 0)
+            if candidates:
+                target = candidates[0]
+                break
+            time.sleep(0.2)
+        if target is None:
+            self.after(0, lambda: messagebox.showerror(
+                "Print shipping label",
+                "The label opened, but PrintFlow could not activate its print window. Press Ctrl+P in the label window.",
+                parent=self,
+            ))
+            return
+
+        user32.ShowWindow(target, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(target)
+        time.sleep(0.5)
+        VK_CONTROL, VK_SHIFT, VK_P, KEYUP = 0x11, 0x10, 0x50, 0x0002
+        # First open Edge's preview so it reads the PDF's portrait 4×6 page size.
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_P, 0, 0, 0)
+        user32.keybd_event(VK_P, 0, KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
+        time.sleep(2.0)
+        # Ctrl+Shift+P from Edge preview opens the native Windows window shown by
+        # the user's screenshot, retaining the document's portrait orientation.
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_SHIFT, 0, 0, 0)
+        user32.keybd_event(VK_P, 0, 0, 0)
+        user32.keybd_event(VK_P, 0, KEYUP, 0)
+        user32.keybd_event(VK_SHIFT, 0, KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
 
     def _generate_packing_list(self,order_id,auto_print=False):
         if self.current_order_id==order_id:self.flush_order_autosave()

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.68
+
+- Changed Print Shipping Label to open the native Windows print window instead of relying on a missing PDF print association.
+- Routed saved labels through Microsoft Edge's built-in PDF support, then opened the system print dialog with the 4×6 document in portrait orientation.
+- Removed the extra confirmation so the print window opens immediately when Print Shipping Label is clicked.
+- Combined the saved portrait shipping label and landscape Hood Layerworks artwork into one two-page 4×6 job, so the logo fills the next label correctly with one click.
+
 ## 0.7.67
 
 - Added a live overhang warning banner to Print Preflight & Orientation that rechecks the model after every rotation.

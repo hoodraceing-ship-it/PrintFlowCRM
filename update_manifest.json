@@ -1,11 +1,12 @@
 {
   "product": "PrintFlow CRM",
-  "version": "0.7.67",
+  "version": "0.7.68",
   "app_files": [
     "PrintFlowCRM.pyw",
     "MessengerCapture.pyw",
     "PirateShipCapture.pyw",
     "SetupWizard.pyw",
+    "hood-layerworks-label.png",
     "update_manifest.json",
     "requirements.txt"
   ]
