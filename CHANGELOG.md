@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.78
+
+- Fixed manually renamed Model Library items being changed back to their original MakerWorld/page titles during startup or link refreshes.
+- Added a protected manual-name flag for renamed inventory items and locally created Add My Files entries.
+- Added one-time recovery of safely matched custom item names from PrintFlow's v0.7.74-and-newer pre-update database backups.
+- Preserved stock counts, source filenames, photos, group assignments, and folder paths while recovering names.
+
 ## 0.7.77
 
 - Replaced free-text-only group changes with an editable dropdown that lists every current Model Library group.

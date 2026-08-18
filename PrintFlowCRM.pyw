@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.77"
+VERSION = "0.7.78"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -378,6 +378,70 @@ class Database:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    @staticmethod
+    def _model_backup_identity(row):
+        keys=set(row.keys())
+        source_key=str(row["source_key"] or "").strip() if "source_key" in keys else ""
+        if source_key:return source_key
+        source_url=str(row["source_url"] or "").strip() if "source_url" in keys else ""
+        return canonical_model_source_key(source_url) or f"id:{int(row['id'])}"
+
+    def _recover_manual_model_names_from_backups(self,c):
+        """Recover pre-regression custom names without restoring any other data."""
+        try:
+            backups=[]
+            for path in BACKUP_DIR.glob("pre-update-v*.db"):
+                match=re.search(r"pre-update-v(\d+)\.(\d+)\.(\d+)-",path.name,re.I)
+                if match and tuple(int(value) for value in match.groups()) >= (0,7,74):backups.append(path)
+            backups.sort(key=lambda path:path.stat().st_mtime,reverse=True)
+        except Exception:return 0
+        recovered_names={}
+        for path in backups:
+            try:
+                backup=sqlite3.connect(f"file:{path.as_posix()}?mode=ro",uri=True);backup.row_factory=sqlite3.Row
+                columns={row[1] for row in backup.execute("PRAGMA table_info(model_library)").fetchall()}
+                if not {"id","product_name","title"}.issubset(columns):backup.close();continue
+                select="id,product_name,title"+(",source_key" if "source_key" in columns else ",'' AS source_key")+(",source_url" if "source_url" in columns else ",'' AS source_url")
+                rows=backup.execute(f"SELECT {select} FROM model_library").fetchall();backup.close()
+                for row in rows:
+                    product=clean_model_item_name(row["product_name"]);title=clean_model_item_name(row["title"])
+                    if product.casefold()==title.casefold() or title.lower() in {"", "imported model", "makerworld model"}:continue
+                    recovered_names.setdefault(self._model_backup_identity(row),product)
+            except Exception:
+                try:backup.close()
+                except Exception:pass
+        if not recovered_names:return 0
+        recovered=0
+        for row in c.execute("SELECT id,product_name,title,source_key,source_url,category,folder_path,name_manual FROM model_library").fetchall():
+            if int(row["name_manual"] or 0):continue
+            current=clean_model_item_name(row["product_name"]);title=clean_model_item_name(row["title"])
+            if current.casefold()!=title.casefold():continue
+            restored=recovered_names.get(self._model_backup_identity(row),"")
+            if not restored or restored.casefold()==current.casefold():continue
+            model_id=int(row["id"]);old_folder=Path(row["folder_path"]);new_folder=old_folder
+            candidate=MODEL_LIBRARY_DIR/model_folder_name(row["category"] or "Other Models")/model_folder_name(restored)
+            if candidate!=old_folder:
+                if candidate.exists():candidate=candidate.with_name(candidate.name+f"-{model_id}")
+                try:
+                    candidate.parent.mkdir(parents=True,exist_ok=True)
+                    if old_folder.exists():old_folder.rename(candidate)
+                    else:candidate.mkdir(parents=True,exist_ok=True)
+                    new_folder=candidate
+                except Exception:new_folder=old_folder
+            c.execute("UPDATE model_library SET product_name=?,name_manual=1,folder_path=? WHERE id=?",
+                      (restored,str(new_folder),model_id))
+            if new_folder!=old_folder:
+                for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
+                    c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",
+                              (str(new_folder/Path(file_row["stored_path"]).name),int(file_row["id"])))
+                image_path=new_folder/"preview.png"
+                c.execute("UPDATE model_library SET image_path=? WHERE id=?",
+                          (str(image_path) if image_path.exists() else "",model_id))
+            recovered+=1
+        if recovered:
+            c.execute("INSERT INTO settings(key,value) VALUES('model_name_recovery_count',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(recovered),))
+        return recovered
+
     def _init_db(self):
         with self.connect() as c:
             c.executescript(
@@ -477,6 +541,7 @@ class Database:
                     folder_path TEXT NOT NULL,
                     stock_qty INTEGER NOT NULL DEFAULT 0,
                     category_manual INTEGER NOT NULL DEFAULT 0,
+                    name_manual INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -560,7 +625,8 @@ class Database:
                 c.execute("ALTER TABLE model_library ADD COLUMN stock_qty INTEGER NOT NULL DEFAULT 0")
             if "category" not in model_columns:
                 c.execute("ALTER TABLE model_library ADD COLUMN category TEXT NOT NULL DEFAULT 'Other Models'")
-            if "source_key" not in model_columns:
+            added_source_key="source_key" not in model_columns
+            if added_source_key:
                 c.execute("ALTER TABLE model_library ADD COLUMN source_key TEXT DEFAULT ''")
             added_category_manual="category_manual" not in model_columns
             if added_category_manual:
@@ -568,13 +634,22 @@ class Database:
                 # Categories from an older release may have been deliberately
                 # changed before this flag existed. Preserve those overrides.
                 c.execute("UPDATE model_library SET category_manual=1 WHERE COALESCE(category,'') NOT IN ('','Other Models')")
+            added_name_manual="name_manual" not in model_columns
+            if added_name_manual:
+                c.execute("ALTER TABLE model_library ADD COLUMN name_manual INTEGER NOT NULL DEFAULT 0")
             # Imported links used to treat the broad Fits/Product text as the item.
             # Upgrade them to one stockable item per design while preserving stock/files.
-            for model in c.execute("SELECT id,product_name,title,source_url,category,source_key,folder_path,category_manual,model_number FROM model_library").fetchall():
+            for model in c.execute("SELECT id,product_name,title,source_url,category,source_key,folder_path,category_manual,name_manual,model_number FROM model_library").fetchall():
                 title=clean_model_item_name(model["title"])
                 product=clean_model_item_name(model["product_name"])
                 has_specific_title=bool(model["source_url"] and title.lower() not in {"", "imported model", "makerworld model"})
-                item=title if has_specific_title else product
+                name_manual=int(model["name_manual"] or 0)
+                # Only databases upgrading from the old pre-group schema need
+                # their broad Fits/Product label replaced with the page title.
+                # Never reapply that title during normal startup: it overwrites
+                # a name the user deliberately entered with Rename.
+                item=title if added_source_key and has_specific_title and not name_manual else product
+                if added_name_manual and not added_source_key and product.casefold()!=title.casefold():name_manual=1
                 category=(model["category"] or "").strip()
                 source_key=(model["source_key"] or "").strip() or canonical_model_source_key(model["source_url"])
                 model_number=(model["model_number"] or "").strip() or detect_model_number(title,product) or KNOWN_MODEL_SOURCE_NUMBERS.get(source_key,"")
@@ -596,8 +671,8 @@ class Database:
                             if old_folder.exists():old_folder.rename(candidate)
                             new_folder=candidate
                         except Exception:new_folder=old_folder
-                c.execute("UPDATE model_library SET product_name=?,category=?,category_manual=?,source_key=?,model_number=?,folder_path=? WHERE id=?",
-                          (item,category,category_manual,source_key,model_number,str(new_folder),int(model["id"])))
+                c.execute("UPDATE model_library SET product_name=?,name_manual=?,category=?,category_manual=?,source_key=?,model_number=?,folder_path=? WHERE id=?",
+                          (item,name_manual,category,category_manual,source_key,model_number,str(new_folder),int(model["id"])))
                 if new_folder!=old_folder:
                     for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(int(model["id"]),)).fetchall():
                         c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",
@@ -605,6 +680,8 @@ class Database:
                     image_path=new_folder/"preview.png"
                     c.execute("UPDATE model_library SET image_path=? WHERE id=?",
                               (str(image_path) if image_path.exists() else "",int(model["id"])))
+            if added_name_manual:
+                self._recover_manual_model_names_from_backups(c)
 
             # v0.2 migration: preserve the single attachment used by v0.1.
             legacy = c.execute(
@@ -1851,6 +1928,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.db = Database(DB_PATH)
+        try:self._recovered_model_names=int(self.db.get_setting("model_name_recovery_count","0") or 0)
+        except Exception:self._recovered_model_names=0
+        if self._recovered_model_names:self.db.set_setting("model_name_recovery_count","0")
         # v0.7.31: migrate the former hardcoded Luna default to the user's
         # complimentary-usage-friendly model once. Explicit choices made after
         # this migration are preserved.
@@ -1914,6 +1994,11 @@ class App(tk.Tk):
         # over labels, entries, cards, etc. — not only over the scrollbar/canvas.
         self.bind_all("<MouseWheel>", self._app_mousewheel, add="+")
         self.show_dashboard()
+        if self._recovered_model_names:
+            self.after(900,lambda:messagebox.showinfo(
+                "Model names restored",
+                f"PrintFlow restored {self._recovered_model_names} custom Model Library name(s) from a pre-update backup.\n\nThose names are now protected from automatic page-title updates.",parent=self
+            ))
         self.after(200, self._restore_topmost)
         # Start the user-selected remote-network/VPN client after PrintFlow is visible.
         # This keeps BambuBuddy/Tailscale-style remote URLs reachable without making
@@ -3483,8 +3568,8 @@ class App(tk.Tk):
         if folder.exists():folder=folder.with_name(folder.name+"-"+uuid.uuid4().hex[:6])
         folder.mkdir(parents=True,exist_ok=True)
         with self.db.connect() as c:
-            cur=c.execute("""INSERT INTO model_library(product_name,category,category_manual,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at)
-                             VALUES(?,?,1,?,?,?,?,?,?,?,?)""",
+            cur=c.execute("""INSERT INTO model_library(product_name,name_manual,category,category_manual,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at)
+                             VALUES(?,1,?,1,?,?,?,?,?,?,?,?)""",
                           (result["product"],result["category"],f"local:{uuid.uuid4().hex}",result["model_number"],result["product"],"","",str(folder),now,now))
             model_id=int(cur.lastrowid)
         added=0
@@ -3671,11 +3756,12 @@ class App(tk.Tk):
             if existing:
                 model_id=int(existing["id"]);folder=Path(existing["folder_path"])
                 if int(existing["category_manual"] or 0) and not category_manual:category=existing["category"]
+                saved_product=existing["product_name"] if int(existing["name_manual"] or 0) else product
                 c.execute("UPDATE model_library SET product_name=?,category=?,category_manual=?,source_key=?,title=?,source_url=?,image_url=?,model_number=CASE WHEN model_number='' THEN ? ELSE model_number END,updated_at=? WHERE id=?",
-                          (product,category,max(category_manual,int(existing["category_manual"] or 0)),source_key,data.get("title",""),data.get("url",""),data.get("image_url",""),data.get("model_number",""),now,model_id))
+                          (saved_product,category,max(category_manual,int(existing["category_manual"] or 0)),source_key,data.get("title",""),data.get("url",""),data.get("image_url",""),data.get("model_number",""),now,model_id))
             else:
                 folder=MODEL_LIBRARY_DIR/self._model_folder_name(category)/self._model_folder_name(product);folder.mkdir(parents=True,exist_ok=True)
-                cur=c.execute("INSERT INTO model_library(product_name,category,category_manual,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                cur=c.execute("INSERT INTO model_library(product_name,name_manual,category,category_manual,source_key,model_number,title,source_url,image_url,folder_path,created_at,updated_at) VALUES(?,0,?,?,?,?,?,?,?,?,?,?)",
                               (product,category,category_manual,source_key,data.get("model_number",""),data.get("title",""),data.get("url",""),data.get("image_url",""),str(folder),now,now))
                 model_id=int(cur.lastrowid)
         folder.mkdir(parents=True,exist_ok=True)
@@ -4030,7 +4116,7 @@ class App(tk.Tk):
             try:new_folder.parent.mkdir(parents=True,exist_ok=True);old_folder.rename(new_folder)
             except Exception:new_folder=old_folder
         with self.db.connect() as c:
-            c.execute("UPDATE model_library SET product_name=?,model_number=?,folder_path=?,updated_at=? WHERE id=?",
+            c.execute("UPDATE model_library SET product_name=?,name_manual=1,model_number=?,folder_path=?,updated_at=? WHERE id=?",
                       (value,model_number,str(new_folder),datetime.now().isoformat(timespec="seconds"),model_id))
             if new_folder!=old_folder:
                 for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
