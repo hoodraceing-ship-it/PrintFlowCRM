@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.81
+
+- Added an automatic STL plate-layout check after Print Preflight and before any source file is sent to BambuBuddy.
+- Detects disconnected printable bodies flattened from multiple slicer plates, keeps nearby bodies together, and exports one centered STL per detected build plate.
+- Automatically slices and queues every generated plate in order while preserving Queue Only/manual-start safety, supports, material, plate type, quantity, and live status tracking.
+- Shows detected plate counts and generated Plate STL helpers beneath the original customer file and uses those plate files for shipping-package sizing.
+- Added Open/Edit Selected and Replace Selected controls for saved Model Library source files. Replacements are atomic, refresh the saved hash, and keep an immediate local recovery copy of the prior file.
+- Added Copy Item and Paste Copied Item for creating independent stockable variants with copied source files and photos, their own name and folder, and a safe starting stock count of zero.
+
 ## 0.7.80
 
 - Added complete disaster-recovery backups containing a consistency-checked database snapshot, customer files, Model Library inventory, shipping labels, packing lists, settings, installed dependencies, and the full app installation.

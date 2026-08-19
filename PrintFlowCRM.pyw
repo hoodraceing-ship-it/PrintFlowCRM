@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.80"
+VERSION = "0.7.81"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2006,6 +2006,7 @@ class App(tk.Tk):
         self._model_search_generation = 0
         self._library_photos = []
         self._library_importing = False
+        self._library_copy_model_id = None
         self._backup_running = False
         self._backup_stop = False
         self._messenger_capture_seen = ""
@@ -3521,7 +3522,9 @@ class App(tk.Tk):
                          "Add Clipboard Link",self._library_import_clipboard,"Delete Entire Library",self._delete_entire_model_library)
         quick=self.card(self.main,12);quick.pack(fill="x",pady=(0,10))
         ttk.Label(quick,text="Quick Add from a link",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,7))
-        ttk.Button(quick,text="+ Add My Files",style="Accent.TButton",command=self._add_my_model_files).grid(row=0,column=3,sticky="e",pady=(0,7))
+        quick_actions=ttk.Frame(quick,style="Card.TFrame");quick_actions.grid(row=0,column=3,sticky="e",pady=(0,7))
+        ttk.Button(quick_actions,text="Paste Copied Item",command=self._paste_library_product_copy).pack(side="right")
+        ttk.Button(quick_actions,text="+ Add My Files",style="Accent.TButton",command=self._add_my_model_files).pack(side="right",padx=(0,7))
         self.library_url_var=tk.StringVar()
         self.library_product_var=tk.StringVar()
         ttk.Label(quick,text="Model page link",style="Card.TLabel").grid(row=1,column=0,sticky="w")
@@ -4080,22 +4083,27 @@ class App(tk.Tk):
         actions=ttk.Frame(body,style="Card.TFrame");actions.pack(fill="x")
         ttk.Button(actions,text="Add Local Files",style="Accent.TButton",command=lambda:self._library_add_local_files(model_id)).pack(side="left",padx=(0,6))
         ttk.Button(actions,text="Open Folder",command=lambda:self._open_library_folder(row["folder_path"])).pack(side="left",padx=(0,6))
-        ttk.Button(actions,text="Rename",command=lambda:self._rename_library_product(model_id)).pack(side="left",padx=(0,6))
-        ttk.Button(actions,text="Change Group",command=lambda:self._change_library_category(model_id)).pack(side="left",padx=(0,6))
-        ttk.Button(actions,text="Change Photo",command=lambda:self._library_change_photo(model_id)).pack(side="left",padx=(0,6))
+        ttk.Button(actions,text="Copy Item",command=lambda:self._copy_library_product(model_id)).pack(side="left",padx=(0,6))
+        manage_actions=ttk.Frame(body,style="Card.TFrame");manage_actions.pack(fill="x",pady=(5,0))
+        ttk.Button(manage_actions,text="Rename",command=lambda:self._rename_library_product(model_id)).pack(side="left",padx=(0,6))
+        ttk.Button(manage_actions,text="Change Group",command=lambda:self._change_library_category(model_id)).pack(side="left",padx=(0,6))
+        ttk.Button(manage_actions,text="Change Photo",command=lambda:self._library_change_photo(model_id)).pack(side="left",padx=(0,6))
         if row["source_url"]:
-            ttk.Button(actions,text="Open Source",command=lambda:webbrowser.open(row["source_url"])).pack(side="left",padx=(0,6))
+            ttk.Button(manage_actions,text="Open Source",command=lambda:webbrowser.open(row["source_url"])).pack(side="left",padx=(0,6))
             if "makerworld.com" in str(row["source_url"]).lower() and not files:
-                ttk.Button(actions,text="Retry Auto Download",command=lambda:self._retry_model_library_source(model_id)).pack(side="left")
+                ttk.Button(manage_actions,text="Retry Auto Download",command=lambda:self._retry_model_library_source(model_id)).pack(side="left")
         ttk.Label(self.library_detail,text=f"Source files ({len(files)})",style="CardTitle.TLabel").pack(anchor="w",pady=(18,7))
         tree=ttk.Treeview(self.library_detail,columns=("type",),show="headings",height=max(5,min(12,len(files)+1)))
         tree.heading("type",text="File type");tree.column("type",width=90,stretch=False)
         tree["columns"]=("name","type");tree.heading("name",text="File");tree.column("name",width=430);tree.heading("type",text="Type")
         for item in files:tree.insert("","end",iid=str(item["id"]),values=(item["original_name"],Path(item["original_name"]).suffix.upper().lstrip(".")))
         tree.pack(fill="both",expand=True)
-        bottom=ttk.Frame(self.library_detail,style="Card.TFrame");bottom.pack(fill="x",pady=(8,0))
+        file_actions=ttk.Frame(self.library_detail,style="Card.TFrame");file_actions.pack(fill="x",pady=(8,0))
+        ttk.Button(file_actions,text="Open/Edit Selected",command=lambda:self._open_library_source_file(model_id,tree)).pack(side="left")
+        ttk.Button(file_actions,text="Replace Selected",command=lambda:self._replace_library_source_file(model_id,tree)).pack(side="left",padx=(7,0))
+        ttk.Button(file_actions,text="Print 1 for Stock",style="Accent.TButton",command=lambda:self._print_library_file_for_stock(model_id,tree)).pack(side="left",padx=(7,0))
+        bottom=ttk.Frame(self.library_detail,style="Card.TFrame");bottom.pack(fill="x",pady=(7,0))
         ttk.Button(bottom,text="Delete Selected File",style="Danger.TButton",command=lambda:self._delete_library_file(model_id,tree)).pack(side="left")
-        ttk.Button(bottom,text="Print 1 for Stock",style="Accent.TButton",command=lambda:self._print_library_file_for_stock(model_id,tree)).pack(side="left",padx=(7,0))
         ttk.Button(bottom,text="Delete Product",style="Danger.TButton",command=lambda:self._delete_library_product(model_id)).pack(side="right")
 
     def _adjust_library_stock(self,model_id,delta):
@@ -4163,6 +4171,143 @@ class App(tk.Tk):
             try:added+=self._store_model_library_bytes(model_id,Path(row["folder_path"]),source.name,source.read_bytes(),"")
             except Exception:continue
         self.status_flash(f"Added {added} source file(s) • G-code excluded");self.show_model_library(model_id)
+
+    def _selected_library_source(self,model_id,tree):
+        selected=tree.selection()
+        if not selected:
+            messagebox.showinfo("Choose a source file","Select a saved STL or other source file first.",parent=self)
+            return None
+        try:file_id=int(selected[0])
+        except (TypeError,ValueError):return None
+        with self.db.connect() as c:
+            return c.execute("SELECT * FROM model_library_files WHERE id=? AND model_id=?",(file_id,int(model_id))).fetchone()
+
+    def _open_library_source_file(self,model_id,tree):
+        row=self._selected_library_source(model_id,tree)
+        if not row:return
+        path=Path(row["stored_path"] or "")
+        if not path.is_file():
+            messagebox.showerror("Missing source file",f"This saved file cannot be found:\n{path}",parent=self);return
+        try:
+            if os.name=="nt":os.startfile(str(path))
+            else:webbrowser.open(path.as_uri())
+            self.status_flash(f"Opened {path.name} for viewing/editing")
+        except Exception as exc:
+            messagebox.showerror("Open source file",f"Windows could not open {path.name}.\n\n{exc}",parent=self)
+
+    def _replace_library_source_file(self,model_id,tree):
+        row=self._selected_library_source(model_id,tree)
+        if not row:return
+        destination=Path(row["stored_path"] or "")
+        suffix=destination.suffix.lower()
+        selected=filedialog.askopenfilename(
+            parent=self,title=f"Replace {row['original_name']}",
+            filetypes=[(f"{suffix.upper().lstrip('.')} source file",f"*{suffix}"),("3D source files","*.stl *.3mf *.step *.stp *.obj *.amf *.scad *.f3d"),("All files","*.*")],
+        )
+        if not selected:return
+        source=Path(selected)
+        if not source.is_file() or not self._model_source_allowed(source.name):
+            messagebox.showwarning("Replace source file","Choose a supported source model. G-code cannot be stored in the Model Library.",parent=self);return
+        if source.suffix.lower()!=suffix:
+            messagebox.showwarning("Replace source file",f"Choose another {suffix.upper()} file so the saved file type does not change.",parent=self);return
+        if not messagebox.askyesno(
+            "Replace saved source",
+            f"Replace the saved {row['original_name']} with:\n\n{source.name}\n\n"
+            "PrintFlow will save a recovery copy of the current file first. Existing customer-order copies will not be changed.",
+            parent=self,
+        ):return
+        temporary=None
+        try:
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            same_file=False
+            try:same_file=source.resolve()==destination.resolve()
+            except Exception:pass
+            if not same_file and destination.is_file():
+                backup_dir=BACKUP_DIR/"Replaced-Model-Library-Files"/datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                backup_dir.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(destination,backup_dir/destination.name)
+            if not same_file:
+                temporary=destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+                shutil.copy2(source,temporary)
+                os.replace(temporary,destination)
+            digest=hashlib.sha256(destination.read_bytes()).hexdigest()
+            with self.db.connect() as c:
+                c.execute("UPDATE model_library_files SET sha256=?,source_url='',added_at=? WHERE id=?",
+                          (digest,datetime.now().isoformat(timespec="seconds"),int(row["id"])))
+                c.execute("UPDATE model_library SET updated_at=? WHERE id=?",
+                          (datetime.now().isoformat(timespec="seconds"),int(model_id)))
+            self.status_flash(f"Replaced and refreshed {destination.name}")
+            self.show_model_library(model_id)
+        except Exception as exc:
+            try:
+                if temporary:Path(temporary).unlink(missing_ok=True)
+            except Exception:pass
+            messagebox.showerror("Replace source file",str(exc),parent=self)
+
+    def _copy_library_product(self,model_id):
+        row=self.db.model_library_item(model_id)
+        if not row:return
+        self._library_copy_model_id=int(model_id)
+        self.status_flash(f"Copied stockable item: {row['product_name']}")
+        messagebox.showinfo(
+            "Stockable item copied",
+            f"Copied {row['product_name']} and its saved source files.\n\n"
+            "Click Paste Copied Item at the top of Model Library to create an independent version. The pasted item's stock starts at 0.",
+            parent=self,
+        )
+
+    def _paste_library_product_copy(self):
+        source_id=getattr(self,"_library_copy_model_id",None)
+        if not source_id:
+            messagebox.showinfo("Paste copied item","Open a stockable item and click Copy Item first.",parent=self);return
+        with self.db.connect() as c:
+            source=c.execute("SELECT * FROM model_library WHERE id=?",(int(source_id),)).fetchone()
+            source_files=c.execute("SELECT * FROM model_library_files WHERE model_id=? ORDER BY id",(int(source_id),)).fetchall()
+        if not source:
+            self._library_copy_model_id=None
+            messagebox.showwarning("Paste copied item","The copied item no longer exists. Copy another item and try again.",parent=self);return
+        name=simpledialog.askstring(
+            "Paste stockable item",
+            "Name for the independent copy:\n\nExample: Charger Insert — 3 Battery Version",
+            initialvalue=f"{source['product_name']} Copy",parent=self,
+        )
+        if not name or not name.strip():return
+        name=clean_model_item_name(name)
+        category=source["category"] or "Other Models"
+        folder=MODEL_LIBRARY_DIR/model_folder_name(category)/model_folder_name(name)
+        if folder.exists():folder=folder.with_name(folder.name+"-"+uuid.uuid4().hex[:6])
+        now=datetime.now().isoformat(timespec="seconds")
+        try:
+            folder.mkdir(parents=True,exist_ok=False)
+            copied_files=[]
+            for file_row in source_files:
+                old_path=Path(file_row["stored_path"] or "")
+                if not old_path.is_file():continue
+                new_path=folder/old_path.name
+                if new_path.exists():new_path=folder/f"{old_path.stem}_{file_row['sha256'][:8]}{old_path.suffix}"
+                shutil.copy2(old_path,new_path)
+                copied_files.append((file_row,new_path,hashlib.sha256(new_path.read_bytes()).hexdigest()))
+            image_path=""
+            old_image=Path(source["image_path"] or "")
+            if old_image.is_file():
+                new_image=folder/"preview.png";shutil.copy2(old_image,new_image);image_path=str(new_image)
+            with self.db.connect() as c:
+                cur=c.execute(
+                    """INSERT INTO model_library(product_name,name_manual,category,category_manual,source_key,model_number,title,source_url,image_url,image_path,folder_path,stock_qty,created_at,updated_at)
+                       VALUES(?,1,?,1,?,?,?,?,?,?,?,?,?,?)""",
+                    (name,category,f"copy:{uuid.uuid4().hex}",source["model_number"] or "",name,source["source_url"] or "",source["image_url"] or "",image_path,str(folder),0,now,now),
+                )
+                new_model_id=int(cur.lastrowid)
+                for file_row,new_path,digest in copied_files:
+                    c.execute(
+                        "INSERT INTO model_library_files(model_id,stored_path,original_name,source_url,sha256,added_at) VALUES(?,?,?,?,?,?)",
+                        (new_model_id,str(new_path),file_row["original_name"] or new_path.name,file_row["source_url"] or "",digest,now),
+                    )
+            self.status_flash(f"Pasted independent item: {name} • stock 0")
+            self.show_model_library(new_model_id)
+        except Exception as exc:
+            shutil.rmtree(folder,ignore_errors=True)
+            messagebox.showerror("Paste copied item",str(exc),parent=self)
 
     def _rename_library_product(self,model_id):
         with self.db.connect() as c:row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
@@ -4997,7 +5142,10 @@ class App(tk.Tk):
             stem = raw[:-10]
         else:
             stem = Path(raw).stem
-        # Generated names can contain both a PRELIGHT stamp and AUTO_SPLIT suffix.
+        # Generated names can contain a PREFLIGHT stamp followed by a queue-plate
+        # or Auto Split suffix. Remove the outermost helper name first so every
+        # generated plate and its sliced G-code stay grouped under the source STL.
+        stem = re.sub(r"_QUEUE_PLATE_\d+(?:_\d{8}_\d{6}_\d+)?$", "", stem, flags=re.I)
         stem = re.sub(r"_AUTO_SPLIT_[XYZ]_PART_\d+(?:_\d{8}_\d{6}_\d+)?$", "", stem, flags=re.I)
         stem = re.sub(r"_PREFLIGHT_\d{8}_\d{6}_\d+$", "", stem, flags=re.I)
         return re.sub(r"\s+", " ", stem).strip().lower()
@@ -5005,7 +5153,7 @@ class App(tk.Tk):
     @staticmethod
     def _is_printflow_generated_file(name):
         text = str(name or "")
-        return bool(re.search(r"_PREFLIGHT_\d{8}_\d{6}_\d+|_AUTO_SPLIT_[XYZ]_PART_\d+", text, flags=re.I))
+        return bool(re.search(r"_PREFLIGHT_\d{8}_\d{6}_\d+|_AUTO_SPLIT_[XYZ]_PART_\d+|_QUEUE_PLATE_\d+", text, flags=re.I))
 
     def _aggregate_print_file_status(self, members, main_row):
         # Source STL + generated G-code can point at the same queue item. Count each job once.
@@ -5075,15 +5223,22 @@ class App(tk.Tk):
             if stock_used:
                 status=(f"From stock ({stock_used})" if status=="Complete" else f"{status} • {stock_used} from stock")
             split_parts = []
+            queue_plates = []
             for f in members:
                 n = f["original_name"] or Path(f["stored_path"]).name
                 m = re.search(r"_AUTO_SPLIT_[XYZ]_PART_(\d+)", n, flags=re.I)
                 if m:
                     split_parts.append(int(m.group(1)))
+                m = re.search(r"_QUEUE_PLATE_(\d+)", n, flags=re.I)
+                if m:
+                    queue_plates.append(int(m.group(1)))
             part_count = len(set(split_parts))
+            plate_count = len(set(queue_plates))
             type_label = self._file_type_label(name)
             if part_count:
                 type_label += f" • {part_count} parts"
+            elif plate_count:
+                type_label += f" • {plate_count} plates"
             tree.insert("", "end", iid=str(main["id"]), text=name + missing, values=(status, type_label), open=False)
             for f in helpers:
                 hp = Path(f["stored_path"])
@@ -5093,6 +5248,8 @@ class App(tk.Tk):
                 htype = self._file_type_label(hname)
                 if "_AUTO_SPLIT_" in hname.upper() and htype == "STL":
                     htype = "Split STL"
+                elif "_QUEUE_PLATE_" in hname.upper() and htype == "STL":
+                    htype = "Plate STL"
                 tree.insert(str(main["id"]), "end", iid=str(f["id"]), text=hname + hmissing, values=(hstatus, htype))
                 self._order_file_parent_map[int(f["id"])] = int(main["id"])
         chosen = str(select_id) if select_id and tree.exists(str(select_id)) else None
@@ -7710,6 +7867,89 @@ class App(tk.Tk):
             **support_fields,
         }
 
+    def _separate_stl_queue_plates(self, order_id, attachment, path):
+        """Create one STL per plate-sized group in a disconnected STL layout.
+
+        STL has no native plate metadata. Some exporters flatten objects from
+        several slicer plates into one STL by leaving disconnected bodies at
+        widely separated XY coordinates. If the full layout does not fit the P2S
+        bed but its connected bodies form bed-sized regions, keep each region
+        together and export it as a separate, queueable STL.
+        """
+        if not self._ensure_autosplit_dependencies():
+            return False
+        try:
+            import numpy as np
+            import trimesh
+            mesh=trimesh.load_mesh(str(path),force="mesh",process=False)
+            if not isinstance(mesh,trimesh.Trimesh) or mesh.is_empty or len(mesh.faces)==0:
+                raise RuntimeError("PrintFlow could not read this STL as a triangle mesh.")
+            limits=np.asarray(self._p2s_bed_limits(),dtype=float)
+            # Intentional multi-object jobs that already fit one plate remain one job.
+            if np.all(np.asarray(mesh.extents,dtype=float)<=limits+0.01):return None
+            components=[part for part in mesh.split(only_watertight=False)
+                        if isinstance(part,trimesh.Trimesh) and not part.is_empty and len(part.faces)]
+            if len(components)<2:return None
+            # One truly oversized connected solid belongs in the existing safe-cut flow.
+            if any(np.any(np.asarray(part.extents,dtype=float)>limits+0.01) for part in components):return None
+
+            def spatial_key(part):
+                center=np.asarray(part.bounds,dtype=float).mean(axis=0)
+                return (float(center[1]),float(center[0]),float(center[2]))
+
+            # Reconstruct flattened plates without rotating bodies or changing their
+            # relative placement. Nearby and overlapping shells stay together.
+            plates=[]
+            for part in sorted(components,key=spatial_key):
+                bounds=np.asarray(part.bounds,dtype=float);placed=False
+                for plate in plates:
+                    combined_min=np.minimum(plate["min"],bounds[0]);combined_max=np.maximum(plate["max"],bounds[1])
+                    if np.all((combined_max-combined_min)<=limits+0.01):
+                        plate["parts"].append(part);plate["min"],plate["max"]=combined_min,combined_max;placed=True;break
+                if not placed:plates.append({"parts":[part],"min":bounds[0].copy(),"max":bounds[1].copy()})
+            if len(plates)<2:return None
+
+            source=Path(attachment["original_name"] or attachment["stored_path"]).name
+            stem=source[:-4] if source.lower().endswith(".stl") else Path(source).stem
+            target_dir=FILES_DIR/str(order_id);target_dir.mkdir(parents=True,exist_ok=True)
+            try:
+                support_override=attachment.get("_support_enabled_override")
+                support_recommended=attachment.get("_support_recommended")
+            except Exception:
+                support_override=support_recommended=None
+            created=[]
+            for index,plate in enumerate(plates,start=1):
+                combined=trimesh.util.concatenate(tuple(plate["parts"]))
+                bounds=np.asarray(combined.bounds,dtype=float)
+                # Center each unchanged XY layout and put its lowest point on Z=0.
+                combined.apply_translation((
+                    -float((bounds[0][0]+bounds[1][0])/2.0),
+                    -float((bounds[0][1]+bounds[1][1])/2.0),
+                    -float(bounds[0][2]),
+                ))
+                name=f"{stem}_QUEUE_PLATE_{index}.stl";dest=target_dir/name
+                if dest.exists():
+                    stamp=datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    name=f"{stem}_QUEUE_PLATE_{index}_{stamp}.stl";dest=target_dir/name
+                combined.export(str(dest),file_type="stl")
+                digest=hashlib.sha256(dest.read_bytes()).hexdigest()
+                file_id,_created=self.db.add_order_file(order_id,dest,name,digest)
+                saved=dict(self.db.order_file(file_id));saved["_preflight_locked"]=True
+                if support_override is not None:
+                    saved["_support_enabled_override"]=bool(support_override)
+                    saved["_support_recommended"]=bool(support_recommended)
+                created.append(saved)
+            self.refresh_order_files(order_id)
+            self.status_flash(f"Separated multi-plate STL into {len(created)} queueable plates")
+            return created
+        except Exception as exc:
+            messagebox.showerror(
+                "Multi-plate STL check failed",
+                f"PrintFlow could not safely inspect this STL for multiple plates:\n\n{exc}\n\n"
+                "No print job was queued. The original STL was not changed.",parent=self,
+            )
+            return False
+
     def _oversize_stl_action(self, order_id, attachment, path):
         """Return None for normal flow, list of split attachments for auto split, or False when cancelled/opened manually."""
         if not self._ensure_autosplit_dependencies():
@@ -7874,6 +8114,7 @@ class App(tk.Tk):
             messagebox.showwarning("Choose a printer","Open Settings, connect to BambuBuddy, and choose the default printer.",parent=self); return False
 
         split_attachments = None
+        multi_plate_layout = False
         if is_source and lower.endswith(".stl"):
             # Every STL gets an explicit preflight first. Orientation is applied before
             # fit detection, so rotating a model can avoid an unnecessary split.
@@ -7884,14 +8125,20 @@ class App(tk.Tk):
             p = Path(attachment["stored_path"] or "")
             display_name = attachment["original_name"] or p.name
             lower = display_name.lower()
-            split_result = self._oversize_stl_action(order_id, attachment, p)
-            if split_result is False:
+            plate_result=self._separate_stl_queue_plates(order_id,attachment,p)
+            if plate_result is False:
                 return False
-            if isinstance(split_result, list):
-                split_attachments = split_result
+            if isinstance(plate_result,list):
+                split_attachments=plate_result;multi_plate_layout=True
+            else:
+                split_result = self._oversize_stl_action(order_id, attachment, p)
+                if split_result is False:return False
+                if isinstance(split_result, list):split_attachments = split_result
 
         material = row["material"] or "PLA"
-        if split_attachments:
+        if multi_plate_layout:
+            self.busy_popup(f"Auto-slicing and queueing {len(split_attachments)} detected plates as {material}…")
+        elif split_attachments:
             self.busy_popup(f"Auto-slicing and queueing {len(split_attachments)} split parts as {material}…")
         else:
             self.busy_popup((f"Auto-slicing {display_name} as {material}…" if is_source else f"Checking printer and queueing {display_name}…"))
@@ -7969,7 +8216,9 @@ class App(tk.Tk):
                         self.after(0,lambda:messagebox.showwarning("Product inventory","The remaining print was queued, but PrintFlow could not reserve the existing stock because its count changed. Please correct the stock count in Model Library.",parent=self))
                 with self.db.connect() as c:
                     c.execute("UPDATE orders SET status='Queued', updated_at=? WHERE id=?",(datetime.now().isoformat(timespec="seconds"),order_id))
-                if split_attachments:
+                if multi_plate_layout:
+                    self.after(0,lambda:self._multi_plate_print_success(order_id,busy,generated_names,last_slice_info,batch_context=batch_context))
+                elif split_attachments:
                     self.after(0, lambda: self._split_print_success(order_id, busy, generated_names, last_slice_info, batch_context=batch_context))
                 else:
                     active_attachment_name = generated_names[-1] if generated_names else display_name
@@ -8101,6 +8350,25 @@ class App(tk.Tk):
         if self.current_page == "orders": self.show_orders(order_id)
         elif self.current_page == "queue": self.show_queue(compact=self.compact)
 
+    def _multi_plate_print_success(self,order_id,busy,generated_names,slice_info=None,batch_context=None):
+        self._close_busy()
+        if batch_context is not None:
+            batch_context["completed"]=int(batch_context.get("completed",0))+1
+            batch_context.setdefault("queued_names",[]).append(batch_context.get("current_name") or "Multi-plate print")
+            self.after(100,lambda:self._print_next_batch_item(batch_context));return
+        count=len(generated_names)
+        state=(f"PrintFlow detected {count} plate layouts in the STL and added each one in Queue Only mode. "
+               "They will NOT start automatically; manually start each plate in BambuBuddy when the printer is ready.")
+        files="\n".join(f"• {name}" for name in generated_names)
+        extra=f"\n\nGenerated and queued in plate order:\n{files}"
+        if slice_info and slice_info.get("profiles"):extra+=f"\n\nProfiles: {slice_info['profiles']}"
+        if slice_info and slice_info.get("supports_enabled"):extra+="\nSupports: enabled for every generated plate from Print Preflight."
+        elif slice_info and slice_info.get("needs_support"):extra+="\n\n⚠ Supports were recommended in Print Preflight but left off."
+        messagebox.showinfo("Multiple plates queued",state+extra,parent=self)
+        self._offer_profile_recommendation(slice_info)
+        if self.current_page=="orders":self.show_orders(order_id)
+        elif self.current_page=="queue":self.show_queue(compact=self.compact)
+
     def _print_error(self, msg, batch_context=None):
         self._close_busy()
         if batch_context is not None:
@@ -8129,12 +8397,16 @@ class App(tk.Tk):
         parts = []
         for main, helpers, members in self._group_order_files_for_display(rows):
             split = []
+            queue_plates = []
             for f in members:
                 name = f["original_name"] or Path(f["stored_path"]).name
                 if name.lower().endswith(".stl") and re.search(r"_AUTO_SPLIT_[XYZ]_PART_\d+", name, flags=re.I):
                     path = Path(f["stored_path"])
                     if path.exists():
                         split.append((int(f["id"]), path, name))
+                elif name.lower().endswith(".stl") and re.search(r"_QUEUE_PLATE_\d+",name,flags=re.I):
+                    path=Path(f["stored_path"])
+                    if path.exists():queue_plates.append((int(f["id"]),path,name))
             if split:
                 # De-duplicate repeated helper rows for the same physical part.
                 seen = set()
@@ -8143,6 +8415,13 @@ class App(tk.Tk):
                     key = (self._print_file_group_key(name), int(m.group(1)) if m else name.lower())
                     if key not in seen:
                         seen.add(key); parts.append(path)
+                continue
+            if queue_plates:
+                seen=set()
+                for _fid,path,name in sorted(queue_plates):
+                    m=re.search(r"_QUEUE_PLATE_(\d+)",name,flags=re.I)
+                    key=(self._print_file_group_key(name),int(m.group(1)) if m else name.lower())
+                    if key not in seen:seen.add(key);parts.append(path)
                 continue
             name = main["original_name"] or Path(main["stored_path"]).name
             path = Path(main["stored_path"])
