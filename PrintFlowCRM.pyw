@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.81"
+VERSION = "0.7.82"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -4093,13 +4093,13 @@ class App(tk.Tk):
             if "makerworld.com" in str(row["source_url"]).lower() and not files:
                 ttk.Button(manage_actions,text="Retry Auto Download",command=lambda:self._retry_model_library_source(model_id)).pack(side="left")
         ttk.Label(self.library_detail,text=f"Source files ({len(files)})",style="CardTitle.TLabel").pack(anchor="w",pady=(18,7))
-        tree=ttk.Treeview(self.library_detail,columns=("type",),show="headings",height=max(5,min(12,len(files)+1)))
+        tree=ttk.Treeview(self.library_detail,columns=("type",),show="headings",height=max(5,min(12,len(files)+1)),selectmode="extended")
         tree.heading("type",text="File type");tree.column("type",width=90,stretch=False)
         tree["columns"]=("name","type");tree.heading("name",text="File");tree.column("name",width=430);tree.heading("type",text="Type")
         for item in files:tree.insert("","end",iid=str(item["id"]),values=(item["original_name"],Path(item["original_name"]).suffix.upper().lstrip(".")))
         tree.pack(fill="both",expand=True)
         file_actions=ttk.Frame(self.library_detail,style="Card.TFrame");file_actions.pack(fill="x",pady=(8,0))
-        ttk.Button(file_actions,text="Open/Edit Selected",command=lambda:self._open_library_source_file(model_id,tree)).pack(side="left")
+        ttk.Button(file_actions,text="Open Selected in Bambu Studio",command=lambda:self._open_library_sources_in_bambu_studio(model_id,tree)).pack(side="left")
         ttk.Button(file_actions,text="Replace Selected",command=lambda:self._replace_library_source_file(model_id,tree)).pack(side="left",padx=(7,0))
         ttk.Button(file_actions,text="Print 1 for Stock",style="Accent.TButton",command=lambda:self._print_library_file_for_stock(model_id,tree)).pack(side="left",padx=(7,0))
         bottom=ttk.Frame(self.library_detail,style="Card.TFrame");bottom.pack(fill="x",pady=(7,0))
@@ -4194,6 +4194,28 @@ class App(tk.Tk):
             self.status_flash(f"Opened {path.name} for viewing/editing")
         except Exception as exc:
             messagebox.showerror("Open source file",f"Windows could not open {path.name}.\n\n{exc}",parent=self)
+
+    def _open_library_sources_in_bambu_studio(self,model_id,tree):
+        selected=tree.selection()
+        if not selected:
+            messagebox.showinfo("Choose source files","Select one or more saved source files first. Use Ctrl+click or Shift+click to select multiple files.",parent=self);return
+        ids=[]
+        for value in selected:
+            try:ids.append(int(value))
+            except (TypeError,ValueError):pass
+        if not ids:return
+        placeholders=",".join("?" for _ in ids)
+        with self.db.connect() as c:
+            rows=c.execute(
+                f"SELECT * FROM model_library_files WHERE model_id=? AND id IN ({placeholders})",
+                [int(model_id),*ids],
+            ).fetchall()
+        by_id={int(row["id"]):row for row in rows}
+        paths=[]
+        for file_id in ids:
+            row=by_id.get(file_id)
+            if row:paths.append(Path(row["stored_path"] or ""))
+        self._open_paths_in_bambu_studio(paths,parent=self)
 
     def _replace_library_source_file(self,model_id,tree):
         row=self._selected_library_source(model_id,tree)
@@ -4890,7 +4912,7 @@ class App(tk.Tk):
             ttk.Button(fb,text="+ Add Files",style="Accent.TButton",command=lambda:self.attach_files(order_id)),
             ttk.Button(fb,text="Product Inventory",command=lambda:self.show_product_inventory_picker(order_id)),
             ttk.Button(fb,text="Change Folder",command=lambda:self.change_order_buyer_folder(order_id)),
-            ttk.Button(fb,text="Open",command=lambda:self.open_selected_file(order_id)),
+            ttk.Button(fb,text="Open Selected in Bambu Studio",command=lambda:self.open_selected_files_in_bambu_studio(order_id)),
             ttk.Button(fb,text="Remove",style="Danger.TButton",command=lambda:self.remove_selected_file(order_id)),
             ttk.Button(fb,text="Set Complete / Reset",command=lambda:self.toggle_selected_file_printed(order_id)),
             ttk.Button(fb,text="Queue Selected",command=lambda:self.print_selected_attachments(order_id)),
@@ -5956,6 +5978,92 @@ class App(tk.Tk):
             else: webbrowser.open(p.as_uri())
         except Exception as e:
             messagebox.showerror("Open failed",str(e),parent=self)
+
+    def _find_bambu_studio_executable(self):
+        """Locate the installed Bambu Studio GUI without depending on STL associations."""
+        configured=(self.db.get_setting("bambu_studio_executable","") or "").strip()
+        if configured and Path(configured).is_file():
+            return Path(configured)
+        found=shutil.which("bambu-studio.exe" if os.name=="nt" else "bambu-studio")
+        if found:return Path(found)
+        if os.name!="nt":return None
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER,winreg.HKEY_LOCAL_MACHINE):
+                for view in (0,getattr(winreg,"KEY_WOW64_64KEY",0),getattr(winreg,"KEY_WOW64_32KEY",0)):
+                    try:
+                        with winreg.OpenKey(hive,r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\bambu-studio.exe",0,winreg.KEY_READ|view) as key:
+                            value=Path(winreg.QueryValue(key,None).strip('"'))
+                            if value.is_file():return value
+                    except OSError:pass
+        except Exception:pass
+        roots=[]
+        for env_name in ("PROGRAMFILES","PROGRAMFILES(X86)","LOCALAPPDATA"):
+            value=os.getenv(env_name)
+            if value:roots.append(Path(value))
+        # Bambu Studio may be installed on a non-system drive (including the
+        # user's current E: installation), so check standard Program Files paths.
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            roots.extend((Path(f"{letter}:\\Program Files"),Path(f"{letter}:\\Program Files (x86)")))
+        relatives=(
+            Path("Bambu Studio")/"bambu-studio.exe",
+            Path("BambuStudio")/"bambu-studio.exe",
+            Path("Programs")/"Bambu Studio"/"bambu-studio.exe",
+        )
+        seen=set()
+        for root in roots:
+            for relative in relatives:
+                candidate=root/relative
+                key=str(candidate).lower()
+                if key in seen:continue
+                seen.add(key)
+                if candidate.is_file():return candidate
+        return None
+
+    @staticmethod
+    def _bambu_studio_source_path(path):
+        p=Path(path)
+        name=p.name.lower()
+        return p.is_file() and name.endswith((".stl",".3mf",".step",".stp",".obj",".amf"))
+
+    def _open_paths_in_bambu_studio(self,paths,parent=None):
+        """Launch Bambu Studio once with every selected source model."""
+        chosen=[];seen=set();missing=[];unsupported=[]
+        for value in paths:
+            p=Path(value)
+            key=str(p.resolve() if p.exists() else p).lower()
+            if key in seen:continue
+            seen.add(key)
+            if not p.is_file():missing.append(p.name or str(p))
+            elif not self._bambu_studio_source_path(p):unsupported.append(p.name)
+            else:chosen.append(p)
+        if missing:
+            messagebox.showerror("Missing source files","These selected files could not be found:\n\n"+"\n".join(missing[:12]),parent=parent or self);return False
+        if unsupported:
+            messagebox.showwarning("Unsupported Bambu Studio files","Select STL, unsliced 3MF, STEP, STP, OBJ, or AMF source files.\n\nNot opened:\n"+"\n".join(unsupported[:12]),parent=parent or self);return False
+        if not chosen:
+            messagebox.showinfo("Choose source files","Select one or more source models first.",parent=parent or self);return False
+        executable=self._find_bambu_studio_executable()
+        if not executable:
+            messagebox.showerror(
+                "Bambu Studio not found",
+                "PrintFlow could not locate bambu-studio.exe. Reinstall Bambu Studio or open it once from Windows, then try again.",
+                parent=parent or self,
+            );return False
+        try:
+            # One process with all paths is intentional: Bambu Studio imports
+            # every model into the same project instead of opening one at a time.
+            subprocess.Popen([str(executable),*[str(p) for p in chosen]],cwd=str(executable.parent))
+            self.status_flash(f"Opened {len(chosen)} file{'s' if len(chosen)!=1 else ''} together in Bambu Studio")
+            return True
+        except Exception as exc:
+            messagebox.showerror("Open in Bambu Studio",f"PrintFlow could not open the selected files together.\n\n{exc}",parent=parent or self);return False
+
+    def open_selected_files_in_bambu_studio(self,order_id):
+        rows=self._selected_order_files(order_id)
+        if not rows:
+            messagebox.showwarning("Choose files","Select one or more source files first. Use Ctrl+click or Shift+click to select multiple files.",parent=self);return
+        self._open_paths_in_bambu_studio([row["stored_path"] for row in rows],parent=self)
 
     def open_attached_file(self, order_id):
         self.open_selected_file(order_id)
@@ -9324,7 +9432,7 @@ class App(tk.Tk):
         ttk.Label(outer,text=buyer["name"],style="Title.TLabel").pack(anchor="w")
         path_label = ttk.Label(outer,text=str(root),justify="left")
         path_label.pack(fill="x",anchor="w",pady=(2,4))
-        help_label = ttk.Label(outer,text="3D-printing and modeling files found in this customer folder and its subfolders. Double-click a file to open it.",justify="left")
+        help_label = ttk.Label(outer,text="3D-printing and modeling files found in this customer folder and its subfolders. Use Ctrl+click or Shift+click, then open all selected source models together in Bambu Studio.",justify="left")
         help_label.pack(fill="x",pady=(0,8))
         outer.bind("<Configure>",lambda e: (path_label.configure(wraplength=max(300,e.width-28)),help_label.configure(wraplength=max(300,e.width-28))),add="+")
 
@@ -9361,12 +9469,8 @@ class App(tk.Tk):
             return [paths[i] for i in tree.selection() if i in paths]
         def open_selected():
             chosen=selected_paths()
-            if not chosen: messagebox.showwarning("Choose a file","Select a file first.",parent=win); return
-            for p in chosen[:10]:
-                try:
-                    if os.name=="nt": os.startfile(str(p))
-                    else: webbrowser.open(p.as_uri())
-                except Exception as exc: messagebox.showerror("Open failed",str(exc),parent=win); break
+            if not chosen: messagebox.showwarning("Choose files","Select one or more source files first.",parent=win); return
+            self._open_paths_in_bambu_studio(chosen,parent=win)
         def attach_selected():
             chosen=selected_paths()
             if not chosen: messagebox.showwarning("Choose files","Select one or more files to attach to this order.",parent=win); return
@@ -9383,7 +9487,7 @@ class App(tk.Tk):
         actions=ttk.Frame(bottom); actions.pack(side="right")
         ttk.Button(actions,text="Refresh",command=refresh).pack(side="left",padx=3)
         ttk.Button(actions,text="Open Folder in Explorer",command=open_explorer).pack(side="left",padx=3)
-        ttk.Button(actions,text="Open",command=open_selected).pack(side="left",padx=3)
+        ttk.Button(actions,text="Open Selected in Bambu Studio",command=open_selected).pack(side="left",padx=3)
         ttk.Button(actions,text="Attach Selected to Order",style="Accent.TButton",command=attach_selected).pack(side="left",padx=3)
         ttk.Button(actions,text="Close",command=win.destroy).pack(side="left",padx=(3,0))
         tree.bind("<Double-1>",lambda e: open_selected())
