@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.82
+
+- Added Open Selected in Bambu Studio to customer orders, customer folders, and Model Library source files.
+- Added Ctrl/Shift multi-selection to Model Library source files.
+- Launches Bambu Studio once with every selected model so the files load together into one project for arranging, slicing, and printing.
+- Added reliable Bambu Studio discovery through Windows App Paths and standard installations on secondary drives.
+
 ## 0.7.81
 
 - Added an automatic STL plate-layout check after Print Preflight and before any source file is sent to BambuBuddy.
