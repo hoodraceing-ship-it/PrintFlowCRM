@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.82"
+VERSION = "0.7.83"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -6020,6 +6020,31 @@ class App(tk.Tk):
                 if candidate.is_file():return candidate
         return None
 
+    def _choose_bambu_studio_executable(self,parent=None):
+        """Let the user locate a portable or nonstandard Bambu Studio install once."""
+        initialdir=""
+        for candidate in (
+            Path(r"E:\Program Files\Bambu Studio"),
+            Path(r"E:\Bambu Studio"),
+            Path(os.getenv("PROGRAMFILES") or r"C:\Program Files")/"Bambu Studio",
+        ):
+            if candidate.is_dir():
+                initialdir=str(candidate);break
+        selected=filedialog.askopenfilename(
+            parent=parent or self,
+            title="Locate Bambu Studio",
+            initialdir=initialdir or None,
+            filetypes=[("Bambu Studio","bambu-studio.exe"),("Windows applications","*.exe")],
+        )
+        if not selected:return None
+        executable=Path(selected)
+        if not executable.is_file() or executable.name.lower()!="bambu-studio.exe":
+            messagebox.showwarning("Wrong application","Select the file named bambu-studio.exe inside your Bambu Studio installation folder.",parent=parent or self)
+            return None
+        self.db.set_setting("bambu_studio_executable",str(executable))
+        self.status_flash("Bambu Studio location saved")
+        return executable
+
     @staticmethod
     def _bambu_studio_source_path(path):
         p=Path(path)
@@ -6045,11 +6070,14 @@ class App(tk.Tk):
             messagebox.showinfo("Choose source files","Select one or more source models first.",parent=parent or self);return False
         executable=self._find_bambu_studio_executable()
         if not executable:
-            messagebox.showerror(
+            locate=messagebox.askyesno(
                 "Bambu Studio not found",
-                "PrintFlow could not locate bambu-studio.exe. Reinstall Bambu Studio or open it once from Windows, then try again.",
+                "PrintFlow could not automatically locate bambu-studio.exe.\n\nWould you like to find it now? PrintFlow will save the location so you only have to choose it once.",
                 parent=parent or self,
-            );return False
+            )
+            if not locate:return False
+            executable=self._choose_bambu_studio_executable(parent=parent)
+            if not executable:return False
         try:
             # One process with all paths is intentional: Bambu Studio imports
             # every model into the same project instead of opening one at a time.
