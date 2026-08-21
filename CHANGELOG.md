@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.83
+
+- Added a one-time Bambu Studio file picker when automatic executable detection fails.
+- Saves the selected `bambu-studio.exe` location permanently and continues the original multi-file open immediately.
+- Prefills the picker from common E: and C: installation folders without requiring Bambu Studio to be reinstalled.
+
 ## 0.7.82
 
 - Added Open Selected in Bambu Studio to customer orders, customer folders, and Model Library source files.
