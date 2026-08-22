@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.83"
+VERSION = "0.7.84"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -201,6 +201,8 @@ MESSENGER_PAYMENT_REQUEST_FILE = DATA_DIR / "messenger_payment_request.json"
 PIRATESHIP_SCAN_REQUEST_FILE = DATA_DIR / "pirateship_scan_request.json"
 PIRATESHIP_SCAN_RESULT_FILE = DATA_DIR / "pirateship_scan_result.json"
 PIRATESHIP_LABEL_RESULT_FILE = DATA_DIR / "pirateship_label_result.json"
+TRACKING_BROWSER_REQUEST_FILE = DATA_DIR / "tracking_browser_request.json"
+TRACKING_BROWSER_RESULT_FILE = DATA_DIR / "tracking_browser_result.json"
 PYTHON_PACKAGES_DIR = DATA_DIR / "python_packages"
 PYTHON_PACKAGES_STAGING_DIR = DATA_DIR / "python_packages_staging"
 PYTHON_PACKAGES_BACKUP_DIR = DATA_DIR / "python_packages_previous"
@@ -2012,6 +2014,7 @@ class App(tk.Tk):
         self._messenger_capture_seen = ""
         self._pirateship_result_seen = ""
         self._pirateship_label_seen = ""
+        self._tracking_browser_seen = ""
         try:
             if MESSENGER_CAPTURE_FILE.exists():
                 self._messenger_capture_seen = json.loads(MESSENGER_CAPTURE_FILE.read_text(encoding="utf-8")).get("captured_at", "")
@@ -2025,6 +2028,11 @@ class App(tk.Tk):
         try:
             if PIRATESHIP_LABEL_RESULT_FILE.exists():
                 self._pirateship_label_seen=json.loads(PIRATESHIP_LABEL_RESULT_FILE.read_text(encoding="utf-8")).get("captured_at","")
+        except Exception:
+            pass
+        try:
+            if TRACKING_BROWSER_RESULT_FILE.exists():
+                self._tracking_browser_seen=json.loads(TRACKING_BROWSER_RESULT_FILE.read_text(encoding="utf-8")).get("captured_at","")
         except Exception:
             pass
         self._configure_styles()
@@ -2050,6 +2058,7 @@ class App(tk.Tk):
         # Keep file-level queue/printing/completion states synchronized with BambuBuddy.
         self.after(1800, self._schedule_print_status_sync)
         self.after(5000, self._schedule_tracking_status_sync)
+        self.after(2500, self._poll_tracking_browser_result)
         self.after(2200, self._poll_pirateship_scan_result)
         # Persisted delayed customer messages survive restarts and dispatch when due.
         self.after(6000, self._dispatch_scheduled_messages)
@@ -5718,7 +5727,49 @@ class App(tk.Tk):
         if not tracking_no:
             messagebox.showwarning("Check tracking","Enter the tracking number on this order first.",parent=self)
             return
-        webbrowser.open(self._carrier_tracking_url(tracking_no))
+        url=self._carrier_tracking_url(tracking_no)
+        helper=Path(sys.argv[0]).resolve().parent/"TrackingCapture.pyw"
+        if os.name=="nt" and helper.is_file() and self._pywebview_available():
+            try:
+                request={"order_id":int(order_id),"tracking_no":tracking_no,"url":url}
+                tmp=Path(tempfile.gettempdir())/f"printflow-tracking-request-{os.getpid()}.json"
+                tmp.write_text(json.dumps(request,ensure_ascii=False),encoding="utf-8")
+                tmp.replace(TRACKING_BROWSER_REQUEST_FILE)
+                creationflags=0x08000000
+                subprocess.Popen([sys.executable,str(helper)],cwd=str(helper.parent),creationflags=creationflags)
+                self.status_flash("Shipment tracking opened • PrintFlow will capture the rendered carrier status")
+                return
+            except Exception as exc:
+                self._log_app_event("Warning","Shipment Tracking","Monitored tracking browser could not start",str(exc))
+        webbrowser.open(url)
+        self.status_flash("Tracking opened in your browser • automatic rendered-status capture is unavailable")
+
+    def _poll_tracking_browser_result(self):
+        try:
+            if TRACKING_BROWSER_RESULT_FILE.exists():
+                data=json.loads(TRACKING_BROWSER_RESULT_FILE.read_text(encoding="utf-8"))
+                stamp=(data.get("captured_at") or "").strip()
+                if stamp and stamp!=self._tracking_browser_seen:
+                    self._tracking_browser_seen=stamp
+                    order_id=int(data.get("order_id") or 0)
+                    row=self.db.order(order_id)
+                    expected=re.sub(r"[^A-Za-z0-9]","",str(row["tracking_no"] if row else "")).upper()
+                    captured=re.sub(r"[^A-Za-z0-9]","",str(data.get("tracking_no") or "")).upper()
+                    if row and expected and captured==expected:
+                        stage=(data.get("status") or "").strip().lower()
+                        new_status="Delivered" if stage=="delivered" else ("Shipped" if stage in {"in_transit","out_for_delivery"} else None)
+                        # Never downgrade a delivered/completed order if a carrier page
+                        # later exposes an older transit event while loading history.
+                        current=str(row["status"] or "")
+                        if new_status and not (current in {"Delivered","Complete"} and new_status=="Shipped"):
+                            if new_status!=current:self.db.set_order_status(order_id,new_status)
+                            self.db.update_tracking_sync(order_id,captured,f"Rendered carrier page: {stage.replace('_',' ').title()}")
+                            self.status_flash(f"Tracking verified • {row['order_no']} • {new_status}")
+                            if self.current_page=="orders":self.show_orders(order_id)
+        except Exception as exc:
+            self._log_app_event("Warning","Shipment Tracking","Rendered tracking result could not be applied",str(exc))
+        finally:
+            self.after(1500,self._poll_tracking_browser_result)
 
     def mark_shipping_status(self, order_id, status):
         if status not in {"Shipped","Delivered"}:
@@ -6447,6 +6498,49 @@ class App(tk.Tk):
         self.db.set_order_file_bambuddy_id(file_id, library_file_id)
         return self.db.order_file(file_id)
 
+    @staticmethod
+    def _insert_pause_before_final_two_layers(gcode):
+        """Insert one Bambu user pause at the start of the penultimate layer."""
+        if "PrintFlow color swap: final two layers" in gcode:
+            return gcode, False
+        markers=[]
+        for match in re.finditer(r"(?im)^\s*;\s*layer\s+num/total_layer_count\s*:\s*\d+\s*/\s*\d+.*$",gcode):
+            markers.append(match.start())
+        if len(markers)<2:
+            markers=[match.start() for match in re.finditer(r"(?im)^\s*;\s*LAYER_CHANGE\s*$",gcode)]
+        if len(markers)<2:
+            return gcode,False
+        insert_at=markers[-2]
+        pause="; PrintFlow color swap: final two layers\nM400 U1\n"
+        return gcode[:insert_at]+pause+gcode[insert_at:],True
+
+    def _apply_final_two_layer_pause(self,client,sliced_attachment):
+        """Patch the generated 3MF G-code, upload it, and point the order at that copy."""
+        path=Path(sliced_attachment["stored_path"] or "")
+        if not path.is_file() or not zipfile.is_zipfile(path):
+            raise RuntimeError("PrintFlow could not open the sliced .gcode.3mf to add the final-layer color swap.")
+        temp=path.with_name(path.name+".pause.tmp")
+        changed=False
+        try:
+            with zipfile.ZipFile(path,"r") as source,zipfile.ZipFile(temp,"w") as output:
+                for info in source.infolist():
+                    data=source.read(info.filename)
+                    if info.filename.lower().endswith(".gcode"):
+                        text=data.decode("utf-8",errors="replace")
+                        text,entry_changed=self._insert_pause_before_final_two_layers(text)
+                        if entry_changed:
+                            data=text.encode("utf-8");changed=True
+                    output.writestr(info,data)
+            if not changed:
+                raise RuntimeError("No printable G-code plate was found for the final-layer color swap.")
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
+        uploaded=client.upload_file(path)
+        library_file_id=self._uploaded_library_id(uploaded)
+        self.db.set_order_file_bambuddy_id(int(sliced_attachment["id"]),library_file_id)
+        return self.db.order_file(int(sliced_attachment["id"]))
+
     def _stl_likely_needs_support(self, path):
         """Conservative geometry heuristic: meaningful downward-facing area above the bed."""
         try:
@@ -6598,6 +6692,13 @@ class App(tk.Tk):
                         + "\n\n" + preset_info
                     ) from None
         sliced_attachment = self._save_sliced_result_to_order(client, row["id"], attachment, result)
+        try:
+            pause_final_layers=bool(attachment.get("_pause_final_two_layers"))
+        except Exception:
+            pause_final_layers=False
+        if pause_final_layers:
+            sliced_attachment=self._apply_final_two_layer_pause(client,sliced_attachment)
+            picked["pause_final_two_layers"]=True
         return sliced_attachment, picked, result
 
     @staticmethod
@@ -7737,7 +7838,8 @@ class App(tk.Tk):
                 preview_original = original
         transform = np.eye(4)
         result = {"ok": False, "mesh": None, "auto": False, "changed": False,
-                  "supports_enabled": False, "supports_recommended": False}
+                  "supports_enabled": False, "supports_recommended": False,
+                  "pause_final_two_layers": False}
 
         win = tk.Toplevel(self)
         win.title("Print Preflight & Orientation")
@@ -7770,6 +7872,16 @@ class App(tk.Tk):
             activeforeground="#ffffff", selectcolor="#111b28", font=("Segoe UI", 9, "bold")
         )
         support_toggle.pack(side="right", padx=(12, 0))
+
+        color_swap_var=tk.BooleanVar(value=False)
+        color_swap_row=tk.Frame(outer,bg="#172337",highlightthickness=1,highlightbackground="#35506f",padx=10,pady=7)
+        color_swap_row.pack(fill="x",pady=(0,8))
+        tk.Checkbutton(color_swap_row,text="Pause for color swap",variable=color_swap_var,bg="#172337",fg="#ffffff",
+                       activebackground="#172337",activeforeground="#ffffff",selectcolor="#111b28",
+                       font=("Segoe UI",9,"bold")).pack(side="right",padx=(12,0))
+        tk.Label(color_swap_row,text="Two-color top layers",bg="#172337",fg="#ffffff",font=("Segoe UI",9,"bold")).pack(side="left")
+        tk.Label(color_swap_row,text="Pause before the final 2 layers so you can swap filament color, then resume the printer.",
+                 bg="#172337",fg="#a9bdd2",font=("Segoe UI",9),wraplength=500,justify="left").pack(side="left",fill="x",expand=True,padx=(12,0))
 
         vf = tk.Frame(outer, bg="#111b28", highlightthickness=1, highlightbackground="#334155")
         vf.pack(fill="both", expand=True)
@@ -7960,6 +8072,7 @@ class App(tk.Tk):
             if ok:
                 result["mesh"]=oriented_mesh()
                 result["supports_enabled"] = bool(support_var.get())
+                result["pause_final_two_layers"] = bool(color_swap_var.get())
                 self.db.set_setting("slicer_bed_type",plate_var.get().strip() or "Textured PEI Plate")
             win.destroy()
         tk.Button(buttons,text="Cancel",width=13,command=lambda:choose(False)).pack(side="right")
@@ -7981,6 +8094,7 @@ class App(tk.Tk):
         support_fields = {
             "_support_enabled_override": bool(result.get("supports_enabled")),
             "_support_recommended": bool(result.get("supports_recommended")),
+            "_pause_final_two_layers": bool(result.get("pause_final_two_layers")),
         }
         if not result.get("changed"):
             prepared = dict(attachment)
@@ -8051,8 +8165,9 @@ class App(tk.Tk):
             try:
                 support_override=attachment.get("_support_enabled_override")
                 support_recommended=attachment.get("_support_recommended")
+                pause_final_layers=attachment.get("_pause_final_two_layers")
             except Exception:
-                support_override=support_recommended=None
+                support_override=support_recommended=pause_final_layers=None
             created=[]
             for index,plate in enumerate(plates,start=1):
                 combined=trimesh.util.concatenate(tuple(plate["parts"]))
@@ -8074,6 +8189,8 @@ class App(tk.Tk):
                 if support_override is not None:
                     saved["_support_enabled_override"]=bool(support_override)
                     saved["_support_recommended"]=bool(support_recommended)
+                if pause_final_layers is not None:
+                    saved["_pause_final_two_layers"]=bool(pause_final_layers)
                 created.append(saved)
             self.refresh_order_files(order_id)
             self.status_flash(f"Separated multi-plate STL into {len(created)} queueable plates")
@@ -8142,14 +8259,18 @@ class App(tk.Tk):
             try:
                 support_override = attachment.get("_support_enabled_override")
                 support_recommended = attachment.get("_support_recommended")
+                pause_final_layers = attachment.get("_pause_final_two_layers")
             except Exception:
-                support_override = support_recommended = None
-            if support_override is not None:
+                support_override = support_recommended = pause_final_layers = None
+            if support_override is not None or pause_final_layers is not None:
                 wrapped = []
                 for part in parts:
                     item = dict(part)
-                    item["_support_enabled_override"] = bool(support_override)
-                    item["_support_recommended"] = bool(support_recommended)
+                    if support_override is not None:
+                        item["_support_enabled_override"] = bool(support_override)
+                        item["_support_recommended"] = bool(support_recommended)
+                    if pause_final_layers is not None:
+                        item["_pause_final_two_layers"] = bool(pause_final_layers)
                     wrapped.append(item)
                 parts = wrapped
             self.refresh_order_files(order_id)
@@ -8304,6 +8425,7 @@ class App(tk.Tk):
                             "orientation_mode": picked.get("orientation_mode"),
                             "auto_orient_used": picked.get("auto_orient_used"),
                             "orientation_fallback": picked.get("orientation_fallback"),
+                            "pause_final_two_layers": picked.get("pause_final_two_layers",False),
                         }
                     file_id = active_attachment["bambuddy_library_file_id"]
                     if not file_id:

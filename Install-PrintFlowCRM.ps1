@@ -73,7 +73,7 @@ if ($WasInstalled) {
     }
 }
 
-foreach ($name in @('PrintFlowCRM.pyw','MessengerCapture.pyw','PirateShipCapture.pyw','SetupWizard.pyw','hood-layerworks-label.png','update_manifest.json','requirements.txt')) {
+foreach ($name in @('PrintFlowCRM.pyw','MessengerCapture.pyw','PirateShipCapture.pyw','TrackingCapture.pyw','SetupWizard.pyw','hood-layerworks-label.png','update_manifest.json','requirements.txt')) {
     $src = Join-Path $Source $name
     if (-not (Test-Path $src)) { throw "Installer package is missing $name" }
     Copy-Item $src (Join-Path $InstallDir $name) -Force

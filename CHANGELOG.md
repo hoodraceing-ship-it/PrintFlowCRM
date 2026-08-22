@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.84
+
+- Added a Print Preflight option that pauses immediately before the final two layers for a manual filament-color swap.
+- Patches the sliced Bambu `.gcode.3mf`, uploads the color-swap copy to BambuBuddy, and queues that verified copy automatically.
+- Changed Track Shipment to use a monitored in-app carrier browser for UPS and USPS when WebView2 is available.
+- Reads the fully rendered tracking result, verifies the exact tracking number, and automatically changes the matching order to Delivered.
+- Uses green delivered-status verification and strong delivered-event wording so an unfinished UPS timeline cannot falsely complete an order.
+- Retains the normal external-browser fallback if the monitored browser component is unavailable.
+
 ## 0.7.83
 
 - Added a one-time Bambu Studio file picker when automatic executable detection fails.

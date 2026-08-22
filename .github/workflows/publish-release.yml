@@ -7,6 +7,7 @@ on:
       - 'PrintFlowCRM.pyw'
       - 'MessengerCapture.pyw'
       - 'PirateShipCapture.pyw'
+      - 'TrackingCapture.pyw'
       - 'SetupWizard.pyw'
       - 'hood-layerworks-label.png'
       - 'requirements.txt'
@@ -35,7 +36,7 @@ jobs:
       - name: Validate sources
         shell: pwsh
         run: |
-          python -m py_compile PrintFlowCRM.pyw MessengerCapture.pyw PirateShipCapture.pyw SetupWizard.pyw
+          python -m py_compile PrintFlowCRM.pyw MessengerCapture.pyw PirateShipCapture.pyw TrackingCapture.pyw SetupWizard.pyw
           $m = Get-Content update_manifest.json -Raw | ConvertFrom-Json
           foreach ($file in $m.app_files) {
             if (-not (Test-Path $file)) { throw "Manifest file missing: $file" }
@@ -78,6 +79,7 @@ jobs:
             'PrintFlowCRM.pyw',
             'MessengerCapture.pyw',
             'PirateShipCapture.pyw',
+            'TrackingCapture.pyw',
             'SetupWizard.pyw',
             'hood-layerworks-label.png',
             'requirements.txt',
