@@ -7,6 +7,7 @@ Pillow>=11.0
 pypdf>=6.0
 numpy>=2.0
 trimesh>=4.0
+lxml>=5.0
 shapely>=2.0
 scipy>=1.14
 networkx>=3.0
