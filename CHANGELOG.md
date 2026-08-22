@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.89
+
+- Fixed Product Inventory design 3MF files showing Fit check unavailable by loading complete 3MF scenes with their saved transforms.
+- Added design 3MF sources to Shipping Package Recalculate instead of incorrectly reporting that no usable STL geometry exists.
+- Added the missing lxml 3MF loader dependency to PrintFlow's verified private mesh environment.
+- Prepare Shipping Label now confirms the verified CSV byte size and copies its full path to the clipboard for direct paste into Pirate Ship's Open window.
+
 ## 0.7.88
 
 - Fixed paid orders failing to leave a Pirate Ship CSV in the exports folder when optional package-size detection was unavailable.
