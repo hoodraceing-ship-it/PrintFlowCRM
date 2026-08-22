@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.87
+
+- Added A1 Mini build-volume support throughout automatic fit checking and the one-cut Auto Split workflow.
+- Added a Printer Fit marker to every customer print file showing whether it fits the A1 Mini or P2S directly, with one cut, or not within the one-cut limit.
+- Kept slicer preset selection, live camera/status, pause/resume/stop, and Pause at Layer tied to the printer selected in the top bar.
+
 ## 0.7.86
 
 - Added an adjustable Pause at Layer control beside the live printer status for prints already running.
