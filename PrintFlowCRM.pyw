@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.88"
+VERSION = "0.7.89"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -238,6 +238,7 @@ if str(PYTHON_PACKAGES_DIR) not in sys.path:
 AUTOSPLIT_DEPENDENCIES = (
     ("numpy", "numpy>=2.0"),
     ("trimesh", "trimesh>=4.0"),
+    ("lxml", "lxml>=5.0"),
     ("shapely", "shapely>=2.0"),
     ("scipy", "scipy>=1.14"),
     ("networkx", "networkx>=3.0"),
@@ -6907,15 +6908,38 @@ class App(tk.Tk):
         self._printer_fit_cache[key]=result
         return result
 
+    @staticmethod
+    def _load_source_mesh(path, process=False):
+        """Load STL or design 3MF geometry and preserve 3MF scene transforms."""
+        import trimesh
+        loaded = trimesh.load(str(path), process=process)
+        if isinstance(loaded, trimesh.Trimesh):
+            mesh = loaded
+        elif isinstance(loaded, trimesh.Scene):
+            if not loaded.geometry:
+                raise RuntimeError("The 3MF does not contain printable mesh geometry.")
+            try:
+                mesh = loaded.to_geometry()
+            except Exception:
+                mesh = loaded.dump(concatenate=True)
+        elif hasattr(loaded, "geometry") and loaded.geometry:
+            scene = trimesh.Scene(loaded)
+            try:
+                mesh = scene.to_geometry()
+            except Exception:
+                mesh = scene.dump(concatenate=True)
+        else:
+            raise RuntimeError("The source file could not be read as a triangle mesh.")
+        if not isinstance(mesh, trimesh.Trimesh) or mesh.is_empty or len(mesh.faces) == 0:
+            raise RuntimeError("The source file does not contain usable triangle geometry.")
+        return mesh
+
     def _stl_mesh_info(self, path):
-        """Return STL bounds/extents using trimesh. Installed on demand for auto-split."""
+        """Return STL or design-3MF bounds/extents using the shared source loader."""
         try:
-            import trimesh
-        except Exception:
+            mesh = self._load_source_mesh(path, process=False)
+        except ImportError:
             return None
-        mesh = trimesh.load_mesh(str(path), force="mesh", process=False)
-        if mesh is None or getattr(mesh, "is_empty", True):
-            raise RuntimeError("The STL could not be read as a mesh.")
         ext = tuple(float(v) for v in mesh.extents)
         bounds = [[float(v) for v in row] for row in mesh.bounds]
         return {"mesh": mesh, "extents": ext, "bounds": bounds}
@@ -8849,12 +8873,12 @@ class App(tk.Tk):
         messagebox.showerror("BambuBuddy error",msg,parent=self)
 
     def _shipping_stl_parts(self, order_id):
-        """Return the final physical STL parts for package sizing.
+        """Return final physical STL or design-3MF sources for package sizing.
 
         If PrintFlow created split STLs for a source file, use those split parts and
         ignore the original oversized source/preflight helper. Otherwise use the
-        user's original STL. G-code files are intentionally ignored because the STL
-        geometry is the physical object being packed.
+        user's original STL or Product Inventory design 3MF. Sliced G-code 3MF files
+        are intentionally ignored because their toolpaths are not source geometry.
         """
         rows = self.db.order_files(order_id)
         parts = []
@@ -8888,7 +8912,8 @@ class App(tk.Tk):
                 continue
             name = main["original_name"] or Path(main["stored_path"]).name
             path = Path(main["stored_path"])
-            if name.lower().endswith(".stl") and path.exists():
+            lower = name.lower()
+            if (lower.endswith(".stl") or (lower.endswith(".3mf") and not lower.endswith(".gcode.3mf"))) and path.exists():
                 parts.append(path)
         return parts
 
@@ -8982,10 +9007,8 @@ class App(tk.Tk):
         import trimesh
         dims=[]; used=[]
         for path in self._shipping_stl_parts(order_id):
-            mesh=trimesh.load_mesh(str(path), force="mesh", process=False)
-            if hasattr(mesh,"geometry") and not hasattr(mesh,"vertices"):
-                mesh=trimesh.util.concatenate(tuple(mesh.geometry.values()))
-            ext=[float(v)/25.4 for v in mesh.extents]  # STL mm -> inches
+            mesh=self._load_source_mesh(path, process=False)
+            ext=[float(v)/25.4 for v in mesh.extents]  # source geometry mm -> inches
             if min(ext) <= 0: continue
             dims.append(tuple(ext)); used.append(path.name)
         packed=self._box_pack_heuristic(dims)
@@ -9687,6 +9710,12 @@ class App(tk.Tk):
                                  f"Could not save the Pirate Ship CSV.\n\nFolder: {EXPORT_DIR}\n\n{type(e).__name__}: {e}",
                                  parent=self); return
         try:
+            self.clipboard_clear()
+            self.clipboard_append(str(path))
+            self.update_idletasks()
+        except Exception:
+            pass
+        try:
             if os.name == "nt":
                 subprocess.Popen(["explorer.exe", f"/select,{path}"])
         except Exception:
@@ -9700,7 +9729,7 @@ class App(tk.Tk):
         if self.current_page == "orders":
             self.show_orders(order_id)
         messagebox.showinfo("Ready to ship",
-                            f"{shipping_payment_text}.\n\nPirate Ship has been opened inside PrintFlow and the CSV is ready here:\n{path}\n\nAfter you purchase the label and open its shipment page, PrintFlow will capture the tracking number and mark the order Packed.",
+                            f"{shipping_payment_text}.\n\nVerified CSV ({path.stat().st_size:,} bytes):\n{path}\n\nThe full path was copied to your clipboard. In Pirate Ship's Open window, press Ctrl+V and Enter.\n\nAfter you purchase the label and open its shipment page, PrintFlow will capture the tracking number and mark the order Packed.",
                             parent=self)
 
     def export_pirateship(self, order_id):
