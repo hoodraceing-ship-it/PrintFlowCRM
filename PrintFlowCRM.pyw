@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.85"
+VERSION = "0.7.86"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2004,6 +2004,8 @@ class App(tk.Tk):
         self._top_printer_details = {}
         self._top_printer_loading = False
         self._top_printer_polling = False
+        self._top_printer_last_status = {}
+        self._printer_pause_targets = {}
         self._top_printer_load_generation = 0
         self._printer_camera_generation = 0
         self._printer_camera_stopping = False
@@ -2371,7 +2373,7 @@ class App(tk.Tk):
         # Persistent printer telemetry. This frame is outside self.main, so it
         # stays visible while the user moves between every PrintFlow page.
         self.printer_strip = tk.Frame(
-            self.content_shell, bg="#111923", height=112,
+            self.content_shell, bg="#111923", height=140,
             highlightthickness=1, highlightbackground=self.BORDER,
         )
         self.printer_strip.pack(fill="x")
@@ -2437,6 +2439,23 @@ class App(tk.Tk):
             font=("Segoe UI", 8), anchor="w",
         )
         self.top_printer_detail.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        self.pause_layer_row=tk.Frame(self.printer_telemetry_frame,bg="#111923")
+        self.pause_layer_row.grid(row=4,column=0,sticky="ew",pady=(5,0))
+        tk.Label(self.pause_layer_row,text="PAUSE AT LAYER",bg="#111923",fg=self.MUTED,
+                 font=("Segoe UI Semibold",7)).pack(side="left")
+        self.pause_layer_var=tk.StringVar()
+        self.pause_layer_spin=ttk.Spinbox(self.pause_layer_row,from_=1,to=99999,width=7,textvariable=self.pause_layer_var)
+        self.pause_layer_spin.pack(side="left",padx=(7,4))
+        self.pause_layer_set=ttk.Button(self.pause_layer_row,text="Set",width=6,command=self._set_pause_at_layer)
+        self.pause_layer_set.pack(side="left",padx=(0,4))
+        self.pause_layer_clear=ttk.Button(self.pause_layer_row,text="Clear",width=7,command=self._clear_pause_at_layer)
+        self.pause_layer_clear.pack(side="left")
+        self.pause_layer_status=tk.Label(self.pause_layer_row,text="Choose a future layer while a print is running",
+                                         bg="#111923",fg=self.MUTED,font=("Segoe UI",8),anchor="w")
+        self.pause_layer_status.pack(side="left",fill="x",expand=True,padx=(10,0))
+        self.pause_layer_spin.configure(state="disabled")
+        self.pause_layer_set.configure(state="disabled")
+        self.pause_layer_clear.configure(state="disabled")
 
         self.printer_camera_frame = tk.Frame(self.printer_strip, bg="#111923")
         self.printer_camera_frame.grid(row=0, column=2, sticky="nse", padx=(0, 14), pady=9)
@@ -2522,6 +2541,59 @@ class App(tk.Tk):
                 self.after(0,lambda error=str(exc):self._printer_control_finished("",error))
         threading.Thread(target=work,daemon=True).start()
 
+    def _set_pause_at_layer(self):
+        printer_id=self._selected_top_printer_id()
+        status=self._top_printer_last_status if str(self._top_printer_last_status.get("_printer_id") or "")==str(printer_id) else {}
+        state=str(status.get("state") or status.get("gcode_state") or "").upper()
+        if not printer_id or state not in {"RUNNING","PRINTING","PAUSE","PAUSED"}:
+            messagebox.showwarning("Pause at layer","Start or select an active print first.",parent=self);return
+        try:target=int(self.pause_layer_var.get().strip())
+        except (TypeError,ValueError):
+            messagebox.showwarning("Pause at layer","Enter a whole-number layer, such as 25.",parent=self);return
+        try:current=max(0,int(status.get("layer_num") or 0));total=max(0,int(status.get("total_layers") or 0))
+        except (TypeError,ValueError):current=total=0
+        if target<=current:
+            messagebox.showwarning("Pause at layer",f"The printer is already on layer {current}. Choose a layer greater than {current}.",parent=self);return
+        if total and target>total:
+            messagebox.showwarning("Pause at layer",f"This print has {total} layers. Choose layer {current+1} through {total}.",parent=self);return
+        file_name=str(status.get("subtask_name") or status.get("current_print") or status.get("gcode_file") or "").strip()
+        self._printer_pause_targets[str(printer_id)]={"layer":target,"file":file_name}
+        self.pause_layer_status.configure(text=f"Armed for layer {target} • currently layer {current}",fg="#fbbf24")
+        self.pause_layer_clear.configure(state="normal")
+        self.status_flash(f"Automatic pause armed for layer {target}")
+        # Poll faster while armed so short layers are not missed.
+        self._schedule_top_printer_poll(250)
+
+    def _clear_pause_at_layer(self):
+        printer_id=str(self._selected_top_printer_id() or "")
+        target=self._printer_pause_targets.pop(printer_id,None)
+        self.pause_layer_status.configure(text="Choose a future layer while a print is running",fg=self.MUTED)
+        self.pause_layer_clear.configure(state="disabled")
+        if target:self.status_flash(f"Pause at layer {target['layer']} cleared")
+
+    def _apply_pause_target_status(self,printer_id,state_key,file_name,current,total):
+        key=str(printer_id);target=self._printer_pause_targets.get(key)
+        active=state_key in {"RUNNING","PRINTING","PAUSE","PAUSED"}
+        self.pause_layer_set.configure(state="normal" if active else "disabled")
+        self.pause_layer_spin.configure(state="normal" if active else "disabled")
+        self.pause_layer_clear.configure(state="normal" if target else "disabled")
+        if not target:
+            self.pause_layer_status.configure(text="Choose a future layer while a print is running" if active else "Available during an active print",fg=self.MUTED)
+            return
+        if target.get("file") and file_name and target["file"]!=file_name:
+            self._printer_pause_targets.pop(key,None)
+            self.pause_layer_status.configure(text="Previous layer pause cleared — the active print changed",fg="#f59e0b")
+            self.pause_layer_clear.configure(state="disabled");return
+        layer=int(target["layer"])
+        if state_key in {"RUNNING","PRINTING"} and current>=layer:
+            self._printer_pause_targets.pop(key,None)
+            self.pause_layer_status.configure(text=f"Layer {layer} reached • sending Pause…",fg="#fbbf24")
+            self.pause_layer_clear.configure(state="disabled")
+            self._control_current_print("pause")
+            return
+        suffix=f" of {total}" if total else ""
+        self.pause_layer_status.configure(text=f"Armed for layer {layer} • currently {current}{suffix}",fg="#fbbf24")
+
     def _printer_control_finished(self,message,error):
         if error:
             messagebox.showerror("Printer control",f"PrintFlow could not control the printer.\n\n{error}",parent=self)
@@ -2554,6 +2626,7 @@ class App(tk.Tk):
             self.top_printer_connection.configure(text="Connected • 0 printers", fg=self.MUTED)
             self.top_camera_label.configure(text="No camera", image="")
             self._set_top_printer_control_state("")
+            self.pause_layer_set.configure(state="disabled");self.pause_layer_spin.configure(state="disabled")
             self.after(15_000, self._initialize_printer_strip)
             return
 
@@ -2587,6 +2660,13 @@ class App(tk.Tk):
         self.top_printer_state.configure(text="Checking printer…", fg="#93c5fd")
         self.top_printer_file.configure(text="Waiting for live status…")
         self.top_printer_detail.configure(text="")
+        self._top_printer_last_status={}
+        self._set_top_printer_control_state("")
+        self.pause_layer_spin.configure(state="disabled")
+        self.pause_layer_set.configure(state="disabled")
+        self.pause_layer_clear.configure(state="normal" if str(printer_id) in self._printer_pause_targets else "disabled")
+        target=self._printer_pause_targets.get(str(printer_id))
+        self.pause_layer_status.configure(text=(f"Armed for layer {target['layer']} • waiting for live status" if target else "Available during an active print"),fg=("#fbbf24" if target else self.MUTED))
         self.top_printer_progress_var.set(0)
         self.top_printer_percent.configure(text="—")
         self._schedule_top_printer_poll(0)
@@ -2646,6 +2726,8 @@ class App(tk.Tk):
             return
 
         status = status or {}
+        status["_printer_id"]=str(printer_id)
+        self._top_printer_last_status=status
         connected = status.get("connected") is not False
         raw_state = str(status.get("state") or status.get("gcode_state") or "Idle").strip()
         state_key = raw_state.upper().replace(" ", "_")
@@ -2676,6 +2758,7 @@ class App(tk.Tk):
         remaining = self._format_printer_minutes(status.get("remaining_time"))
         if remaining and file_name != "No active print":
             details.append(remaining)
+        layer=total_layers=0
         try:
             layer = int(status.get("layer_num") or 0)
             total_layers = int(status.get("total_layers") or 0)
@@ -2683,10 +2766,11 @@ class App(tk.Tk):
                 details.append(f"Layer {layer:,} of {total_layers:,}" if total_layers else f"Layer {layer:,}")
         except (TypeError, ValueError):
             pass
+        self._apply_pause_target_status(printer_id,state_key if connected else "",file_name,layer,total_layers)
         self.top_printer_detail.configure(text=" • ".join(details) if details else ("Ready" if connected else "Printer is offline"))
         if status.get("ipcam") is False and self._printer_camera_frame_bytes is None:
             self.top_camera_label.configure(text="Camera unavailable", image="")
-        self._schedule_top_printer_poll(2500)
+        self._schedule_top_printer_poll(500 if str(printer_id) in self._printer_pause_targets else 2500)
 
     def _start_top_camera(self, printer_id, generation):
         if self._printer_camera_stopping or generation != self._printer_camera_generation:
