@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.87"
+VERSION = "0.7.88"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -9477,17 +9477,34 @@ class App(tk.Tk):
             return self.db.order(order_id)
 
     def _pirateship_csv_path(self, row):
-        return EXPORT_DIR / f"{row['order_no']}_pirateship.csv"
+        raw = str(row["order_no"] or "").strip()
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip(" ._")
+        if not safe:
+            safe = f"order-{int(row['id'])}"
+        return EXPORT_DIR / f"{safe}_pirateship.csv"
 
     def _write_pirateship_csv(self, row):
         missing=[k for k in ["address1","city","state","postal_code"] if not (row[k] or "").strip()]
         if missing:
             raise ValueError(f"Add the buyer's shipping address first. Missing: {', '.join(missing)}")
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         path = self._pirateship_csv_path(row)
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         headers=["Name","Email","Phone","Address1","Address2","City","State","Zip","Country","OrderID","Description","WeightOz","LengthIn","WidthIn","HeightIn"]
         values=[row["buyer_name"],row["buyer_email"],row["buyer_phone"],row["address1"],row["address2"],row["city"],row["state"],row["postal_code"],row["country"],row["order_no"],row["item"],row["weight_oz"],row["length_in"],row["width_in"],row["height_in"]]
-        with path.open("w",newline="",encoding="utf-8-sig") as f:
-            w=csv.writer(f); w.writerow(headers); w.writerow(values)
+        try:
+            with temp_path.open("w",newline="",encoding="utf-8-sig") as f:
+                w=csv.writer(f); w.writerow(headers); w.writerow(values)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_path.replace(path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if not path.is_file() or path.stat().st_size <= 3:
+            raise OSError(f"PrintFlow could not verify the Pirate Ship CSV at {path}")
         return path
 
     def _mark_order_paid_full_for_shipping(self, order_id):
@@ -9650,22 +9667,34 @@ class App(tk.Tk):
             message=self._format_customer_message(template,row,balance=balance)
             action=self._prompt_customer_message(order_id,message,"payment reminder",balance=balance)
             if action == "sent":
-                return
-            if action == "scheduled":
-                self.status_flash(f"Payment reminder scheduled • continuing to shipping label")
-            self.status_flash(f"Payment reminder bypassed • {self.money(balance)} still due")
+                shipping_payment_text = f"Payment reminder sent • {self.money(balance)} still due"
+            elif action == "scheduled":
+                shipping_payment_text = f"Payment reminder scheduled • {self.money(balance)} still due"
+            else:
+                shipping_payment_text = f"Payment bypassed • {self.money(balance)} still due"
         try:
-            row = self._ensure_package_dimensions_for_pirateship(order_id) or row
+            # Save the requested order before optional package-size detection so a
+            # missing recommendation can never prevent the spreadsheet export.
             path = self._write_pirateship_csv(row)
+            updated_row = self._ensure_package_dimensions_for_pirateship(order_id)
+            if updated_row:
+                row = updated_row
+                path = self._write_pirateship_csv(row)
         except ValueError as e:
             messagebox.showwarning("Shipping address incomplete",str(e),parent=self); return
         except Exception as e:
-            messagebox.showerror("Shipping",str(e),parent=self); return
+            messagebox.showerror("Shipping export failed",
+                                 f"Could not save the Pirate Ship CSV.\n\nFolder: {EXPORT_DIR}\n\n{type(e).__name__}: {e}",
+                                 parent=self); return
         try:
             if os.name == "nt":
-                subprocess.Popen(["explorer", "/select,", str(path)])
+                subprocess.Popen(["explorer.exe", f"/select,{path}"])
         except Exception:
-            pass
+            try:
+                if os.name == "nt":
+                    os.startfile(str(EXPORT_DIR))
+            except Exception:
+                pass
         self.open_pirateship_browser(order_id)
         self.status_flash(f"{shipping_payment_text} • Pirate Ship ready • waiting for purchased label")
         if self.current_page == "orders":
