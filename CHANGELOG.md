@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.88
+
+- Fixed paid orders failing to leave a Pirate Ship CSV in the exports folder when optional package-size detection was unavailable.
+- Writes and verifies the selected order's CSV before attempting box recommendations, then refreshes it if dimensions are calculated.
+- Added atomic CSV replacement, automatic exports-folder recreation, Windows-safe filenames, clearer save errors, and reliable Explorer selection.
+- Made unpaid-order reminders continue the shipping action instead of silently ending it.
+
 ## 0.7.87
 
 - Added A1 Mini build-volume support throughout automatic fit checking and the one-cut Auto Split workflow.
