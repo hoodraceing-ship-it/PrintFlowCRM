@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.86"
+VERSION = "0.7.87"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2006,6 +2006,7 @@ class App(tk.Tk):
         self._top_printer_polling = False
         self._top_printer_last_status = {}
         self._printer_pause_targets = {}
+        self._printer_fit_cache = {}
         self._top_printer_load_generation = 0
         self._printer_camera_generation = 0
         self._printer_camera_stopping = False
@@ -4254,10 +4255,11 @@ class App(tk.Tk):
             if "makerworld.com" in str(row["source_url"]).lower() and not files:
                 ttk.Button(manage_actions,text="Retry Auto Download",command=lambda:self._retry_model_library_source(model_id)).pack(side="left")
         ttk.Label(self.library_detail,text=f"Source files ({len(files)})",style="CardTitle.TLabel").pack(anchor="w",pady=(18,7))
-        tree=ttk.Treeview(self.library_detail,columns=("type",),show="headings",height=max(5,min(12,len(files)+1)),selectmode="extended")
-        tree.heading("type",text="File type");tree.column("type",width=90,stretch=False)
-        tree["columns"]=("name","type");tree.heading("name",text="File");tree.column("name",width=430);tree.heading("type",text="Type")
-        for item in files:tree.insert("","end",iid=str(item["id"]),values=(item["original_name"],Path(item["original_name"]).suffix.upper().lstrip(".")))
+        tree=ttk.Treeview(self.library_detail,columns=("name","type","printers"),show="headings",height=max(5,min(12,len(files)+1)),selectmode="extended")
+        tree.heading("name",text="File");tree.column("name",width=340)
+        tree.heading("type",text="File type");tree.column("type",width=80,stretch=False)
+        tree.heading("printers",text="Printer Fit (max 1 cut)");tree.column("printers",width=285,stretch=False)
+        for item in files:tree.insert("","end",iid=str(item["id"]),values=(item["original_name"],Path(item["original_name"]).suffix.upper().lstrip("."),self._printer_fit_marker(item["stored_path"])))
         tree.pack(fill="both",expand=True)
         file_actions=ttk.Frame(self.library_detail,style="Card.TFrame");file_actions.pack(fill="x",pady=(8,0))
         ttk.Button(file_actions,text="Open Selected in Bambu Studio",command=lambda:self._open_library_sources_in_bambu_studio(model_id,tree)).pack(side="left")
@@ -5062,10 +5064,11 @@ class App(tk.Tk):
                               style="Card.TLabel", justify="left")
         file_help.grid(row=1,column=0,sticky="ew",pady=(0,7))
         file_frame.bind("<Configure>", lambda e, lbl=file_help: lbl.configure(wraplength=max(220, e.width-12)), add="+")
-        self.order_file_tree = ttk.Treeview(file_frame,columns=("status","type"),show="tree headings",height=5,selectmode="extended")
+        self.order_file_tree = ttk.Treeview(file_frame,columns=("status","type","printers"),show="tree headings",height=5,selectmode="extended")
         self.order_file_tree.heading("#0",text="Print File"); self.order_file_tree.column("#0",width=390,anchor="w",stretch=True)
         self.order_file_tree.heading("status",text="Print Status"); self.order_file_tree.column("status",width=155,anchor="center",stretch=False)
         self.order_file_tree.heading("type",text="Type"); self.order_file_tree.column("type",width=115,anchor="w",stretch=False)
+        self.order_file_tree.heading("printers",text="Printer Fit (max 1 cut)"); self.order_file_tree.column("printers",width=285,anchor="w",stretch=False)
         self.order_file_tree.grid(row=2,column=0,sticky="nsew")
         fb = ttk.Frame(file_frame,style="Card.TFrame")
         fb.grid(row=3,column=0,sticky="ew",pady=(7,0))
@@ -5422,7 +5425,8 @@ class App(tk.Tk):
                 type_label += f" • {part_count} parts"
             elif plate_count:
                 type_label += f" • {plate_count} plates"
-            tree.insert("", "end", iid=str(main["id"]), text=name + missing, values=(status, type_label), open=False)
+            fit=self._printer_fit_marker(p)
+            tree.insert("", "end", iid=str(main["id"]), text=name + missing, values=(status, type_label,fit), open=False)
             for f in helpers:
                 hp = Path(f["stored_path"])
                 hname = f["original_name"] or hp.name
@@ -5433,7 +5437,7 @@ class App(tk.Tk):
                     htype = "Split STL"
                 elif "_QUEUE_PLATE_" in hname.upper() and htype == "STL":
                     htype = "Plate STL"
-                tree.insert(str(main["id"]), "end", iid=str(f["id"]), text=hname + hmissing, values=(hstatus, htype))
+                tree.insert(str(main["id"]), "end", iid=str(f["id"]), text=hname + hmissing, values=(hstatus, htype,self._printer_fit_marker(hp)))
                 self._order_file_parent_map[int(f["id"])] = int(main["id"])
         chosen = str(select_id) if select_id and tree.exists(str(select_id)) else None
         if chosen and tree.parent(chosen):
@@ -6058,9 +6062,10 @@ class App(tk.Tk):
         pscroll=ttk.Scrollbar(left,orient="vertical",command=products.yview);products.configure(yscrollcommand=pscroll.set)
         pscroll.pack(side="right",fill="y");products.pack(side="left",fill="both",expand=True)
         product_title=ttk.Label(right,text="Select a product",style="CardTitle.TLabel");product_title.pack(anchor="w",pady=(0,7))
-        files=ttk.Treeview(right,columns=("type",),show="tree headings",selectmode="extended")
-        files.heading("#0",text="Source file");files.column("#0",width=410,stretch=True)
+        files=ttk.Treeview(right,columns=("type","printers"),show="tree headings",selectmode="extended")
+        files.heading("#0",text="Source file");files.column("#0",width=310,stretch=True)
         files.heading("type",text="Type");files.column("type",width=90,anchor="center",stretch=False)
+        files.heading("printers",text="Printer Fit");files.column("printers",width=270,anchor="w",stretch=False)
         fscroll=ttk.Scrollbar(right,orient="vertical",command=files.yview);files.configure(yscrollcommand=fscroll.set)
         fscroll.pack(side="right",fill="y");files.pack(side="left",fill="both",expand=True)
         model_rows={};file_rows={}
@@ -6099,7 +6104,7 @@ class App(tk.Tk):
             for row in rows:
                 name=row["original_name"] or Path(row["stored_path"]).name
                 if not (name.lower().endswith(".stl") or (name.lower().endswith(".3mf") and not name.lower().endswith(".gcode.3mf"))):continue
-                iid=str(row["id"]);file_rows[iid]=row;files.insert("","end",iid=iid,text=name,values=(self._file_type_label(name),))
+                iid=str(row["id"]);file_rows[iid]=row;files.insert("","end",iid=iid,text=name,values=(self._file_type_label(name),self._printer_fit_marker(row["stored_path"])))
             choices=files.get_children()
             if len(choices)==1:files.selection_set(choices[0]);files.focus(choices[0])
 
@@ -6854,9 +6859,53 @@ class App(tk.Tk):
         return sliced_attachment, picked, result
 
     @staticmethod
-    def _p2s_bed_limits():
-        # Bambu Lab P2S nominal build volume.
-        return (256.0, 256.0, 256.0)
+    def _printer_volume_from_text(value):
+        text=str(value or "").lower().replace("_"," ").replace("-"," ")
+        if "a1 mini" in text or re.search(r"\ba1m\b",text):return "A1 Mini",(180.0,180.0,180.0)
+        if "p2s" in text:return "P2S",(256.0,256.0,256.0)
+        if "a1" in text:return "A1",(256.0,256.0,256.0)
+        if any(name in text for name in ("p1s","p1p","x1c","x1 carbon","x1e")):return "256 mm Bambu",(256.0,256.0,256.0)
+        return "Selected printer",(256.0,256.0,256.0)
+
+    def _active_printer_build_volume(self):
+        printer_id=str(self.db.get_setting("bambuddy_printer_id","") or "")
+        printer=self._top_printer_details.get(printer_id,{})
+        identity=" ".join(str(printer.get(key) or "") for key in ("name","model","printer_model","type"))
+        return self._printer_volume_from_text(identity)
+
+    def _p2s_bed_limits(self):
+        # Compatibility name retained for the existing safe-split pipeline; the
+        # returned volume now follows the selected printer (including A1 Mini).
+        return self._active_printer_build_volume()[1]
+
+    @staticmethod
+    def _fit_with_max_one_cut(extents,limits):
+        dims=sorted(float(v) for v in extents);bed=sorted(float(v) for v in limits)
+        if all(size<=limit+0.01 for size,limit in zip(dims,bed)):return "Fits"
+        oversized=[i for i,(size,limit) in enumerate(zip(dims,bed)) if size>limit+0.01]
+        if len(oversized)==1 and dims[oversized[0]]<=bed[oversized[0]]*2+0.01:return "1 cut"
+        return "No"
+
+    def _printer_fit_marker(self,path):
+        path=Path(path)
+        name=path.name.lower()
+        if not path.is_file():return "Missing"
+        if not (name.endswith(".stl") or (name.endswith(".3mf") and not name.endswith(".gcode.3mf"))):return "Sliced"
+        try:key=(str(path),path.stat().st_mtime_ns,path.stat().st_size)
+        except OSError:return "Missing"
+        cached=self._printer_fit_cache.get(key)
+        if cached:return cached
+        try:
+            info=self._stl_mesh_info(path)
+            if not info:raise RuntimeError("mesh tools unavailable")
+            ext=info["extents"]
+            a1=self._fit_with_max_one_cut(ext,(180,180,180))
+            p2s=self._fit_with_max_one_cut(ext,(256,256,256))
+            result=f"A1 Mini: {a1}  •  P2S: {p2s}"
+        except Exception:
+            result="Fit check unavailable"
+        self._printer_fit_cache[key]=result
+        return result
 
     def _stl_mesh_info(self, path):
         """Return STL bounds/extents using trimesh. Installed on demand for auto-split."""
@@ -7060,7 +7109,7 @@ class App(tk.Tk):
         limits = self._p2s_bed_limits()
         over = [i for i, (size, lim) in enumerate(zip(ext, limits)) if size > lim + 0.01]
         if len(over) != 1:
-            raise RuntimeError("Automatic two-part splitting is only safe when exactly one model axis exceeds the P2S build volume.")
+            raise RuntimeError("Automatic two-part splitting is only safe when exactly one model axis exceeds the selected printer's build volume.")
         axis = over[0]
         bounds = info["bounds"]
         lo_bound = float(bounds[0][axis])
@@ -7070,7 +7119,7 @@ class App(tk.Tk):
         safe_lo = hi_bound - limit + 0.05
         safe_hi = lo_bound + limit - 0.05
         if safe_lo > safe_hi:
-            raise RuntimeError("Two safe P2S-sized halves cannot be produced on the oversized axis.")
+            raise RuntimeError("Two safe printer-sized halves cannot be produced on the oversized axis.")
         center = (lo_bound + hi_bound) / 2.0
         # Try the center first, then progressively move away from it. Moving the cut a
         # few millimeters often avoids coplanar walls, thin ribs, holes, or coincident
@@ -7193,7 +7242,7 @@ class App(tk.Tk):
                     continue
             part = best
             if any(float(size) > lim + 0.05 for size, lim in zip(part.extents, limits)):
-                raise RuntimeError("Alternate cut would leave a part outside the P2S build volume.")
+                raise RuntimeError("Alternate cut would leave a part outside the selected printer's build volume.")
             if not part.is_watertight:
                 if source_watertight or len(boundary_edges_on_cut(part)) != 0:
                     raise RuntimeError("Alternate cap still left an open edge on the new cut plane.")
@@ -7254,10 +7303,10 @@ class App(tk.Tk):
         limits = self._p2s_bed_limits()
         over = [i for i, (size, lim) in enumerate(zip(ext, limits)) if size > lim + 0.01]
         if len(over) != 1:
-            raise RuntimeError("Automatic two-part splitting is only safe when exactly one model axis exceeds the P2S build volume.")
+            raise RuntimeError("Automatic two-part splitting is only safe when exactly one model axis exceeds the selected printer's build volume.")
         axis = over[0]
         if ext[axis] > limits[axis] * 2:
-            raise RuntimeError("This model is more than twice the P2S bed size on the oversized axis, so two pieces would still not fit.")
+            raise RuntimeError("This model is more than twice the selected printer's bed size on the oversized axis, so two pieces would still not fit.")
         for i in range(3):
             if i != axis and ext[i] > limits[i] + 0.01:
                 raise RuntimeError("This model is oversized on more than one axis and needs a manual multi-axis split.")
@@ -7609,7 +7658,7 @@ class App(tk.Tk):
         b = capped_half(-1)
         for idx, part in enumerate((a, b), start=1):
             if any(float(size) > lim + 0.05 for size, lim in zip(part.extents, limits)):
-                raise RuntimeError(f"Part {idx} would still exceed the P2S build volume after the cut.")
+                raise RuntimeError(f"Part {idx} would still exceed the selected printer's build volume after the cut.")
             if not part.is_watertight:
                 # Some downloadable STLs are already non-watertight but Bambu Studio can
                 # repair/slice them. Do not blame Auto Split for pre-existing defects if
@@ -7638,7 +7687,9 @@ class App(tk.Tk):
         return created, axis_name, center
 
     def _show_oversize_cut_dialog(self, info, axis, center, dims):
-        """Interactive 3D preview of the STL, P2S build plate and proposed cut plane."""
+        """Interactive 3D preview of the STL, selected build plate and proposed cut plane."""
+        printer_name,limits=self._active_printer_build_volume()
+        half_x,half_y=limits[0]/2.0,limits[1]/2.0
         win = tk.Toplevel(self)
         win.title("Oversized STL detected")
         win.transient(self)
@@ -7652,7 +7703,7 @@ class App(tk.Tk):
         outer.pack(fill="both", expand=True)
         tk.Label(outer, text="Oversized STL detected", bg="#0f1722", fg="#ffffff",
                  font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        tk.Label(outer, text=f"Model size: {dims}    •    P2S build plate: 256 × 256 mm    •    Z limit: 256 mm",
+        tk.Label(outer, text=f"Model size: {dims}    •    {printer_name} build plate: {limits[0]:.0f} × {limits[1]:.0f} mm    •    Z limit: {limits[2]:.0f} mm",
                  bg="#0f1722", fg="#b8c6d9", font=("Segoe UI", 9)).pack(anchor="w", pady=(3, 6))
         tk.Label(outer,
                  text="Drag the model to rotate • Mouse wheel zooms • Double-click resets • STL orientation is preserved; preview is centered on the plate",
@@ -7753,9 +7804,9 @@ class App(tk.Tk):
             )
 
         def view_scale(w, h):
-            # Fit a 256 mm plate plus the actual oversized model into the viewer.
-            span_x = max(256.0, model_max[0]-model_min[0])
-            span_y = max(256.0, model_max[1]-model_min[1])
+            # Fit the selected printer's plate plus the oversized model.
+            span_x = max(limits[0], model_max[0]-model_min[0])
+            span_y = max(limits[1], model_max[1]-model_min[1])
             span_z = max(80.0, model_max[2]-model_min[2])
             base = min(max(1.0, w-70.0) / max(span_x, span_y, 1.0),
                        max(1.0, h-70.0) / max(span_y, span_z, 1.0))
@@ -7781,17 +7832,17 @@ class App(tk.Tk):
             R = rotation_matrix()
             scale = view_scale(w, h)
 
-            # --- P2S build plate ---
-            plate = [(-128,-128,0), (128,-128,0), (128,128,0), (-128,128,0)]
+            # --- selected printer build plate ---
+            plate = [(-half_x,-half_y,0), (half_x,-half_y,0), (half_x,half_y,0), (-half_x,half_y,0)]
             pp = [project(v, R, scale, cx, cy) for v in plate]
             preview.create_polygon(*[c for p in pp for c in p[:2]], fill="#172434", outline="#58708b", width=2)
-            # 32 mm grid, with stronger center axes.
-            for mm in range(-128, 129, 32):
+            grid=max(20,int(min(limits[0],limits[1])//6))
+            for mm in range(-int(min(half_x,half_y)),int(min(half_x,half_y))+1,grid):
                 col = "#30465c" if mm else "#4e6b87"
                 width = 1 if mm else 2
-                draw_line3((mm,-128,0), (mm,128,0), R, scale, cx, cy, fill=col, width=width)
-                draw_line3((-128,mm,0), (128,mm,0), R, scale, cx, cy, fill=col, width=width)
-            draw_text3((0,-145,0), "P2S BUILD PLATE 256 × 256", R, scale, cx, cy,
+                draw_line3((mm,-half_y,0), (mm,half_y,0), R, scale, cx, cy, fill=col, width=width)
+                draw_line3((-half_x,mm,0), (half_x,mm,0), R, scale, cx, cy, fill=col, width=width)
+            draw_text3((0,-half_y-17,0), f"{printer_name.upper()} BUILD PLATE {limits[0]:.0f} × {limits[1]:.0f}", R, scale, cx, cy,
                        fill="#7891a9", font=("Segoe UI", 8, "bold"))
 
             # --- Model surface ---
@@ -7854,7 +7905,7 @@ class App(tk.Tk):
                        fill="#ff7272", font=("Segoe UI", 9, "bold"))
 
             # --- World orientation axes ---
-            origin = (-128,-128,0)
+            origin = (-half_x,-half_y,0)
             axis_len = 55.0
             draw_line3(origin, (origin[0]+axis_len,origin[1],origin[2]), R, scale, cx, cy, fill="#ff6868", width=3, arrow="last")
             draw_line3(origin, (origin[0],origin[1]+axis_len,origin[2]), R, scale, cx, cy, fill="#68d77b", width=3, arrow="last")
@@ -7982,6 +8033,8 @@ class App(tk.Tk):
 
         original = mesh.copy()
         current = mesh.copy()
+        printer_name,printer_limits=self._active_printer_build_volume()
+        plate_half_x,plate_half_y=printer_limits[0]/2.0,printer_limits[1]/2.0
         preview_original = original
         if len(original.faces) > 12000:
             try:
@@ -8082,7 +8135,7 @@ class App(tk.Tk):
 
         def estimate(m):
             ext=np.asarray(m.extents,float)
-            fits = ext[0] <= 256.01 and ext[1] <= 256.01 and ext[2] <= 256.01
+            fits = all(float(size)<=float(limit)+0.01 for size,limit in zip(ext,printer_limits))
             tri=m.triangles
             normals=m.face_normals
             areas=m.area_faces
@@ -8119,17 +8172,17 @@ class App(tk.Tk):
                 geometry.update(ext=ext,fits=fits,sup=sup,contact=contact,score=score,
                                 verts=verts,faces=faces,motion_faces=motion_faces)
                 info_var.set(f"Size: {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm   •   "
-                             f"{'Fits P2S' if fits else 'Needs split'}   •   Estimated support burden: {sup:.0f} mm²   •   "
+                             f"{f'Fits {printer_name}' if fits else f'Needs split for {printer_name}'}   •   Estimated support burden: {sup:.0f} mm²   •   "
                              f"Bed contact: {contact:.0f} mm²")
             ext=geometry["ext"]; verts=geometry["verts"]
             faces=geometry["motion_faces"] if motion else geometry["faces"]
             canvas.delete("all")
             w=max(350,canvas.winfo_width()); h=max(300,canvas.winfo_height()); cx=w/2; cy=h/2+18
-            R=rot_view(); span=max(256.0,float(ext[0]),float(ext[1]),float(ext[2])*0.75)
+            R=rot_view(); span=max(float(printer_limits[0]),float(printer_limits[1]),float(ext[0]),float(ext[1]),float(ext[2])*0.75)
             scale=min((w-70)/span,(h-70)/max(180.0,float(ext[2])+80))*view["zoom"]*0.9
             def proj(v):
                 q=R@np.asarray(v,float); return (cx+q[0]*scale, cy-q[1]*scale, q[2])
-            plate=[(-128,-128,0),(128,-128,0),(128,128,0),(-128,128,0)]
+            plate=[(-plate_half_x,-plate_half_y,0),(plate_half_x,-plate_half_y,0),(plate_half_x,plate_half_y,0),(-plate_half_x,plate_half_y,0)]
             pp=[proj(x) for x in plate]
             canvas.create_polygon(*[z for q in pp for z in q[:2]],fill="#172434",outline="#58708b",width=2)
             surf=[]
@@ -8389,7 +8442,7 @@ class App(tk.Tk):
         if len(over) != 1 or ext[over[0]] > limits[over[0]] * 2:
             messagebox.showwarning(
                 "Model needs a manual split",
-                f"This STL is {dims}.\n\nThe P2S build volume is 256 × 256 × 256 mm. "
+                f"This STL is {dims}.\n\nThe selected printer's build volume is {limits[0]:.0f} × {limits[1]:.0f} × {limits[2]:.0f} mm. "
                 "A single safe center cut cannot make this model fit on two plates. PrintFlow will not guess at a multi-axis cut.\n\n"
                 "The STL will be opened so you can split it in Bambu Studio.",
                 parent=self,
