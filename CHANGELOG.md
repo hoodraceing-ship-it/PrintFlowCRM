@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.85
+
+- Added Pause, Play/Resume, and Stop controls beside the live printer status.
+- Enabled each control only when valid for the current printer state and refreshes status immediately after commands.
+- Added a confirmation gate before Stop because cancelling a current print cannot be undone.
+
 ## 0.7.84
 
 - Added a Print Preflight option that pauses immediately before the final two layers for a manual filament-color swap.

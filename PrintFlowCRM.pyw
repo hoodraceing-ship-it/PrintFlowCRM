@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.84"
+VERSION = "0.7.85"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -1202,6 +1202,13 @@ class BambuBuddyClient:
     def printer_status(self, printer_id):
         """Return BambuBuddy's current live state for one printer."""
         return self._json_request("GET", f"/printers/{int(printer_id)}/status", timeout=12) or {}
+
+    def control_print(self, printer_id, action):
+        """Pause, resume, or stop the active print through BambuBuddy."""
+        action=str(action or "").strip().lower()
+        if action not in {"pause","resume","stop"}:
+            raise ValueError("Unsupported printer action.")
+        return self._json_request("POST",f"/printers/{int(printer_id)}/print/{action}",timeout=20) or {}
 
     def camera_stream_token(self):
         """Create the short-lived token required by BambuBuddy's MJPEG camera stream."""
@@ -2397,6 +2404,18 @@ class App(tk.Tk):
             font=("Segoe UI Semibold", 11), anchor="w",
         )
         self.top_printer_state.pack(side="left")
+        self.top_printer_controls=tk.Frame(status_row,bg="#111923")
+        self.top_printer_controls.pack(side="left",padx=(14,0))
+        self.top_printer_pause=ttk.Button(self.top_printer_controls,text="⏸ Pause",width=9,
+                                          command=lambda:self._control_current_print("pause"))
+        self.top_printer_pause.pack(side="left",padx=(0,4))
+        self.top_printer_resume=ttk.Button(self.top_printer_controls,text="▶ Play",width=8,
+                                           command=lambda:self._control_current_print("resume"))
+        self.top_printer_resume.pack(side="left",padx=(0,4))
+        self.top_printer_stop=ttk.Button(self.top_printer_controls,text="■ Stop",width=8,style="Danger.TButton",
+                                         command=lambda:self._control_current_print("stop"))
+        self.top_printer_stop.pack(side="left")
+        self._set_top_printer_control_state("")
         self.top_printer_percent = tk.Label(
             status_row, text="—", bg="#111923", fg="white",
             font=("Segoe UI Semibold", 11), anchor="e",
@@ -2463,7 +2482,53 @@ class App(tk.Tk):
         self.top_printer_detail.configure(text=error)
         self.top_printer_connection.configure(text="Will retry automatically", fg="#f59e0b")
         self.top_camera_label.configure(text="Camera offline", image="")
+        self._set_top_printer_control_state("")
         self.after(15_000, self._initialize_printer_strip)
+
+    def _set_top_printer_control_state(self,state_key,busy=False):
+        """Only expose actions that are safe for the printer's current state."""
+        if busy:
+            pause_state=resume_state=stop_state="disabled"
+        else:
+            active=state_key in {"RUNNING","PRINTING"}
+            paused=state_key in {"PAUSE","PAUSED"}
+            pause_state="normal" if active else "disabled"
+            resume_state="normal" if paused else "disabled"
+            stop_state="normal" if active or paused else "disabled"
+        for button,state in ((self.top_printer_pause,pause_state),(self.top_printer_resume,resume_state),(self.top_printer_stop,stop_state)):
+            try:button.configure(state=state)
+            except tk.TclError:pass
+
+    def _control_current_print(self,action):
+        printer_id=self._selected_top_printer_id()
+        if not printer_id:
+            messagebox.showwarning("Printer control","Choose a connected printer first.",parent=self);return
+        labels={"pause":"pause","resume":"resume","stop":"stop"}
+        verb=labels.get(action,action)
+        if action=="stop" and not messagebox.askyesno(
+            "Stop current print?",
+            "This will permanently cancel the current print. It cannot be resumed.\n\nStop the print now?",
+            icon="warning",parent=self,
+        ):
+            return
+        self._set_top_printer_control_state("",busy=True)
+        self.status_flash(f"Sending {verb} command to printer…")
+        def work():
+            try:
+                result=self._client().control_print(int(printer_id),action)
+                message=str(result.get("message") or f"Print {verb} command sent")
+                self.after(0,lambda:self._printer_control_finished(message,None))
+            except Exception as exc:
+                self.after(0,lambda error=str(exc):self._printer_control_finished("",error))
+        threading.Thread(target=work,daemon=True).start()
+
+    def _printer_control_finished(self,message,error):
+        if error:
+            messagebox.showerror("Printer control",f"PrintFlow could not control the printer.\n\n{error}",parent=self)
+            self.status_flash("Printer control failed")
+        else:
+            self.status_flash(message)
+        self._schedule_top_printer_poll(350)
 
     @staticmethod
     def _printer_display_label(printer):
@@ -2488,6 +2553,7 @@ class App(tk.Tk):
             self.top_printer_detail.configure(text="")
             self.top_printer_connection.configure(text="Connected • 0 printers", fg=self.MUTED)
             self.top_camera_label.configure(text="No camera", image="")
+            self._set_top_printer_control_state("")
             self.after(15_000, self._initialize_printer_strip)
             return
 
@@ -2575,6 +2641,7 @@ class App(tk.Tk):
         if error:
             self.top_printer_state.configure(text="Connection lost", fg="#fca5a5")
             self.top_printer_detail.configure(text=error)
+            self._set_top_printer_control_state("")
             self._schedule_top_printer_poll(5000)
             return
 
@@ -2591,6 +2658,7 @@ class App(tk.Tk):
         state_text = "Offline" if not connected else state_names.get(state_key, raw_state.title() or "Idle")
         state_color = "#86efac" if state_text == "Printing" else "#fbbf24" if state_text in ("Paused", "Preparing", "Slicing") else "#fca5a5" if state_text in ("Offline", "Print failed", "Printer error") else "#93c5fd"
         self.top_printer_state.configure(text=state_text, fg=state_color)
+        self._set_top_printer_control_state(state_key if connected else "")
 
         file_name = str(
             status.get("subtask_name") or status.get("current_print") or
