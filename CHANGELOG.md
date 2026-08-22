@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.86
+
+- Added an adjustable Pause at Layer control beside the live printer status for prints already running.
+- Validates the target against the current and total layer counts, shows live progress toward the selected layer, and automatically sends Pause when it is reached.
+- Clears an armed pause safely if the active print changes so it cannot affect the next queued job.
+
 ## 0.7.85
 
 - Added Pause, Play/Resume, and Stop controls beside the live printer status.
