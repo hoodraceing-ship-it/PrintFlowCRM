@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.90
+
+- Added dedicated Iso, Top, Bottom View, Front, and Right camera buttons to Print Preflight while preserving free mouse-drag orbiting and zoom.
+- Highlights the exact raised downward-facing triangles used by the support recommendation in bright green.
+- Keeps the green support overlay synchronized after manual rotation, reset, and Auto Orient.
+- Added an in-preview green legend so support-recommended areas are immediately identifiable from underneath the model.
+
 ## 0.7.89
 
 - Fixed Product Inventory design 3MF files showing Fit check unavailable by loading complete 3MF scenes with their saved transforms.
