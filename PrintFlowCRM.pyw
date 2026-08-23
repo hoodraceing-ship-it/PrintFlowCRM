@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.89"
+VERSION = "0.7.90"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -8081,6 +8081,7 @@ class App(tk.Tk):
                  font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 6))
         tk.Label(outer,
                  text="Set the actual print orientation before PrintFlow checks fit, Auto Split, supports and slicing. "
+                      "Drag to orbit, use Bottom View to inspect underneath, and look for green support-recommended surfaces. "
                       "Manual rotations are locked so the slicer will not undo them.",
                  wraplength=900, justify="left", bg="#0f1722", fg="#7f93aa",
                  font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 8))
@@ -8188,18 +8189,24 @@ class App(tk.Tk):
                 verts[:,0]-=c[0]; verts[:,1]-=c[1]
                 faces=np.asarray(pm.faces,int)
                 if len(faces)>1800:
-                    idx=np.linspace(0,len(faces)-1,1800,dtype=int)
-                    motion_faces=faces[idx]
+                    motion_indices=np.linspace(0,len(faces)-1,1800,dtype=int)
                 else:
-                    motion_faces=faces
+                    motion_indices=np.arange(len(faces),dtype=int)
+                preview_normals=np.asarray(pm.face_normals,float)
+                preview_centers=np.asarray(pm.triangles_center,float)
+                preview_minz=float(pm.bounds[0][2])
+                support_mask=(preview_normals[:,2] < -0.45) & (preview_centers[:,2] > preview_minz+0.8)
+                if not result["supports_recommended"]:
+                    support_mask=np.zeros(len(faces),dtype=bool)
                 geometry.clear()
                 geometry.update(ext=ext,fits=fits,sup=sup,contact=contact,score=score,
-                                verts=verts,faces=faces,motion_faces=motion_faces)
+                                verts=verts,faces=faces,motion_indices=motion_indices,
+                                support_mask=support_mask)
                 info_var.set(f"Size: {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm   •   "
                              f"{f'Fits {printer_name}' if fits else f'Needs split for {printer_name}'}   •   Estimated support burden: {sup:.0f} mm²   •   "
                              f"Bed contact: {contact:.0f} mm²")
-            ext=geometry["ext"]; verts=geometry["verts"]
-            faces=geometry["motion_faces"] if motion else geometry["faces"]
+            ext=geometry["ext"]; verts=geometry["verts"]; faces=geometry["faces"]
+            face_indices=geometry["motion_indices"] if motion else np.arange(len(faces),dtype=int)
             canvas.delete("all")
             w=max(350,canvas.winfo_width()); h=max(300,canvas.winfo_height()); cx=w/2; cy=h/2+18
             R=rot_view(); span=max(float(printer_limits[0]),float(printer_limits[1]),float(ext[0]),float(ext[1]),float(ext[2])*0.75)
@@ -8210,19 +8217,32 @@ class App(tk.Tk):
             pp=[proj(x) for x in plate]
             canvas.create_polygon(*[z for q in pp for z in q[:2]],fill="#172434",outline="#58708b",width=2)
             surf=[]
-            for f in faces:
+            support_mask=geometry["support_mask"]
+            for face_index in face_indices:
+                f=faces[int(face_index)]
                 a,b,c3=verts[f[0]],verts[f[1]],verts[f[2]]
                 qa,qb,qc=R@a,R@b,R@c3
                 area=(qb[0]-qa[0])*(qc[1]-qa[1])-(qb[1]-qa[1])*(qc[0]-qa[0])
                 if abs(area)<1e-7: continue
-                nz=np.cross(qb-qa,qc-qa); nn=float(np.linalg.norm(nz)) or 1
-                light=max(0,min(1,abs(float(nz[2]))/nn)); tone=int(96+82*light)
-                fill=f"#{tone:02x}{min(255,tone+7):02x}{min(255,tone+14):02x}"
-                surf.append(((qa[2]+qb[2]+qc[2])/3,[(cx+qa[0]*scale,cy-qa[1]*scale),(cx+qb[0]*scale,cy-qb[1]*scale),(cx+qc[0]*scale,cy-qc[1]*scale)],fill))
+                highlighted=bool(result["supports_recommended"] and support_mask[int(face_index)])
+                if highlighted:
+                    fill,outline,width="#31d97c","#087d45",1
+                else:
+                    nz=np.cross(qb-qa,qc-qa); nn=float(np.linalg.norm(nz)) or 1
+                    light=max(0,min(1,abs(float(nz[2]))/nn)); tone=int(96+82*light)
+                    fill=f"#{tone:02x}{min(255,tone+7):02x}{min(255,tone+14):02x}"
+                    outline,width="",0
+                surf.append(((qa[2]+qb[2]+qc[2])/3,
+                             [(cx+qa[0]*scale,cy-qa[1]*scale),(cx+qb[0]*scale,cy-qb[1]*scale),(cx+qc[0]*scale,cy-qc[1]*scale)],
+                             fill,outline,width))
             surf.sort(key=lambda x:x[0])
-            for _,pts,fill in surf:
-                canvas.create_polygon(*[z for q in pts for z in q],fill=fill,outline="")
+            for _,pts,fill,outline,width in surf:
+                canvas.create_polygon(*[z for q in pts for z in q],fill=fill,outline=outline,width=width)
             canvas.create_text(10,10,anchor="nw",text=choice_var.get(),fill="#9fb3c8",font=("Segoe UI",9,"bold"))
+            if result["supports_recommended"]:
+                canvas.create_rectangle(10,34,31,51,fill="#31d97c",outline="#087d45")
+                canvas.create_text(38,42,anchor="w",text="Green = support recommended",fill="#8ff0b7",
+                                   font=("Segoe UI",9,"bold"))
 
         def apply_axis(axis, deg):
             nonlocal transform
@@ -8289,6 +8309,26 @@ class App(tk.Tk):
         for axis in ("X","Y","Z"):
             tk.Button(controls,text=f"{axis} -90°",width=8,command=lambda a=axis:apply_axis(a,-90)).pack(side="left",padx=2)
             tk.Button(controls,text=f"{axis} +90°",width=8,command=lambda a=axis:apply_axis(a,90)).pack(side="left",padx=2)
+
+        def set_camera_view(name):
+            presets={
+                "Iso":(math.radians(-38),math.radians(-58)),
+                "Top":(0.0,math.radians(-88)),
+                "Bottom":(math.radians(-38),math.radians(58)),
+                "Front":(0.0,0.0),
+                "Right":(math.radians(90),0.0),
+            }
+            view["yaw"],view["pitch"]=presets[name]
+            render()
+
+        view_row=tk.Frame(outer,bg="#0f1722"); view_row.pack(fill="x",pady=(7,0))
+        tk.Label(view_row,text="Camera:",bg="#0f1722",fg="#a9bdd2",font=("Segoe UI",9,"bold")).pack(side="left")
+        for camera_name in ("Iso","Top","Bottom","Front","Right"):
+            label="Bottom View" if camera_name=="Bottom" else camera_name
+            tk.Button(view_row,text=label,width=12 if camera_name=="Bottom" else 8,
+                      command=lambda n=camera_name:set_camera_view(n)).pack(side="left",padx=(6,0))
+        tk.Label(view_row,text="Drag still orbits freely from any view.",bg="#0f1722",fg="#71869d",
+                 font=("Segoe UI",8)).pack(side="left",padx=(12,0))
         plate_row=tk.Frame(outer,bg="#0f1722"); plate_row.pack(fill="x",pady=(8,0))
         tk.Label(plate_row,text="Build plate installed:",bg="#0f1722",fg="#dce6f2",font=("Segoe UI",9)).pack(side="left")
         plate_combo=ttk.Combobox(plate_row,textvariable=plate_var,state="readonly",values=BUILD_PLATE_TYPES,width=28)
