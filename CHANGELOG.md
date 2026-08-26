@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.95
+
+- Fixed Marketplace’s newest buyer bubble detection by locating messages from the center composer lane instead of relying on an unstable Facebook container.
+- Improved Spanish detection, including “Aún está disponible,” location questions, and accented phrases.
+- Smart Reply now interprets the buyer’s newest question and answers availability, location, shipping, price, included items, customization, thanks, scam concerns, and multi-item interest directly.
+- Context-aware answers are composed in English and translated back into the buyer’s detected language.
+- Added reliable certificate handling for Google translation requests, local fallbacks for common Marketplace phrases, and visible error details.
+
+
 ## 0.7.94
 
 - Made the Smart Sales Reply panel draggable and resizable, with its position and size remembered.
