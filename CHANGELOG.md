@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.93
+
+- Added a Smart Sales Reply panel to PrintFlow's integrated Marketplace Messenger window.
+- Automatically reads the currently open buyer conversation, detects English, Spanish, French, Portuguese, German, or Italian, and prepares a reply in the buyer's language.
+- Sales replies confirm availability, ask whether the buyer needs pickup near Aiken or shipping, and mention custom sizes and colors.
+- Replies remain visible and editable before one deliberate Send Smart Reply click; PrintFlow never bulk-sends unattended messages.
+- Added duplicate-send protection per visible conversation and exact composer verification before sending.
+- Automatically refreshes the prepared reply when a different Marketplace conversation is opened.
+
 ## 0.7.92
 
 - Fixed Model Library selections making Windows report PrintFlow as Not Responding while large STL/3MF printer-fit checks ran.
