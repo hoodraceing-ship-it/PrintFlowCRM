@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.100
+
+- Correctly translates “Ich möchte zwei. Eins in rot und eins blau” as “I would like two: one red and one blue.”
+- Checks combined quantity-and-color requests before single-color rules.
+- Added direct two-color confirmation replies in all six supported languages.
+- Improved offline phrase normalization so punctuation does not prevent a match.
+
+
 ## 0.7.99
 
 - Recognizes common German sentence patterns and misspellings without relying on Google.
