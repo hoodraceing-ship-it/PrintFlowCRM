@@ -1,6 +1,7 @@
 import ctypes
 import json
 import os
+import re
 import ssl
 import sys
 import tempfile
@@ -124,7 +125,7 @@ class Bridge:
                 "error": f"Google rate-limit cooldown ({wait_seconds}s remaining)",
             }
 
-        normalized = " ".join(text.lower().replace("¿", "").replace("?", "").split())
+        normalized = " ".join(re.sub(r"[^\w\s]", " ", text.lower(), flags=re.UNICODE).split())
         offline_phrases = {
             "hola": ("Hello", "es"),
             "hola sigue disponible": ("Hi, is it still available?", "es"),
@@ -149,6 +150,9 @@ class Bridge:
             "kanst du das in blau machen": ("Can you make that in blue?", "de"),
             "kaanst du das in blau machen": ("Can you make that in blue?", "de"),
             "kannst du es in blau machen": ("Can you make it in blue?", "de"),
+            "ich möchte zwei eins in rot und eins blau": ("I would like two. One in red and one in blue.", "de"),
+            "ich mochte zwei eins in rot und eins blau": ("I would like two. One in red and one in blue.", "de"),
+            "ich möchte zwei eins in rot und eins in blau": ("I would like two. One in red and one in blue.", "de"),
         }
         if target == "en" and normalized in offline_phrases:
             translated, source = offline_phrases[normalized]
@@ -479,7 +483,7 @@ INJECT = r'''
         es:['hola','sigue disponible','aún está disponible','aun esta disponible','disponible','ubicacion','ubicación','dónde','donde','baño','bano','todavía','precio','cuánto','cuanto','envío','envio','gracias','interesado'],
         fr:['bonjour','toujours disponible','combien','prix','livraison','merci','intéressé','interesse'],
         pt:['olá','ola','ainda está disponível','ainda esta disponivel','preço','preco','envio','obrigado','interessado'],
-        de:['hallo','verfügbar','verfugbar','ist das','kannst du','kanst du','kaanst du','in blau','blau','machen','preis','versand','danke','interessiert'],
+        de:['hallo','verfügbar','verfugbar','ist das','kannst du','kanst du','kaanst du','ich möchte','ich mochte','zwei','eins in','in rot','in blau','blau','rot','machen','preis','versand','danke','interessiert'],
         it:['ciao','disponibile','prezzo','spedizione','grazie','interessato']
       };
       let best='en', bestScore=0;
@@ -620,8 +624,12 @@ INJECT = r'''
     const detectIntent = question => {
       const value = String(question || '').toLowerCase();
       if (/scam|fraud|estafa|betrug|arnaque|fraude|truffa/.test(value)) return 'scam';
-      if (/blue|blau|azul|bleu|\bblu\b/.test(value)) return 'blue';
-      if (/\b(two|2|both|pair|dos|beide|deux|dois|due)\b/.test(value) || /you have posted|your listings|these two/.test(value)) return 'multi';
+      const hasTwo = /\b(two|2|both|pair|dos|zwei|beide|deux|dois|due)\b/.test(value);
+      const hasRed = /\b(red|rot|rojo|rouge|vermelho|rosso)\b/.test(value);
+      const hasBlue = /\b(blue|blau|azul|bleu|blu)\b/.test(value);
+      if (hasTwo && hasRed && hasBlue) return 'multi_color';
+      if (hasTwo || /you have posted|your listings|these two/.test(value)) return 'multi';
+      if (hasBlue) return 'blue';
       if (/where|location|located|pickup|address|bathroom|ubicaci[oó]n|d[oó]nde|recoger|wo\b|standort|abholen|adresse|o[uù]|emplacement|retirer|localiza[cç][aã]o|retirada|dove|posizione|ritiro/.test(value)) return 'location';
       if (/ship|shipping|deliver|mail|postal|zip code|env[ií]o|enviar|versand|liefern|lieferung|livraison|exp[eé]dier|spedizione|spedire/.test(value)) return 'shipping';
       if (/price|cost|how much|lowest|offer|precio|cu[aá]nto|preis|kosten|combien|prix|pre[cç]o|quanto|prezzo|offerta/.test(value)) return 'price';
@@ -635,6 +643,7 @@ INJECT = r'''
     const intentEnglish = intent => ({
       scam:'The buyer is concerned this may be a scam.',
       blue:'The buyer is asking whether you can make it in blue.',
+      multi_color:'The buyer wants two items: one red and one blue.',
       multi:'The buyer is interested in two items.',
       location:'The buyer is asking where you are located.',
       shipping:'The buyer is asking about shipping.',
@@ -652,6 +661,7 @@ INJECT = r'''
         en:{
           availability:"Hi! Yes, it’s still available. Would you prefer local pickup near Aiken, SC, or shipping?",
           blue:"Yes, I can make it in blue. Would you prefer local pickup near Aiken, SC, or shipping?",
+          multi_color:"Perfect—I can make two: one red and one blue. Would you prefer local pickup near Aiken, SC, or shipping?",
           location:"I’m located near Aiken, South Carolina. I can also ship anywhere in the U.S.",
           shipping:"Yes, I can ship anywhere in the U.S. What ZIP code should I use for the shipping quote?",
           price:price ? "The listed price is "+price+". Would you need shipping or local pickup near Aiken, SC?" : "What item and quantity are you interested in? I can confirm the price and shipping.",
@@ -665,6 +675,7 @@ INJECT = r'''
         es:{
           availability:"¡Hola! Sí, todavía está disponible. ¿Prefieres recogerlo cerca de Aiken, Carolina del Sur, o necesitas envío?",
           blue:"Sí, puedo hacerlo en azul. ¿Prefieres recogerlo cerca de Aiken, Carolina del Sur, o necesitas envío?",
+          multi_color:"Perfecto, puedo hacer dos: uno rojo y uno azul. ¿Prefieres recogerlos cerca de Aiken, Carolina del Sur, o necesitas envío?",
           location:"Estoy cerca de Aiken, Carolina del Sur. También puedo enviarlo a cualquier parte de EE. UU.",
           shipping:"Sí, puedo enviarlo a cualquier parte de EE. UU. ¿Qué código postal debo usar para calcular el envío?",
           price:price ? "El precio publicado es "+price+". ¿Necesitas envío o recogida cerca de Aiken, Carolina del Sur?" : "¿Qué artículo y cantidad te interesan? Puedo confirmar el precio y el envío.",
@@ -678,6 +689,7 @@ INJECT = r'''
         de:{
           availability:"Hallo! Ja, der Artikel ist noch verfügbar. Möchten Sie ihn in der Nähe von Aiken, South Carolina, abholen oder benötigen Sie Versand?",
           blue:"Ja, ich kann es in Blau anfertigen. Möchten Sie es in der Nähe von Aiken, South Carolina, abholen oder benötigen Sie Versand?",
+          multi_color:"Perfekt, ich kann zwei anfertigen: einen in Rot und einen in Blau. Möchten Sie sie in der Nähe von Aiken, South Carolina, abholen oder benötigen Sie Versand?",
           location:"Ich befinde mich in der Nähe von Aiken, South Carolina. Ich kann auch überall in den USA versenden.",
           shipping:"Ja, ich kann überall in den USA versenden. Welche Postleitzahl soll ich für die Versandkosten verwenden?",
           price:price ? "Der angegebene Preis beträgt "+price+". Benötigen Sie Versand oder Abholung in der Nähe von Aiken, SC?" : "Für welchen Artikel und welche Menge interessieren Sie sich? Ich kann Preis und Versand bestätigen.",
@@ -691,6 +703,7 @@ INJECT = r'''
         fr:{
           availability:"Bonjour ! Oui, l’article est toujours disponible. Préférez-vous le récupérer près d’Aiken, en Caroline du Sud, ou le faire expédier ?",
           blue:"Oui, je peux le faire en bleu. Préférez-vous le retrait près d’Aiken ou la livraison ?",
+          multi_color:"Parfait, je peux en faire deux : un rouge et un bleu. Préférez-vous le retrait près d’Aiken ou la livraison ?",
           location:"Je suis près d’Aiken, en Caroline du Sud. Je peux aussi expédier partout aux États-Unis.",
           shipping:"Oui, je peux expédier partout aux États-Unis. Quel code postal dois-je utiliser pour calculer les frais d’envoi ?",
           price:price ? "Le prix affiché est de "+price+". Avez-vous besoin d’une livraison ou d’un retrait près d’Aiken ?" : "Quel article et quelle quantité vous intéressent ? Je peux confirmer le prix et la livraison.",
@@ -704,6 +717,7 @@ INJECT = r'''
         pt:{
           availability:"Olá! Sim, o item ainda está disponível. Você prefere retirar perto de Aiken, Carolina do Sul, ou precisa de envio?",
           blue:"Sim, posso fazê-lo em azul. Você prefere retirar perto de Aiken ou precisa de envio?",
+          multi_color:"Perfeito, posso fazer dois: um vermelho e um azul. Você prefere retirar perto de Aiken ou precisa de envio?",
           location:"Estou perto de Aiken, Carolina do Sul. Também posso enviar para qualquer lugar dos EUA.",
           shipping:"Sim, posso enviar para qualquer lugar dos EUA. Qual CEP devo usar para calcular o frete?",
           price:price ? "O preço anunciado é "+price+". Você precisa de envio ou retirada perto de Aiken?" : "Qual item e quantidade você deseja? Posso confirmar o preço e o envio.",
@@ -717,6 +731,7 @@ INJECT = r'''
         it:{
           availability:"Ciao! Sì, l’articolo è ancora disponibile. Preferisci il ritiro vicino ad Aiken, South Carolina, oppure la spedizione?",
           blue:"Sì, posso realizzarlo in blu. Preferisci il ritiro vicino ad Aiken oppure la spedizione?",
+          multi_color:"Perfetto, posso realizzarne due: uno rosso e uno blu. Preferisci il ritiro vicino ad Aiken oppure la spedizione?",
           location:"Mi trovo vicino ad Aiken, South Carolina. Posso anche spedire ovunque negli Stati Uniti.",
           shipping:"Sì, posso spedire ovunque negli Stati Uniti. Quale CAP devo usare per calcolare la spedizione?",
           price:price ? "Il prezzo indicato è "+price+". Ti serve la spedizione o il ritiro vicino ad Aiken?" : "Quale articolo e quantità ti interessano? Posso confermare prezzo e spedizione.",
