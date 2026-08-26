@@ -576,6 +576,9 @@ INJECT = r'''
           ? "The listed price is " + listingPrice + ". Would you need shipping or local pickup near Aiken, SC?"
           : "What item and quantity are you interested in? I can confirm the price and shipping.";
       }
+      if (/\b(two|2|both|pair)\b/.test(value) || /you have posted|your listings|these two/.test(value)) {
+        return "Great! Which two items would you like, and do you need shipping or local pickup near Aiken, SC?";
+      }
       if (/include|come with|tool|battery|charger/.test(value)) {
         return "The sale is for the 3D-printed holder or insert shown. Tools, batteries, and chargers are not included unless the listing specifically says otherwise.";
       }
