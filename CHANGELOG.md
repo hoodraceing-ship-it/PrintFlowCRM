@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.94
+
+- Made the Smart Sales Reply panel draggable and resizable, with its position and size remembered.
+- Added an English translation of the latest buyer message and the reply being prepared.
+- Added small English captions beneath visible non-English Marketplace chat messages.
+- Translation sends only the individual visible message being translated to Google Translate; results are cached locally.
+- Kept the original Marketplace messages visible and preserved the deliberate one-click send safeguard.
+
+
 ## 0.7.93
 
 - Added a Smart Sales Reply panel to PrintFlow's integrated Marketplace Messenger window.
