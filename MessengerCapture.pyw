@@ -725,7 +725,20 @@ INJECT = r'''
       });
       const incomingNode = incoming.length ? incoming[incoming.length - 1] : null;
       const incomingText = incomingNode ? String(incomingNode.innerText || '').replace(/\s+/g, ' ').trim() : '';
-      return {composer, root, text, incomingNode, incomingText, key:location.href + '|' + (incomingText || text.slice(-500))};
+      const centerLine = composerRect.left + composerRect.width * 0.5;
+      const messages = candidates.slice(-60).map((node, index) => {
+        const r = node.getBoundingClientRect();
+        return {
+          index, node,
+          role:(r.left + r.width / 2 < centerLine ? 'buyer' : 'seller'),
+          text:String(node.innerText || '').replace(/\s+/g, ' ').trim()
+        };
+      }).filter(item => item.text);
+      const signature = messages.slice(-4).map(item => item.role + ':' + item.text).join('|');
+      return {
+        composer, root, text, messages, incomingNode, incomingText,
+        key:location.href + '|' + (signature || incomingText || text.slice(-500))
+      };
     };
 
     const translateEnglish = async value => {
@@ -760,8 +773,11 @@ INJECT = r'''
     const translationQueue = [];
     let translationWorkerBusy = false;
     let smartPreparing = false;
+    let aiTranslationActive = false;
+    let aiRequestSerial = 0;
 
     const queueConversationTranslations = (root, skipNode=null) => {
+      if (aiTranslationActive || smartPreparing) return;
       const now = Date.now();
       for (const node of messageCandidates(root)) {
         if (node === skipNode) continue;
@@ -775,7 +791,7 @@ INJECT = r'''
     };
 
     const processTranslationQueue = async () => {
-      if (translationWorkerBusy || smartPreparing || !translationQueue.length) return;
+      if (translationWorkerBusy || smartPreparing || aiTranslationActive || !translationQueue.length) return;
       translationWorkerBusy = true;
       const item = translationQueue.shift();
       const node = item.node;
@@ -956,7 +972,88 @@ INJECT = r'''
         setSmartStatus('I can see the chat, but not the newest buyer bubble. Try Refresh.', '#fbbf24');
         return;
       }
-      setSmartStatus('Reading the buyer’s latest question…');
+      const requestSerial = ++aiRequestSerial;
+      const consentKey = 'printflow-openai-chat-consent-v1';
+      let aiConsent = localStorage.getItem(consentKey) || '';
+      if (!aiConsent) {
+        const allowed = window.confirm(
+          'Enable full AI chat translation?\n\n' +
+          'PrintFlow will send the loaded Marketplace message text and listing context to OpenAI for translation and reply preparation. ' +
+          'Names and conversation links are not intentionally included. This uses your configured OpenAI API key and API credit.'
+        );
+        aiConsent = allowed ? 'allowed' : 'denied';
+        localStorage.setItem(consentKey, aiConsent);
+      }
+
+      if (aiConsent === 'allowed') {
+        setSmartStatus('OpenAI is translating the full conversation…');
+        if (buyerTranslation) buyerTranslation.textContent = 'Translating the complete message…';
+        if (replyTranslation) replyTranslation.textContent = 'Preparing a conversation-aware reply…';
+        smartPreparing = true;
+        aiTranslationActive = false;
+        translationQueue.length = 0;
+        let aiResult = null;
+        try {
+          const safeMessages = (snapshot.messages || []).map((item, index) => ({
+            index, role:item.role, text:item.text
+          }));
+          aiResult = await window.pywebview.api.ai_analyze(safeMessages, snapshot.text);
+        } catch (error) {
+          aiResult = {ok:false, error:String(error || 'OpenAI request failed')};
+        }
+        smartPreparing = false;
+
+        const currentSnapshot = conversationSnapshot();
+        if (requestSerial !== aiRequestSerial || !currentSnapshot || currentSnapshot.key !== snapshot.key) return;
+
+        if (aiResult && aiResult.ok && aiResult.data) {
+          const data = aiResult.data;
+          aiTranslationActive = true;
+          translationQueue.length = 0;
+          if (languageBox) languageBox.textContent = data.detected_language_name || String(data.detected_language_code || '').toUpperCase() || 'Detected';
+          if (buyerTranslation) {
+            buyerTranslation.textContent = data.latest_buyer_message_english || 'No buyer message translation returned.';
+            buyerTranslation.title = 'Full translation by OpenAI';
+          }
+          if (replyTranslation) replyTranslation.textContent = data.reply_in_english || '';
+          if (replyBox) {
+            replyBox.value = data.reply_in_buyer_language || data.reply_in_english || '';
+            replyBox.dataset.conversationKey = snapshot.key;
+          }
+
+          const translations = Array.isArray(data.translations) ? data.translations : [];
+          for (const translation of translations) {
+            const item = (snapshot.messages || [])[Number(translation.index)];
+            if (!item || !item.node || !item.node.isConnected) continue;
+            const english = String(translation.english || '').trim();
+            const original = String(item.text || '').trim();
+            const oldCaption = item.node.parentElement
+              ? item.node.parentElement.querySelector(':scope > .printflow-inline-translation')
+              : null;
+            if (!english || english.toLowerCase() === original.toLowerCase()) {
+              if (oldCaption) oldCaption.remove();
+              item.node.dataset.printflowTranslatedText = original;
+            } else {
+              setInlineCaption(item.node, english);
+            }
+          }
+
+          const sentKey = localStorage.getItem('printflow-smart-last-sent') || '';
+          if (sentKey === snapshot.key) {
+            setSmartStatus('A reply was already sent for this visible conversation.', '#fbbf24');
+          } else {
+            setSmartStatus('Full chat translated and a conversation-aware reply prepared with OpenAI.', '#86efac');
+          }
+          return;
+        }
+        aiTranslationActive = false;
+        setSmartStatus(
+          'OpenAI unavailable: ' + ((aiResult && aiResult.error) || 'unknown error') + '. Using fallback.',
+          '#fbbf24'
+        );
+      }
+
+      setSmartStatus('Reading the buyer’s latest question with fallback translation…');
       if (buyerTranslation) buyerTranslation.textContent = 'Translating…';
 
       smartPreparing = true;
@@ -1089,7 +1186,7 @@ INJECT = r'''
         lastConversation = key;
         prepareSmartReply();
       }
-      if (snapshot) queueConversationTranslations(snapshot.root, snapshot.incomingNode);
+      if (snapshot && !aiTranslationActive) queueConversationTranslations(snapshot.root, snapshot.incomingNode);
     };
     setInterval(watchConversation, 650);
     setTimeout(watchConversation, 500);
