@@ -734,7 +734,7 @@ INJECT = r'''
           text:String(node.innerText || '').replace(/\s+/g, ' ').trim()
         };
       }).filter(item => item.text);
-      const signature = messages.slice(-4).map(item => item.role + ':' + item.text).join('|');
+      const signature = messages.map(item => item.role + ':' + item.text).join('|');
       return {
         composer, root, text, messages, incomingNode, incomingText,
         key:location.href + '|' + (signature || incomingText || text.slice(-500))
@@ -978,8 +978,9 @@ INJECT = r'''
       if (!aiConsent) {
         const allowed = window.confirm(
           'Enable full AI chat translation?\n\n' +
-          'PrintFlow will send the loaded Marketplace message text and listing context to OpenAI for translation and reply preparation. ' +
-          'Names and conversation links are not intentionally included. This uses your configured OpenAI API key and API credit.'
+          'PrintFlow will send the loaded Marketplace messages and listing context to OpenAI for translation and reply preparation. ' +
+          'This can include buyer names displayed with messages. Conversation links are not sent intentionally. ' +
+          'This uses your configured OpenAI API key and API credit.'
         );
         aiConsent = allowed ? 'allowed' : 'denied';
         localStorage.setItem(consentKey, aiConsent);
@@ -1178,18 +1179,24 @@ INJECT = r'''
     };
 
     let lastConversation = '';
+    let conversationChangeTimer = 0;
     const watchConversation = () => {
       if (!document.getElementById('printflow-smart-reply')) return;
       const snapshot = conversationSnapshot();
       const key = snapshot ? snapshot.key : '';
       if (key && key !== lastConversation) {
         lastConversation = key;
-        prepareSmartReply();
+        aiTranslationActive = false;
+        clearTimeout(conversationChangeTimer);
+        conversationChangeTimer = setTimeout(() => {
+          const stableSnapshot = conversationSnapshot();
+          if (stableSnapshot && stableSnapshot.key === lastConversation) prepareSmartReply();
+        }, 700);
       }
       if (snapshot && !aiTranslationActive) queueConversationTranslations(snapshot.root, snapshot.incomingNode);
     };
     setInterval(watchConversation, 650);
-    setTimeout(watchConversation, 500);
+    setTimeout(watchConversation, 350);
   }
 
   const payment = window.__PRINTFLOW_PAYMENT_REQUEST__;
