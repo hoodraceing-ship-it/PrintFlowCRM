@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.92
+
+- Fixed Model Library selections making Windows report PrintFlow as Not Responding while large STL/3MF printer-fit checks ran.
+- Model details now appear immediately and show Checking… while A1 Mini/P2S fit results calculate on a background worker.
+- Cached fit results are reused on later selections, and stale calculations stop when a different model is selected.
+- Large Model Library preview images are decoded and resized off the Tk UI thread.
+
 ## 0.7.91
 
 - Removed the separate New Marketplace Order dialog and its duplicate creation buttons.
