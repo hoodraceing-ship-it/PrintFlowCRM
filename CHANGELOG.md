@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.96
+
+- Rebuilt the v0.7.95 Messenger fixes in a correctly versioned update package.
+- Fixed the release pipeline that produced a ZIP whose manifest and main app version did not match.
+- Releases now build only after the version manifest is finalized.
+- Added validation that blocks any future release when the manifest and app versions disagree.
+
+
 ## 0.7.95
 
 - Fixed Marketplace’s newest buyer bubble detection by locating messages from the center composer lane instead of relying on an unstable Facebook container.
