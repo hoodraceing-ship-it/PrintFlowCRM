@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.101
+
+- Replaced the normal keyword/phrase translation path with OpenAI full-conversation translation.
+- Translates every loaded Marketplace message literally into English instead of showing an intent summary.
+- Preserves quantities, colors, prices, corrections, measurements, pickup/shipping details, and negations.
+- Generates the sales reply from the entire conversation and listing context, then writes it in the latest buyer language.
+- Automatically reruns after switching chats, receiving a message, or loading additional history.
+- Adds a one-time privacy consent prompt before Marketplace text is sent to OpenAI.
+- Keeps the paced Google translator and offline intent system only as emergency fallbacks.
+- Updated Settings to describe the Marketplace Sales Assistant use of the configured OpenAI key and model.
+
+
 ## 0.7.100
 
 - Correctly translates “Ich möchte zwei. Eins in rot und eins blau” as “I would like two: one red and one blue.”
