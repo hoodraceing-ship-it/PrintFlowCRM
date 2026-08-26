@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.99
+
+- Recognizes common German sentence patterns and misspellings without relying on Google.
+- Added German color vocabulary, including “blau,” to offline language and intent detection.
+- “Kaanst du das in blau machen?” is interpreted as “Can you make that in blue?”
+- Added direct color-specific replies in all six supported languages.
+
+
 ## 0.7.98
 
 - Fixed offline phrase metadata that incorrectly labeled cached German, French, Portuguese, and Italian phrases as Spanish.
