@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.91
+
+- Removed the separate New Marketplace Order dialog and its duplicate creation buttons.
+- Expanded the working New Order dialog with order source, agreed price, paid amount, payment method, filament colors, conversation link, and optional Marketplace conversation.
+- Marketplace clipboard imports now open the unified New Order form and keep their chat attached to the order.
+- Added visible save-error reporting so a failed order creation can no longer silently do nothing.
+- Existing Marketplace orders, conversations, and the Marketplace order list remain intact.
+
 ## 0.7.90
 
 - Added dedicated Iso, Top, Bottom View, Front, and Right camera buttons to Print Preflight while preserving free mouse-drag orbiting and zoom.
