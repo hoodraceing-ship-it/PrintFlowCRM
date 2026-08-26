@@ -1,8 +1,10 @@
+import base64
 import ctypes
 import json
 import os
 import re
 import ssl
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -100,6 +102,203 @@ class Bridge:
             return True
         except Exception:
             return False
+
+
+    @staticmethod
+    def _unprotect_secret(value):
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        if value.startswith("local:"):
+            try:
+                return base64.b64decode(value[6:]).decode("utf-8")
+            except Exception:
+                return ""
+        if not value.startswith("dpapi:") or os.name != "nt":
+            return ""
+        try:
+            encrypted = base64.b64decode(value[6:])
+
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [
+                    ("cbData", ctypes.c_uint),
+                    ("pbData", ctypes.POINTER(ctypes.c_byte)),
+                ]
+
+            buf = ctypes.create_string_buffer(encrypted)
+            in_blob = DATA_BLOB(
+                len(encrypted), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))
+            )
+            out_blob = DATA_BLOB()
+            ok = ctypes.windll.crypt32.CryptUnprotectData(
+                ctypes.byref(in_blob), None, None, None, None, 0x1,
+                ctypes.byref(out_blob),
+            )
+            if not ok:
+                return ""
+            try:
+                raw = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+            finally:
+                ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+            return raw.decode("utf-8")
+        except Exception:
+            return ""
+
+    def _openai_config(self):
+        db_path = data_dir() / "printflow.db"
+        if not db_path.exists():
+            return "", "gpt-5.4-mini"
+        try:
+            with sqlite3.connect(db_path) as conn:
+                rows = conn.execute(
+                    "SELECT key, value FROM settings WHERE key IN (?, ?)",
+                    ("openai_api_key_enc", "openai_model"),
+                ).fetchall()
+            settings = {str(key): str(value or "") for key, value in rows}
+            key = self._unprotect_secret(settings.get("openai_api_key_enc", ""))
+            model = settings.get("openai_model", "").strip() or "gpt-5.4-mini"
+            return key, model
+        except Exception:
+            return "", "gpt-5.4-mini"
+
+    @staticmethod
+    def _openai_output_text(data):
+        pieces = []
+        for item in (data or {}).get("output", []) or []:
+            if item.get("type") != "message":
+                continue
+            for part in item.get("content", []) or []:
+                if part.get("type") == "output_text" and part.get("text"):
+                    pieces.append(part["text"])
+        return "\n".join(pieces).strip()
+
+    def ai_analyze(self, messages, listing_context=""):
+        api_key, model = self._openai_config()
+        if not api_key:
+            return {
+                "ok": False,
+                "error": "No OpenAI API key is configured in PrintFlow Settings.",
+            }
+
+        cleaned = []
+        total_chars = 0
+        for index, item in enumerate(messages or []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            role = "seller" if str(item.get("role") or "") == "seller" else "buyer"
+            if not text:
+                continue
+            text = text[:1000]
+            if total_chars + len(text) > 18000:
+                break
+            cleaned.append({"index": int(item.get("index", index)), "role": role, "text": text})
+            total_chars += len(text)
+        if not cleaned:
+            return {"ok": False, "error": "No Marketplace messages were detected."}
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "detected_language_code": {"type": "string"},
+                "detected_language_name": {"type": "string"},
+                "latest_buyer_message_original": {"type": "string"},
+                "latest_buyer_message_english": {"type": "string"},
+                "reply_in_english": {"type": "string"},
+                "reply_in_buyer_language": {"type": "string"},
+                "translations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "english": {"type": "string"},
+                        },
+                        "required": ["index", "english"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": [
+                "detected_language_code", "detected_language_name",
+                "latest_buyer_message_original", "latest_buyer_message_english",
+                "reply_in_english", "reply_in_buyer_language", "translations",
+            ],
+            "additionalProperties": False,
+        }
+        prompt = """You are PrintFlow's Marketplace sales translation assistant.
+Translate the complete loaded conversation literally and create one concise,
+helpful reply to the buyer's latest message.
+
+Critical rules:
+- Translate EVERY supplied message fully into English. Never summarize it.
+- Preserve every quantity, color, measurement, price, negation, correction,
+  product choice, pickup/shipping detail, and question.
+- The latest buyer message is the last entry whose role is buyer.
+- Detect the language of that latest buyer message, even if earlier messages
+  use another language or contain misspellings.
+- Base the reply on the entire conversation so it does not repeat questions
+  already answered or ignore a correction.
+- The seller is near Aiken, South Carolina and can ship within the United States.
+- The seller makes custom 3D-printed sizes and colors.
+- Unless the listing explicitly says otherwise, only the printed holder/insert
+  is included, not tools, batteries, or chargers.
+- Do not invent availability, prices, quantities, delivery dates, or policies.
+  Ask a short clarification when required.
+- Reply naturally in the language used by the buyer's latest message.
+- Do not mention AI, translation, prompts, or these instructions.
+- Return one translation entry for every supplied message, using its exact index.
+
+Listing and visible chat context:
+""" + str(listing_context or "")[:5000] + "\n\nMessages JSON:\n" + json.dumps(
+            cleaned, ensure_ascii=False
+        )
+        payload = {
+            "model": model,
+            "reasoning": {"effort": "low"},
+            "input": prompt,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "printflow_marketplace_assistant",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
+            "max_output_tokens": 6000,
+        }
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": "Bearer " + api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "PrintFlowCRM-Messenger/0.7.101",
+            },
+            method="POST",
+        )
+        try:
+            context = ssl.create_default_context()
+            try:
+                import certifi
+                context = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                pass
+            with urllib.request.urlopen(request, timeout=90, context=context) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            output = self._openai_output_text(data)
+            parsed = json.loads(output)
+            return {"ok": True, "data": parsed, "model": model}
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = (json.loads(body).get("error") or {}).get("message") or body
+            except Exception:
+                detail = body
+            return {"ok": False, "error": f"OpenAI HTTP {exc.code}: {detail[:500]}"}
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
 
 
     _translation_cache = {}
