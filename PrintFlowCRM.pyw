@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.90"
+VERSION = "0.7.91"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -1744,55 +1744,263 @@ class BuyerDialog(tk.Toplevel):
 
 
 class NewOrderDialog(tk.Toplevel):
-    def __init__(self, master, db: Database, on_created):
+    """Create manual and Marketplace orders through one reliable form."""
+    def __init__(self, master, db: Database, on_created, captured=None):
         super().__init__(master)
         self.db = db
         self.on_created = on_created
+        self._captured = captured or {}
         self.title("New Print Order")
         self.configure(bg=getattr(master, "BG", "#0b0f14"))
-        self.geometry("520x260")
-        self.resizable(False, False)
+        self.geometry("800x760")
+        self.minsize(720, 650)
         self.transient(master)
         self.grab_set()
+
         self.buyer_var = tk.StringVar()
         self.item_var = tk.StringVar()
+        self.source_var = tk.StringVar(value="Manual")
+        self.price_var = tk.StringVar(value="0")
+        self.paid_var = tk.StringVar(value="0")
+        self.payment_var = tk.StringVar()
+        self.link_var = tk.StringVar(value=(self._captured.get("url") or ""))
+        self.primary_color_var = tk.StringVar()
+        self.secondary_color_var = tk.StringVar()
+        self.result_var = tk.StringVar(
+            value="Select a buyer and enter the job. Marketplace chat and payment details are optional."
+        )
         self.buyer_map = {}
         self._build()
         self.refresh_buyers()
 
+        if self._captured.get("text"):
+            self.source_var.set("Facebook Marketplace")
+            self.chat.insert("1.0", self._captured.get("text") or "")
+            self.analyze()
+
     def _build(self):
-        f = ttk.Frame(self, padding=20)
+        f = ttk.Frame(self, padding=18)
         f.pack(fill="both", expand=True)
-        ttk.Label(f, text="Buyer").grid(row=0,column=0,sticky="w",pady=8)
-        row = ttk.Frame(f)
-        row.grid(row=0,column=1,sticky="ew",pady=8)
-        self.buyer_combo = ttk.Combobox(row, textvariable=self.buyer_var, state="readonly", width=35)
+        f.columnconfigure(1, weight=1)
+        f.columnconfigure(3, weight=1)
+
+        ttk.Label(f, text="New Print Order", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w"
+        )
+        ttk.Label(
+            f,
+            text="Manual and Facebook Marketplace orders now use the same form.",
+            style="Sub.TLabel",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 14))
+
+        ttk.Label(f, text="Buyer").grid(row=2, column=0, sticky="w", pady=5)
+        buyer_row = ttk.Frame(f)
+        buyer_row.grid(row=2, column=1, sticky="ew", padx=(8, 16), pady=5)
+        self.buyer_combo = ttk.Combobox(
+            buyer_row, textvariable=self.buyer_var, state="readonly", width=28
+        )
         self.buyer_combo.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="+ Buyer", command=self.new_buyer).pack(side="left", padx=(6,0))
-        ttk.Label(f, text="Item / Job").grid(row=1,column=0,sticky="w",pady=8)
-        item = ttk.Entry(f, textvariable=self.item_var, width=42)
-        item.grid(row=1,column=1,sticky="ew",pady=8)
-        item.focus_set()
-        f.columnconfigure(1,weight=1)
+        ttk.Button(buyer_row, text="+ Buyer", command=self.new_buyer).pack(
+            side="left", padx=(6, 0)
+        )
+
+        ttk.Label(f, text="Item / job").grid(row=2, column=2, sticky="w", pady=5)
+        item = ttk.Entry(f, textvariable=self.item_var)
+        item.grid(row=2, column=3, sticky="ew", padx=(8, 0), pady=5)
+
+        ttk.Label(f, text="Order source").grid(row=3, column=0, sticky="w", pady=5)
+        ttk.Combobox(
+            f,
+            textvariable=self.source_var,
+            values=["Manual", "Facebook Marketplace"],
+            state="readonly",
+        ).grid(row=3, column=1, sticky="ew", padx=(8, 16), pady=5)
+        ttk.Label(f, text="Agreed price").grid(row=3, column=2, sticky="w", pady=5)
+        ttk.Entry(f, textvariable=self.price_var).grid(
+            row=3, column=3, sticky="ew", padx=(8, 0), pady=5
+        )
+
+        ttk.Label(f, text="Paid now").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Entry(f, textvariable=self.paid_var).grid(
+            row=4, column=1, sticky="ew", padx=(8, 16), pady=5
+        )
+        ttk.Label(f, text="Payment method").grid(row=4, column=2, sticky="w", pady=5)
+        ttk.Combobox(
+            f,
+            textvariable=self.payment_var,
+            values=["", "Cash App", "Venmo", "PayPal", "Cash", "Zelle", "Card", "Other"],
+            state="readonly",
+        ).grid(row=4, column=3, sticky="ew", padx=(8, 0), pady=5)
+
+        ttk.Label(f, text="Primary filament color").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Entry(f, textvariable=self.primary_color_var).grid(
+            row=5, column=1, sticky="ew", padx=(8, 16), pady=5
+        )
+        ttk.Label(f, text="Secondary color").grid(row=5, column=2, sticky="w", pady=5)
+        ttk.Entry(f, textvariable=self.secondary_color_var).grid(
+            row=5, column=3, sticky="ew", padx=(8, 0), pady=5
+        )
+
+        ttk.Label(f, text="Conversation link (optional)").grid(
+            row=6, column=0, sticky="w", pady=5
+        )
+        ttk.Entry(f, textvariable=self.link_var).grid(
+            row=6, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=5
+        )
+
+        bar = ttk.Frame(f)
+        bar.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(12, 6))
+        ttk.Label(
+            bar, text="Marketplace conversation (optional)", style="CardTitle.TLabel"
+        ).pack(side="left")
+        ttk.Button(bar, text="Paste Clipboard", command=self.paste_clipboard).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(bar, text="Analyze Paste", command=self.analyze).pack(side="right")
+
+        self.chat = tk.Text(
+            f,
+            height=15,
+            wrap="word",
+            font=("Segoe UI", 9),
+            relief="solid",
+            bd=1,
+            bg=getattr(self.master, "INPUT", "#0f1620"),
+            fg=getattr(self.master, "TEXT", "#eef4fb"),
+            insertbackground=getattr(self.master, "TEXT", "#eef4fb"),
+            selectbackground="#1d4ed8",
+            highlightbackground=getattr(self.master, "BORDER", "#263241"),
+            highlightcolor=getattr(self.master, "ACCENT", "#3b82f6"),
+        )
+        self.chat.grid(row=8, column=0, columnspan=4, sticky="nsew")
+        f.rowconfigure(8, weight=1)
+
+        ttk.Label(
+            f, textvariable=self.result_var, style="Sub.TLabel", wraplength=740
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(8, 4))
+
         bf = ttk.Frame(f)
-        bf.grid(row=2,column=0,columnspan=2,sticky="e",pady=(22,0))
-        ttk.Button(bf,text="Cancel",command=self.destroy).pack(side="left",padx=5)
-        ttk.Button(bf,text="Create Order",style="Accent.TButton",command=self.create).pack(side="left")
+        bf.grid(row=10, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        ttk.Button(bf, text="Cancel", command=self.destroy).pack(side="left", padx=5)
+        ttk.Button(
+            bf,
+            text="Create Order",
+            style="Accent.TButton",
+            command=self.create,
+        ).pack(side="left")
+
+        item.focus_set()
 
     def refresh_buyers(self, select_id=None):
         buyers = self.db.buyers()
-        self.buyer_map = {f"{b['name']}  #{b['id']}": b['id'] for b in buyers}
+        self.buyer_map = {f"{b['name']}  #{b['id']}": b["id"] for b in buyers}
         self.buyer_combo["values"] = list(self.buyer_map.keys())
         if select_id:
-            for label,bid in self.buyer_map.items():
+            for label, bid in self.buyer_map.items():
                 if bid == select_id:
                     self.buyer_var.set(label)
                     break
-        elif buyers:
+        elif buyers and not self.buyer_var.get():
             self.buyer_combo.current(0)
 
     def new_buyer(self):
         BuyerDialog(self, self.db, on_saved=lambda bid: self.refresh_buyers(bid))
+
+    @staticmethod
+    def _clean_line(line):
+        return re.sub(r"\s+", " ", line).strip(" \t:-")
+
+    @staticmethod
+    def _number(text, field):
+        try:
+            return float(str(text).strip() or 0)
+        except ValueError:
+            raise ValueError(f"{field} must be a number.")
+
+    def _select_existing_buyer(self, detected_name):
+        if not detected_name:
+            return False
+        wanted = detected_name.casefold().strip()
+        for label, bid in self.buyer_map.items():
+            buyer_name = label.rsplit("  #", 1)[0].casefold().strip()
+            if buyer_name == wanted:
+                self.buyer_var.set(label)
+                return True
+        return False
+
+    def paste_clipboard(self):
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            self.result_var.set("Clipboard does not contain text.")
+            return
+        self.chat.delete("1.0", "end")
+        self.chat.insert("1.0", text)
+        self.source_var.set("Facebook Marketplace")
+        self.analyze()
+
+    def analyze(self):
+        text = self.chat.get("1.0", "end").strip()
+        if not text:
+            self.result_var.set(
+                "Conversation is optional. Select a buyer and enter the item to create the order."
+            )
+            return
+
+        self.source_var.set("Facebook Marketplace")
+        found = []
+        buyer_hint = ""
+        ignore = {"you", "marketplace", "facebook", "message", "messages", "seller", "buyer"}
+        for raw in text.splitlines()[:12]:
+            line = self._clean_line(raw)
+            simple = re.sub(r"[^A-Za-z' -]", "", line).strip()
+            words = simple.split()
+            if 1 < len(words) <= 4 and simple.lower() not in ignore and len(simple) <= 45:
+                if not re.search(
+                    r"\b(want|need|hello|hey|hi|thanks|price|available|interested|can|could|would)\b",
+                    simple,
+                    re.I,
+                ):
+                    buyer_hint = simple
+                    if self._select_existing_buyer(simple):
+                        found.append("buyer")
+                    break
+
+        amounts = re.findall(r"\$\s*([0-9]+(?:\.[0-9]{1,2})?)", text)
+        if amounts and self.price_var.get().strip() in {"", "0", "0.0", "0.00"}:
+            self.price_var.set(amounts[-1])
+            found.append("price")
+
+        if not self.item_var.get().strip():
+            match = re.search(
+                r"\b(?:want|need|looking for|interested in|make|print)(?:\s+me)?(?:\s+(?:a|an|the))?\s+([^\n.!?]{3,90})",
+                text,
+                re.I,
+            )
+            if match:
+                item = self._clean_line(match.group(1))
+                item = re.sub(
+                    r"\s+(?:for|at)\s+\$?\d+(?:\.\d+)?$", "", item, flags=re.I
+                )
+                self.item_var.set(item[:90])
+                found.append("item")
+
+        primary, secondary = extract_filament_colors(text)
+        if primary and not self.primary_color_var.get().strip():
+            self.primary_color_var.set(primary)
+            found.append("primary color")
+        if secondary and not self.secondary_color_var.get().strip():
+            self.secondary_color_var.set(secondary)
+            found.append("secondary color")
+
+        message = (
+            "Best-effort filled: " + ", ".join(found) + ". Review before creating."
+            if found
+            else "Conversation saved. Review the order fields before creating."
+        )
+        if buyer_hint and "buyer" not in found:
+            message += f' Buyer may be "{buyer_hint}"; use + Buyer if they are new.'
+        self.result_var.set(message)
 
     def create(self):
         label = self.buyer_var.get()
@@ -1803,164 +2011,32 @@ class NewOrderDialog(tk.Toplevel):
         if not item:
             messagebox.showerror("Item required", "Enter what you are printing.", parent=self)
             return
-        oid = self.db.create_order(self.buyer_map[label], item)
+        try:
+            price = self._number(self.price_var.get(), "Agreed price")
+            paid = self._number(self.paid_var.get(), "Paid now")
+            if price < 0 or paid < 0:
+                raise ValueError("Price and payment cannot be negative.")
+            oid = self.db.create_order(
+                self.buyer_map[label],
+                item,
+                source=self.source_var.get().strip() or "Manual",
+                marketplace_chat=self.chat.get("1.0", "end").strip(),
+                messenger_url=self.link_var.get().strip(),
+                total_price=price,
+                amount_paid=paid,
+                payment_method=self.payment_var.get().strip(),
+                primary_color=self.primary_color_var.get().strip(),
+                secondary_color=self.secondary_color_var.get().strip(),
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "Could not create order",
+                f"PrintFlow could not save this order.\n\n{error}",
+                parent=self,
+            )
+            return
         self.destroy()
         self.on_created(oid)
-
-
-class MarketplaceOrderDialog(tk.Toplevel):
-    """Fast manual bridge for personal Facebook Marketplace chats.
-
-    Meta does not expose personal Marketplace inboxes through the Page Messenger API,
-    so this dialog makes copy/paste intake intentionally fast without scraping Facebook.
-    """
-    def __init__(self, master, db: Database, on_created, captured=None):
-        super().__init__(master)
-        self.db = db
-        self.on_created = on_created
-        self._captured = captured or {}
-        self.title("New Marketplace Order")
-        self.configure(bg=getattr(master, "BG", "#0b0f14"))
-        self.geometry("780x750")
-        self.minsize(700, 650)
-        self.transient(master)
-        self.grab_set()
-        self.name_var = tk.StringVar()
-        self.item_var = tk.StringVar()
-        self.price_var = tk.StringVar()
-        self.paid_var = tk.StringVar(value="0")
-        self.payment_var = tk.StringVar()
-        self.link_var = tk.StringVar(value=(self._captured.get("url") or ""))
-        self.primary_color_var = tk.StringVar()
-        self.secondary_color_var = tk.StringVar()
-        self.result_var = tk.StringVar(value="Paste/capture the Marketplace conversation, then review the fields above.")
-        self._build()
-        if self._captured.get("text"):
-            self.chat.insert("1.0", self._captured.get("text") or "")
-            self.analyze()
-
-    def _build(self):
-        f = ttk.Frame(self, padding=18)
-        f.pack(fill="both", expand=True)
-        f.columnconfigure(1, weight=1); f.columnconfigure(3, weight=1)
-        ttk.Label(f, text="Facebook Marketplace → PrintFlow", style="Title.TLabel").grid(row=0,column=0,columnspan=4,sticky="w")
-        ttk.Label(f, text="Paste the chat. PrintFlow keeps the full conversation with the order and fills what it can.", style="Sub.TLabel").grid(row=1,column=0,columnspan=4,sticky="w",pady=(3,14))
-
-        ttk.Label(f,text="Buyer name").grid(row=2,column=0,sticky="w",pady=5)
-        ttk.Entry(f,textvariable=self.name_var).grid(row=2,column=1,sticky="ew",padx=(8,16),pady=5)
-        ttk.Label(f,text="Item / job").grid(row=2,column=2,sticky="w",pady=5)
-        ttk.Entry(f,textvariable=self.item_var).grid(row=2,column=3,sticky="ew",padx=(8,0),pady=5)
-
-        ttk.Label(f,text="Agreed price").grid(row=3,column=0,sticky="w",pady=5)
-        ttk.Entry(f,textvariable=self.price_var).grid(row=3,column=1,sticky="ew",padx=(8,16),pady=5)
-        ttk.Label(f,text="Paid now").grid(row=3,column=2,sticky="w",pady=5)
-        ttk.Entry(f,textvariable=self.paid_var).grid(row=3,column=3,sticky="ew",padx=(8,0),pady=5)
-
-        ttk.Label(f,text="Payment method").grid(row=4,column=0,sticky="w",pady=5)
-        ttk.Combobox(f,textvariable=self.payment_var,values=["","Cash App","Venmo","PayPal","Cash","Zelle","Card","Other"],state="readonly").grid(row=4,column=1,sticky="ew",padx=(8,16),pady=5)
-        ttk.Label(f,text="Conversation link (optional)").grid(row=4,column=2,sticky="w",pady=5)
-        ttk.Entry(f,textvariable=self.link_var).grid(row=4,column=3,sticky="ew",padx=(8,0),pady=5)
-
-        ttk.Label(f,text="Primary filament color").grid(row=5,column=0,sticky="w",pady=5)
-        ttk.Entry(f,textvariable=self.primary_color_var).grid(row=5,column=1,sticky="ew",padx=(8,16),pady=5)
-        ttk.Label(f,text="Secondary color").grid(row=5,column=2,sticky="w",pady=5)
-        ttk.Entry(f,textvariable=self.secondary_color_var).grid(row=5,column=3,sticky="ew",padx=(8,0),pady=5)
-
-        bar=ttk.Frame(f)
-        bar.grid(row=6,column=0,columnspan=4,sticky="ew",pady=(12,6))
-        ttk.Label(bar,text="Marketplace conversation",style="CardTitle.TLabel").pack(side="left")
-        ttk.Button(bar,text="Paste Clipboard",command=self.paste_clipboard).pack(side="right",padx=(6,0))
-        ttk.Button(bar,text="Analyze Paste",command=self.analyze).pack(side="right")
-
-        self.chat = tk.Text(f,height=18,wrap="word",font=("Segoe UI",9),relief="solid",bd=1,
-                            bg=getattr(self.master,"INPUT","#0f1620"), fg=getattr(self.master,"TEXT","#eef4fb"),
-                            insertbackground=getattr(self.master,"TEXT","#eef4fb"), selectbackground="#1d4ed8",
-                            highlightbackground=getattr(self.master,"BORDER","#263241"), highlightcolor=getattr(self.master,"ACCENT","#3b82f6"))
-        self.chat.grid(row=7,column=0,columnspan=4,sticky="nsew")
-        f.rowconfigure(7,weight=1)
-        ttk.Label(f,textvariable=self.result_var,style="Sub.TLabel",wraplength=720).grid(row=8,column=0,columnspan=4,sticky="w",pady=(8,4))
-
-        bf=ttk.Frame(f)
-        bf.grid(row=9,column=0,columnspan=4,sticky="e",pady=(12,0))
-        ttk.Button(bf,text="Open Messenger",command=lambda:webbrowser.open(MARKETPLACE_MESSENGER_URL)).pack(side="left",padx=(0,8))
-        ttk.Button(bf,text="Cancel",command=self.destroy).pack(side="left",padx=5)
-        ttk.Button(bf,text="Create Marketplace Order",style="Accent.TButton",command=self.create).pack(side="left")
-
-    def paste_clipboard(self):
-        try:
-            text=self.clipboard_get()
-        except tk.TclError:
-            self.result_var.set("Clipboard does not contain text.")
-            return
-        self.chat.delete("1.0","end"); self.chat.insert("1.0",text)
-        self.analyze()
-
-    @staticmethod
-    def _clean_line(line):
-        return re.sub(r"\s+", " ", line).strip(" \t:-")
-
-    def analyze(self):
-        text=self.chat.get("1.0","end").strip()
-        if not text:
-            self.result_var.set("Paste a conversation first.")
-            return
-        found=[]
-        if not self.name_var.get().strip():
-            ignore={"you","marketplace","facebook","message","messages","seller","buyer"}
-            for raw in text.splitlines()[:12]:
-                line=self._clean_line(raw)
-                simple=re.sub(r"[^A-Za-z' -]", "", line).strip()
-                words=simple.split()
-                if 1 < len(words) <= 4 and simple.lower() not in ignore and len(simple) <= 45:
-                    # Avoid grabbing ordinary sentence lines as names.
-                    if not re.search(r"\b(want|need|hello|hey|hi|thanks|price|available|interested|can|could|would)\b", simple, re.I):
-                        self.name_var.set(simple); found.append("buyer"); break
-        amounts=re.findall(r"\$\s*([0-9]+(?:\.[0-9]{1,2})?)", text)
-        if amounts and not self.price_var.get().strip():
-            self.price_var.set(amounts[-1]); found.append("price")
-        if not self.item_var.get().strip():
-            m=re.search(r"\b(?:want|need|looking for|interested in|make|print)(?:\s+me)?(?:\s+(?:a|an|the))?\s+([^\n.!?]{3,90})", text, re.I)
-            if m:
-                item=self._clean_line(m.group(1))
-                item=re.sub(r"\s+(?:for|at)\s+\$?\d+(?:\.\d+)?$", "", item, flags=re.I)
-                self.item_var.set(item[:90]); found.append("item")
-        primary, secondary = extract_filament_colors(text)
-        if primary and not self.primary_color_var.get().strip():
-            self.primary_color_var.set(primary); found.append("primary color")
-        if secondary and not self.secondary_color_var.get().strip():
-            self.secondary_color_var.set(secondary); found.append("secondary color")
-        self.result_var.set("Best-effort filled: " + ", ".join(found) + ". Review before creating." if found else "Nothing reliable was auto-detected. Enter buyer/item/colors above; the full chat will still be saved.")
-
-    @staticmethod
-    def _number(text, field):
-        try: return float(str(text).strip() or 0)
-        except ValueError: raise ValueError(f"{field} must be a number.")
-
-    def create(self):
-        self.analyze()
-        name=self.name_var.get().strip(); item=self.item_var.get().strip(); chat=self.chat.get("1.0","end").strip()
-        if not name:
-            messagebox.showerror("Buyer required","Enter the Marketplace buyer's name.",parent=self); return
-        if not item:
-            messagebox.showerror("Item required","Enter what they want printed.",parent=self); return
-        try:
-            price=self._number(self.price_var.get(),"Agreed price")
-            paid=self._number(self.paid_var.get(),"Paid now")
-        except ValueError as e:
-            messagebox.showerror("Payment",str(e),parent=self); return
-        buyer=self.db.find_buyer_by_name(name)
-        if buyer:
-            bid=buyer["id"]
-        else:
-            bid=self.db.save_buyer(None,[name,"","","","","","","","US"])
-        oid=self.db.create_order(bid,item,source="Facebook Marketplace",marketplace_chat=chat,
-                                 messenger_url=self.link_var.get().strip(),total_price=price,
-                                 amount_paid=paid,payment_method=self.payment_var.get().strip(),
-                                 primary_color=self.primary_color_var.get().strip(),
-                                 secondary_color=self.secondary_color_var.get().strip())
-        self.destroy(); self.on_created(oid)
-
-
 class App(tk.Tk):
     BG = "#0b0f14"
     NAV = "#0d131b"
@@ -3067,11 +3143,8 @@ class App(tk.Tk):
         if sel:
             self.show_orders(int(sel[0]))
 
-    def new_order(self):
-        NewOrderDialog(self, self.db, lambda oid: self.show_orders(oid))
-
-    def new_marketplace_order(self, captured=None):
-        MarketplaceOrderDialog(self, self.db, lambda oid: self.show_orders(oid), captured=captured)
+    def new_order(self, captured=None):
+        NewOrderDialog(self, self.db, lambda oid: self.show_orders(oid), captured=captured)
 
     def _read_messenger_capture(self, quiet=False):
         try:
@@ -3092,7 +3165,7 @@ class App(tk.Tk):
         data=self._read_messenger_capture()
         if data:
             self._messenger_capture_seen=data.get("captured_at","") or self._messenger_capture_seen
-            self.new_marketplace_order(captured=data)
+            self.new_order(captured=data)
 
     def _poll_messenger_capture(self):
         if self.current_page != "marketplace":
@@ -3102,7 +3175,7 @@ class App(tk.Tk):
             stamp=data.get("captured_at","")
             if stamp and stamp != self._messenger_capture_seen:
                 self._messenger_capture_seen=stamp
-                self.new_marketplace_order(captured=data)
+                self.new_order(captured=data)
                 return
         self.after(1400,self._poll_messenger_capture)
 
@@ -3574,7 +3647,7 @@ class App(tk.Tk):
         self.current_page = "marketplace"
         self.clear_main()
         self.page_header("Marketplace", "Marketplace orders with an integrated Messenger window",
-                         "+ Marketplace Order", self.new_marketplace_order, "Messenger Browser",
+                         "+ New Order", self.new_order, "Messenger Browser",
                          self.open_messenger_capture_browser)
         c=self.card(self.main,12); c.pack(fill="both",expand=True)
         tip=ttk.Frame(c,style="Card.TFrame"); tip.pack(fill="x",pady=(0,10))
@@ -4913,7 +4986,7 @@ class App(tk.Tk):
     def show_orders(self, select_order_id=None):
         self.current_page = "orders"
         self.clear_main()
-        self.page_header("Orders", "Buyer details, notes, payments, files and print actions", "+ New Order", self.new_order, "+ Marketplace", self.new_marketplace_order)
+        self.page_header("Orders", "Buyer details, notes, payments, files and print actions", "+ New Order", self.new_order)
         paned = ttk.Panedwindow(self.main, orient="horizontal")
         paned.pack(fill="both", expand=True)
         left = self.card(paned, 10)
