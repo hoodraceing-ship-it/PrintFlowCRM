@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.98
+
+- Fixed offline phrase metadata that incorrectly labeled cached German, French, Portuguese, and Italian phrases as Spanish.
+- Smart Reply now prioritizes strong local language detection when translation metadata conflicts.
+- “Ist das noch verfügbar” is recognized as German and receives the German availability response automatically.
+
+
 ## 0.7.97
 
 - Automatically reacts when the open Marketplace conversation changes or a new buyer message arrives; Refresh Reply is no longer required.
