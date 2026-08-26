@@ -5,6 +5,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -95,6 +97,50 @@ class Bridge:
             return True
         except Exception:
             return False
+
+
+    _translation_cache = {}
+    _translation_lock = threading.Lock()
+
+    def translate(self, text, target="en"):
+        text = str(text or "").strip()
+        target = str(target or "en").strip().lower()
+        if not text:
+            return {"ok": False, "text": "", "source": "", "error": "No text"}
+        text = text[:1200]
+        key = (text, target)
+        with self._translation_lock:
+            cached = self._translation_cache.get(key)
+        if cached:
+            return cached
+        try:
+            query = urllib.parse.urlencode({
+                "client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": text
+            })
+            request = urllib.request.Request(
+                "https://translate.googleapis.com/translate_a/single?" + query,
+                headers={"User-Agent": "PrintFlowCRM/0.7.94"},
+            )
+            with urllib.request.urlopen(request, timeout=12) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            translated = "".join(
+                str(part[0] or "") for part in (payload[0] or [])
+                if isinstance(part, list) and part
+            ).strip()
+            result = {
+                "ok": bool(translated),
+                "text": translated,
+                "source": str(payload[2] or "") if len(payload) > 2 else "",
+                "error": "" if translated else "No translation returned",
+            }
+        except Exception as exc:
+            result = {"ok": False, "text": "", "source": "", "error": str(exc)}
+        if result["ok"]:
+            with self._translation_lock:
+                if len(self._translation_cache) >= 300:
+                    self._translation_cache.clear()
+                self._translation_cache[key] = result
+        return result
 
 
 bridge = Bridge()
@@ -265,20 +311,30 @@ INJECT = r'''
     const smartPanel = document.createElement('div');
     smartPanel.id = 'printflow-smart-reply';
     Object.assign(smartPanel.style, {
-      position:'fixed', top:'66px', left:'50%', transform:'translateX(-50%)',
-      zIndex:'2147483646', width:'min(620px,calc(100vw - 40px))',
+      position:'fixed', top:'66px', left:'calc(50% - 310px)', zIndex:'2147483646',
+      width:'620px', minWidth:'360px', minHeight:'280px',
+      maxWidth:'calc(100vw - 20px)', maxHeight:'calc(100vh - 20px)',
+      resize:'both', overflow:'auto', boxSizing:'border-box',
       background:'#111827', color:'#fff', border:'2px solid #3b82f6',
       borderRadius:'10px', padding:'11px 13px',
       font:'13px Segoe UI,Arial,sans-serif',
       boxShadow:'0 8px 26px rgba(0,0,0,.45)'
     });
     smartPanel.innerHTML =
-      '<div style="display:flex;align-items:center;gap:10px;margin-bottom:7px">' +
+      '<div id="printflow-smart-drag" style="display:flex;align-items:center;gap:10px;margin:-5px -5px 8px;padding:5px;cursor:move;user-select:none">' +
         '<div style="font-weight:700;color:#93c5fd;flex:1">PrintFlow Smart Sales Reply</div>' +
         '<div id="printflow-smart-language" style="font-size:11px;color:#cbd5e1">Detecting language…</div>' +
         '<button id="printflow-smart-close" type="button" style="border:0;background:transparent;color:#94a3b8;font-size:18px;cursor:pointer">×</button>' +
       '</div>' +
+      '<div style="border:1px solid #334155;border-radius:7px;padding:7px 9px;margin-bottom:7px;background:#0f172a">' +
+        '<div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase">Buyer said (English)</div>' +
+        '<div id="printflow-smart-buyer-translation" style="margin-top:3px;color:#e2e8f0">Waiting for a buyer message…</div>' +
+      '</div>' +
       '<textarea id="printflow-smart-text" rows="3" style="box-sizing:border-box;width:100%;resize:vertical;border:1px solid #475569;border-radius:7px;background:#0f172a;color:#fff;padding:8px;font:13px Segoe UI,Arial,sans-serif"></textarea>' +
+      '<div style="border:1px solid #334155;border-radius:7px;padding:7px 9px;margin-top:7px;background:#0f172a">' +
+        '<div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase">You are sending (English)</div>' +
+        '<div id="printflow-smart-reply-translation" style="margin-top:3px;color:#e2e8f0">Preparing translation…</div>' +
+      '</div>' +
       '<div style="display:flex;align-items:center;gap:8px;margin-top:8px">' +
         '<div id="printflow-smart-status" style="flex:1;font-size:11px;color:#93c5fd">Opening the conversation…</div>' +
         '<button id="printflow-smart-refresh" type="button" style="padding:7px 10px;border:1px solid #64748b;border-radius:7px;background:#1e293b;color:#fff;font-weight:600;cursor:pointer">Refresh Reply</button>' +
@@ -286,8 +342,60 @@ INJECT = r'''
       '</div>';
     document.documentElement.appendChild(smartPanel);
 
+    const geometryKey = 'printflow-smart-geometry-v1';
+    const saveGeometry = () => {
+      const r = smartPanel.getBoundingClientRect();
+      localStorage.setItem(geometryKey, JSON.stringify({
+        left:Math.round(r.left), top:Math.round(r.top),
+        width:Math.round(r.width), height:Math.round(r.height)
+      }));
+    };
+    const clampPanel = () => {
+      const r = smartPanel.getBoundingClientRect();
+      smartPanel.style.left = Math.max(0, Math.min(r.left, window.innerWidth - 80)) + 'px';
+      smartPanel.style.top = Math.max(0, Math.min(r.top, window.innerHeight - 50)) + 'px';
+      smartPanel.style.width = Math.min(r.width, window.innerWidth - 10) + 'px';
+      if (smartPanel.style.height) smartPanel.style.height = Math.min(r.height, window.innerHeight - 10) + 'px';
+    };
+    try {
+      const saved = JSON.parse(localStorage.getItem(geometryKey) || 'null');
+      if (saved) {
+        smartPanel.style.left = Number(saved.left || 0) + 'px';
+        smartPanel.style.top = Number(saved.top || 0) + 'px';
+        smartPanel.style.width = Math.max(360, Number(saved.width || 620)) + 'px';
+        if (saved.height) smartPanel.style.height = Math.max(280, Number(saved.height)) + 'px';
+      }
+    } catch (_) {}
+    clampPanel();
+
+    let dragState = null;
+    document.getElementById('printflow-smart-drag').addEventListener('mousedown', event => {
+      if (event.button !== 0 || event.target.closest('button')) return;
+      const r = smartPanel.getBoundingClientRect();
+      dragState = {x:event.clientX, y:event.clientY, left:r.left, top:r.top};
+      event.preventDefault();
+    });
+    document.addEventListener('mousemove', event => {
+      if (!dragState || !document.getElementById('printflow-smart-reply')) return;
+      smartPanel.style.left = Math.max(0, Math.min(dragState.left + event.clientX - dragState.x, window.innerWidth - 80)) + 'px';
+      smartPanel.style.top = Math.max(0, Math.min(dragState.top + event.clientY - dragState.y, window.innerHeight - 50)) + 'px';
+    });
+    document.addEventListener('mouseup', () => {
+      if (dragState) { dragState = null; saveGeometry(); }
+    });
+    window.addEventListener('resize', () => { clampPanel(); saveGeometry(); });
+    if (window.ResizeObserver) {
+      let resizeTimer = 0;
+      new ResizeObserver(() => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(saveGeometry, 180);
+      }).observe(smartPanel);
+    }
+
     const replyBox = document.getElementById('printflow-smart-text');
     const languageBox = document.getElementById('printflow-smart-language');
+    const buyerTranslation = document.getElementById('printflow-smart-buyer-translation');
+    const replyTranslation = document.getElementById('printflow-smart-reply-translation');
     const smartStatus = document.getElementById('printflow-smart-status');
     const setSmartStatus = (text, color='#93c5fd') => {
       if (smartStatus) {
@@ -326,12 +434,89 @@ INJECT = r'''
       return best;
     };
 
+    const messageCandidates = root => {
+      if (!root) return [];
+      const rootRect = root.getBoundingClientRect();
+      return [...root.querySelectorAll('[dir="auto"]')].filter(el => {
+        const r = visibleRect(el);
+        if (!r || el.closest('#printflow-smart-reply') || el.closest('.printflow-inline-translation')) return false;
+        if (el.isContentEditable || el.closest('[contenteditable="true"]')) return false;
+        const value = String(el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!value || value.length > 600 || /^\d{1,2}:\d{2}/.test(value)) return false;
+        if (/^(send|like|more|search|message sent)$/i.test(value)) return false;
+        if ([...el.querySelectorAll('[dir="auto"]')].some(child => String(child.innerText || '').trim())) return false;
+        return r.left >= rootRect.left && r.right <= rootRect.right + 5;
+      }).sort((a,b) => a.getBoundingClientRect().bottom - b.getBoundingClientRect().bottom);
+    };
+
     const conversationSnapshot = () => {
       const composer = findComposer();
       const root = findConversationRoot(composer);
       if (!composer || !root) return null;
       const text = cleanConversationText(root.innerText || '');
-      return {composer, text, key:location.href + '|' + text.slice(-500)};
+      const rootRect = root.getBoundingClientRect();
+      const candidates = messageCandidates(root);
+      const incoming = candidates.filter(el => {
+        const r = el.getBoundingClientRect();
+        return r.left + r.width / 2 < rootRect.left + rootRect.width * 0.53;
+      });
+      const incomingNode = incoming.length ? incoming[incoming.length - 1] : null;
+      const incomingText = incomingNode ? String(incomingNode.innerText || '').replace(/\s+/g, ' ').trim() : '';
+      return {composer, root, text, incomingText, key:location.href + '|' + (incomingText || text.slice(-500))};
+    };
+
+    const translateEnglish = async value => {
+      const sourceText = String(value || '').trim();
+      if (!sourceText) return {ok:false, text:'', source:'', error:'No text'};
+      try {
+        return await window.pywebview.api.translate(sourceText, 'en');
+      } catch (error) {
+        return {ok:false, text:'', source:'', error:String(error || 'Translation unavailable')};
+      }
+    };
+
+    const translateVisibleBubbles = async root => {
+      for (const node of messageCandidates(root).slice(-12)) {
+        const original = String(node.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!original || node.dataset.printflowTranslatedText === original) continue;
+        node.dataset.printflowTranslatedText = original;
+        const result = await translateEnglish(original);
+        let caption = node.parentElement ? node.parentElement.querySelector(':scope > .printflow-inline-translation') : null;
+        if (!result.ok || !result.text || result.source === 'en' || result.text.toLowerCase() === original.toLowerCase()) {
+          if (caption) caption.remove();
+          continue;
+        }
+        if (!caption) {
+          caption = document.createElement('div');
+          caption.className = 'printflow-inline-translation';
+          Object.assign(caption.style, {
+            margin:'3px 6px 5px', padding:'3px 7px', maxWidth:'420px',
+            borderRadius:'6px', background:'rgba(30,58,138,.35)',
+            color:'#bfdbfe', font:'11px Segoe UI,Arial,sans-serif', lineHeight:'1.3'
+          });
+          node.insertAdjacentElement('afterend', caption);
+        }
+        caption.textContent = 'English: ' + result.text;
+      }
+    };
+
+    let translationRun = 0;
+    const refreshTranslations = async (snapshot, outgoingText) => {
+      const run = ++translationRun;
+      if (buyerTranslation) buyerTranslation.textContent = snapshot.incomingText ? 'Translating…' : 'No buyer message detected.';
+      if (replyTranslation) replyTranslation.textContent = outgoingText ? 'Translating…' : 'No reply prepared.';
+      const results = await Promise.all([
+        translateEnglish(snapshot.incomingText),
+        translateEnglish(outgoingText)
+      ]);
+      if (run !== translationRun) return;
+      if (buyerTranslation) buyerTranslation.textContent = results[0].ok
+        ? results[0].text
+        : (snapshot.incomingText ? 'Translation unavailable — original remains visible.' : 'No buyer message detected.');
+      if (replyTranslation) replyTranslation.textContent = results[1].ok
+        ? results[1].text
+        : (outgoingText ? 'Translation unavailable — review the original before sending.' : 'No reply prepared.');
+      translateVisibleBubbles(snapshot.root);
     };
 
     const prepareSmartReply = () => {
@@ -340,12 +525,13 @@ INJECT = r'''
         setSmartStatus('Open a buyer conversation so PrintFlow can prepare a reply.', '#fbbf24');
         return;
       }
-      const language = detectLanguage(snapshot.text);
+      const language = detectLanguage(snapshot.incomingText || snapshot.text);
       if (languageBox) languageBox.textContent = languageNames[language] || 'English';
       if (replyBox) {
         replyBox.value = replies[language] || replies.en;
         replyBox.dataset.conversationKey = snapshot.key;
       }
+      refreshTranslations(snapshot, replyBox ? replyBox.value : '');
       const sentKey = localStorage.getItem('printflow-smart-last-sent') || '';
       if (sentKey === snapshot.key) {
         setSmartStatus('A smart reply was already sent for this visible conversation.', '#fbbf24');
@@ -374,6 +560,14 @@ INJECT = r'''
 
     document.getElementById('printflow-smart-close').onclick = () => smartPanel.remove();
     document.getElementById('printflow-smart-refresh').onclick = prepareSmartReply;
+    let replyTranslateTimer = 0;
+    replyBox.addEventListener('input', () => {
+      clearTimeout(replyTranslateTimer);
+      replyTranslateTimer = setTimeout(() => {
+        const snapshot = conversationSnapshot();
+        if (snapshot) refreshTranslations(snapshot, replyBox.value);
+      }, 450);
+    });
     document.getElementById('printflow-smart-send').onclick = async () => {
       const snapshot = conversationSnapshot();
       const message = String(replyBox ? replyBox.value : '').trim();
@@ -431,6 +625,8 @@ INJECT = r'''
       if (key && key !== lastConversation) {
         lastConversation = key;
         prepareSmartReply();
+      } else if (snapshot) {
+        translateVisibleBubbles(snapshot.root);
       }
     }, 2200);
     setTimeout(prepareSmartReply, 900);
