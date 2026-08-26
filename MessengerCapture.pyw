@@ -125,29 +125,30 @@ class Bridge:
             }
 
         normalized = " ".join(text.lower().replace("¿", "").replace("?", "").split())
-        offline_es = {
-            "hola": "Hello",
-            "hola sigue disponible": "Hi, is it still available?",
-            "aún está disponible": "Is it still available?",
-            "aun esta disponible": "Is it still available?",
-            "sigue disponible": "Is it still available?",
-            "cuál es la ubicación": "What is the location?",
-            "cual es la ubicacion": "What is the location?",
-            "dónde está baño": "Where is the bathroom?",
-            "donde esta bano": "Where is the bathroom?",
-            "estafa es lo siento": "It is a scam, sorry.",
-            "ist das noch verfügbar": "Is this still available?",
-            "ist das noch verfugbar": "Is this still available?",
-            "noch verfügbar": "Still available?",
-            "noch verfugbar": "Still available?",
-            "est-ce toujours disponible": "Is this still available?",
-            "ainda está disponível": "Is this still available?",
-            "ainda esta disponivel": "Is this still available?",
-            "è ancora disponibile": "Is this still available?",
-            "e ancora disponibile": "Is this still available?",
+        offline_phrases = {
+            "hola": ("Hello", "es"),
+            "hola sigue disponible": ("Hi, is it still available?", "es"),
+            "aún está disponible": ("Is it still available?", "es"),
+            "aun esta disponible": ("Is it still available?", "es"),
+            "sigue disponible": ("Is it still available?", "es"),
+            "cuál es la ubicación": ("What is the location?", "es"),
+            "cual es la ubicacion": ("What is the location?", "es"),
+            "dónde está baño": ("Where is the bathroom?", "es"),
+            "donde esta bano": ("Where is the bathroom?", "es"),
+            "estafa es lo siento": ("It is a scam, sorry.", "es"),
+            "ist das noch verfügbar": ("Is this still available?", "de"),
+            "ist das noch verfugbar": ("Is this still available?", "de"),
+            "noch verfügbar": ("Still available?", "de"),
+            "noch verfugbar": ("Still available?", "de"),
+            "est-ce toujours disponible": ("Is this still available?", "fr"),
+            "ainda está disponível": ("Is this still available?", "pt"),
+            "ainda esta disponivel": ("Is this still available?", "pt"),
+            "è ancora disponibile": ("Is this still available?", "it"),
+            "e ancora disponibile": ("Is this still available?", "it"),
         }
-        if target == "en" and normalized in offline_es:
-            result = {"ok": True, "text": offline_es[normalized], "source": "es", "error": ""}
+        if target == "en" and normalized in offline_phrases:
+            translated, source = offline_phrases[normalized]
+            result = {"ok": True, "text": translated, "source": source, "error": ""}
             with self._translation_lock:
                 self._translation_cache[key] = result
             return result
@@ -736,7 +737,9 @@ INJECT = r'''
       const detectedLanguage = detectLanguage(snapshot.incomingText) || 'en';
       const buyerResult = await translateEnglish(snapshot.incomingText);
       smartPreparing = false;
-      const language = (buyerResult.source || detectedLanguage || 'en').toLowerCase();
+      const language = (
+        detectedLanguage !== 'en' ? detectedLanguage : (buyerResult.source || 'en')
+      ).toLowerCase();
       const intent = detectIntent(snapshot.incomingText + ' ' + (buyerResult.ok ? buyerResult.text : ''));
       const listingPrice = (String(snapshot.text || '').match(/\$\s*\d+(?:\.\d{2})?/) || [])[0] || '';
       const englishMeaning = buyerResult.ok ? buyerResult.text : intentEnglish(intent);
