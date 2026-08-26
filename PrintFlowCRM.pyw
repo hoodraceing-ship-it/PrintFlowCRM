@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.91"
+VERSION = "0.7.92"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -2094,6 +2094,7 @@ class App(tk.Tk):
         self._model_photos = []
         self._model_search_generation = 0
         self._library_photos = []
+        self._library_detail_generation = 0
         self._library_importing = False
         self._library_copy_model_id = None
         self._backup_running = False
@@ -4285,63 +4286,324 @@ class App(tk.Tk):
         self.show_model_library(select_category=new_category)
 
     def _show_model_library_detail(self,model_id):
-        for widget in self.library_detail.winfo_children():widget.destroy()
+        # Selecting a model must never block Tk's UI thread. Large STL/design 3MF
+        # fit checks and oversized preview images are loaded in cancellable workers.
+        self._library_detail_generation += 1
+        generation = self._library_detail_generation
+        for widget in self.library_detail.winfo_children():
+            widget.destroy()
         if not model_id:
-            ttk.Label(self.library_detail,text="Your saved models will appear here.",style="CardTitle.TLabel").pack(anchor="w");return
+            ttk.Label(
+                self.library_detail,
+                text="Your saved models will appear here.",
+                style="CardTitle.TLabel",
+            ).pack(anchor="w")
+            return
+
         with self.db.connect() as c:
-            row=c.execute("SELECT * FROM model_library WHERE id=?",(model_id,)).fetchone()
-            files=c.execute("SELECT * FROM model_library_files WHERE model_id=? ORDER BY LOWER(original_name)",(model_id,)).fetchall()
-            latest_job=c.execute("SELECT id,inventory_adjusted,status FROM orders WHERE is_inventory_job=1 AND inventory_model_id=? ORDER BY id DESC LIMIT 1",(model_id,)).fetchone()
-        if not row:return
-        top=ttk.Frame(self.library_detail,style="Card.TFrame");top.pack(fill="x")
-        preview=tk.Label(top,text="No preview",bg=self.INPUT,fg=self.MUTED,width=24,height=9)
-        preview.pack(side="left",padx=(0,14))
-        image_path=Path(row["image_path"] or "")
+            row = c.execute(
+                "SELECT * FROM model_library WHERE id=?", (model_id,)
+            ).fetchone()
+            files = c.execute(
+                "SELECT * FROM model_library_files WHERE model_id=? ORDER BY LOWER(original_name)",
+                (model_id,),
+            ).fetchall()
+            latest_job = c.execute(
+                "SELECT id,inventory_adjusted,status FROM orders "
+                "WHERE is_inventory_job=1 AND inventory_model_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (model_id,),
+            ).fetchone()
+        if not row:
+            return
+
+        top = ttk.Frame(self.library_detail, style="Card.TFrame")
+        top.pack(fill="x")
+        preview = tk.Label(
+            top,
+            text="No preview",
+            bg=self.INPUT,
+            fg=self.MUTED,
+            width=24,
+            height=9,
+        )
+        preview.pack(side="left", padx=(0, 14))
+
+        image_path = Path(row["image_path"] or "")
         if image_path.is_file():
-            try:
-                photo=tk.PhotoImage(file=str(image_path));factor=max(1,(max(photo.width(),photo.height())+219)//220)
-                if factor>1:photo=photo.subsample(factor,factor)
-                self._library_photos.append(photo);preview.configure(image=photo,text="",width=220,height=145)
-            except Exception:pass
-        body=ttk.Frame(top,style="Card.TFrame");body.pack(side="left",fill="both",expand=True)
-        ttk.Label(body,text=row["product_name"],style="CardTitle.TLabel",wraplength=520).pack(anchor="w")
-        ttk.Label(body,text="Group: "+(row["category"] or "Other Models"),style="Card.TLabel").pack(anchor="w",pady=(4,0))
-        if row["model_number"]:ttk.Label(body,text="Model: "+row["model_number"],style="Card.TLabel").pack(anchor="w",pady=(4,0))
-        stockline=ttk.Frame(body,style="Card.TFrame");stockline.pack(fill="x",pady=(5,2))
-        ttk.Label(stockline,text=f"Ready-to-ship stock: {int(row['stock_qty'] or 0)}",style="CardTitle.TLabel").pack(side="left")
-        ttk.Button(stockline,text="− 1",width=5,command=lambda:self._adjust_library_stock(model_id,-1)).pack(side="left",padx=(10,4))
-        ttk.Button(stockline,text="+ 1",width=5,command=lambda:self._adjust_library_stock(model_id,1)).pack(side="left",padx=(0,4))
-        ttk.Button(stockline,text="Set",width=5,command=lambda:self._set_library_stock(model_id)).pack(side="left")
+            preview.configure(text="Loading preview…")
+
+            def load_preview():
+                encoded = None
+                try:
+                    from PIL import Image
+                    with Image.open(image_path) as source:
+                        image = source.convert("RGBA")
+                    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+                    image.thumbnail((220, 145), resampling)
+                    output = io.BytesIO()
+                    image.save(output, "PNG")
+                    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+                except Exception:
+                    pass
+
+                def apply_preview():
+                    if (
+                        generation != self._library_detail_generation
+                        or self.current_page != "model_library"
+                    ):
+                        return
+                    try:
+                        if not preview.winfo_exists():
+                            return
+                        if not encoded:
+                            preview.configure(text="Preview unavailable")
+                            return
+                        photo = tk.PhotoImage(data=encoded)
+                        self._library_photos.append(photo)
+                        preview.configure(
+                            image=photo, text="", width=220, height=145
+                        )
+                    except tk.TclError:
+                        return
+
+                self.after(0, apply_preview)
+
+            threading.Thread(target=load_preview, daemon=True).start()
+
+        body = ttk.Frame(top, style="Card.TFrame")
+        body.pack(side="left", fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=row["product_name"],
+            style="CardTitle.TLabel",
+            wraplength=520,
+        ).pack(anchor="w")
+        ttk.Label(
+            body,
+            text="Group: " + (row["category"] or "Other Models"),
+            style="Card.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+        if row["model_number"]:
+            ttk.Label(
+                body,
+                text="Model: " + row["model_number"],
+                style="Card.TLabel",
+            ).pack(anchor="w", pady=(4, 0))
+
+        stockline = ttk.Frame(body, style="Card.TFrame")
+        stockline.pack(fill="x", pady=(5, 2))
+        ttk.Label(
+            stockline,
+            text=f"Ready-to-ship stock: {int(row['stock_qty'] or 0)}",
+            style="CardTitle.TLabel",
+        ).pack(side="left")
+        ttk.Button(
+            stockline,
+            text="− 1",
+            width=5,
+            command=lambda: self._adjust_library_stock(model_id, -1),
+        ).pack(side="left", padx=(10, 4))
+        ttk.Button(
+            stockline,
+            text="+ 1",
+            width=5,
+            command=lambda: self._adjust_library_stock(model_id, 1),
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            stockline,
+            text="Set",
+            width=5,
+            command=lambda: self._set_library_stock(model_id),
+        ).pack(side="left")
+
         if latest_job and not int(latest_job["inventory_adjusted"] or 0):
-            ttk.Label(body,text="Restock print: "+self._order_live_print_status(int(latest_job["id"]),latest_job["status"]),style="Card.TLabel").pack(anchor="w",pady=(2,0))
-        if row["title"] and row["title"].strip().lower()!=row["product_name"].strip().lower():
-            ttk.Label(body,text=row["title"],style="Card.TLabel",wraplength=520,justify="left").pack(anchor="w",pady=(4,8))
-        actions=ttk.Frame(body,style="Card.TFrame");actions.pack(fill="x")
-        ttk.Button(actions,text="Add Local Files",style="Accent.TButton",command=lambda:self._library_add_local_files(model_id)).pack(side="left",padx=(0,6))
-        ttk.Button(actions,text="Open Folder",command=lambda:self._open_library_folder(row["folder_path"])).pack(side="left",padx=(0,6))
-        ttk.Button(actions,text="Copy Item",command=lambda:self._copy_library_product(model_id)).pack(side="left",padx=(0,6))
-        manage_actions=ttk.Frame(body,style="Card.TFrame");manage_actions.pack(fill="x",pady=(5,0))
-        ttk.Button(manage_actions,text="Rename",command=lambda:self._rename_library_product(model_id)).pack(side="left",padx=(0,6))
-        ttk.Button(manage_actions,text="Change Group",command=lambda:self._change_library_category(model_id)).pack(side="left",padx=(0,6))
-        ttk.Button(manage_actions,text="Change Photo",command=lambda:self._library_change_photo(model_id)).pack(side="left",padx=(0,6))
+            ttk.Label(
+                body,
+                text="Restock print: "
+                + self._order_live_print_status(
+                    int(latest_job["id"]), latest_job["status"]
+                ),
+                style="Card.TLabel",
+            ).pack(anchor="w", pady=(2, 0))
+        if (
+            row["title"]
+            and row["title"].strip().lower()
+            != row["product_name"].strip().lower()
+        ):
+            ttk.Label(
+                body,
+                text=row["title"],
+                style="Card.TLabel",
+                wraplength=520,
+                justify="left",
+            ).pack(anchor="w", pady=(4, 8))
+
+        actions = ttk.Frame(body, style="Card.TFrame")
+        actions.pack(fill="x")
+        ttk.Button(
+            actions,
+            text="Add Local Files",
+            style="Accent.TButton",
+            command=lambda: self._library_add_local_files(model_id),
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            actions,
+            text="Open Folder",
+            command=lambda: self._open_library_folder(row["folder_path"]),
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            actions,
+            text="Copy Item",
+            command=lambda: self._copy_library_product(model_id),
+        ).pack(side="left", padx=(0, 6))
+
+        manage_actions = ttk.Frame(body, style="Card.TFrame")
+        manage_actions.pack(fill="x", pady=(5, 0))
+        ttk.Button(
+            manage_actions,
+            text="Rename",
+            command=lambda: self._rename_library_product(model_id),
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            manage_actions,
+            text="Change Group",
+            command=lambda: self._change_library_category(model_id),
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            manage_actions,
+            text="Change Photo",
+            command=lambda: self._library_change_photo(model_id),
+        ).pack(side="left", padx=(0, 6))
         if row["source_url"]:
-            ttk.Button(manage_actions,text="Open Source",command=lambda:webbrowser.open(row["source_url"])).pack(side="left",padx=(0,6))
-            if "makerworld.com" in str(row["source_url"]).lower() and not files:
-                ttk.Button(manage_actions,text="Retry Auto Download",command=lambda:self._retry_model_library_source(model_id)).pack(side="left")
-        ttk.Label(self.library_detail,text=f"Source files ({len(files)})",style="CardTitle.TLabel").pack(anchor="w",pady=(18,7))
-        tree=ttk.Treeview(self.library_detail,columns=("name","type","printers"),show="headings",height=max(5,min(12,len(files)+1)),selectmode="extended")
-        tree.heading("name",text="File");tree.column("name",width=340)
-        tree.heading("type",text="File type");tree.column("type",width=80,stretch=False)
-        tree.heading("printers",text="Printer Fit (max 1 cut)");tree.column("printers",width=285,stretch=False)
-        for item in files:tree.insert("","end",iid=str(item["id"]),values=(item["original_name"],Path(item["original_name"]).suffix.upper().lstrip("."),self._printer_fit_marker(item["stored_path"])))
-        tree.pack(fill="both",expand=True)
-        file_actions=ttk.Frame(self.library_detail,style="Card.TFrame");file_actions.pack(fill="x",pady=(8,0))
-        ttk.Button(file_actions,text="Open Selected in Bambu Studio",command=lambda:self._open_library_sources_in_bambu_studio(model_id,tree)).pack(side="left")
-        ttk.Button(file_actions,text="Replace Selected",command=lambda:self._replace_library_source_file(model_id,tree)).pack(side="left",padx=(7,0))
-        ttk.Button(file_actions,text="Print 1 for Stock",style="Accent.TButton",command=lambda:self._print_library_file_for_stock(model_id,tree)).pack(side="left",padx=(7,0))
-        bottom=ttk.Frame(self.library_detail,style="Card.TFrame");bottom.pack(fill="x",pady=(7,0))
-        ttk.Button(bottom,text="Delete Selected File",style="Danger.TButton",command=lambda:self._delete_library_file(model_id,tree)).pack(side="left")
-        ttk.Button(bottom,text="Delete Product",style="Danger.TButton",command=lambda:self._delete_library_product(model_id)).pack(side="right")
+            ttk.Button(
+                manage_actions,
+                text="Open Source",
+                command=lambda: webbrowser.open(row["source_url"]),
+            ).pack(side="left", padx=(0, 6))
+            if (
+                "makerworld.com" in str(row["source_url"]).lower()
+                and not files
+            ):
+                ttk.Button(
+                    manage_actions,
+                    text="Retry Auto Download",
+                    command=lambda: self._retry_model_library_source(model_id),
+                ).pack(side="left")
+
+        ttk.Label(
+            self.library_detail,
+            text=f"Source files ({len(files)})",
+            style="CardTitle.TLabel",
+        ).pack(anchor="w", pady=(18, 7))
+        tree = ttk.Treeview(
+            self.library_detail,
+            columns=("name", "type", "printers"),
+            show="headings",
+            height=max(5, min(12, len(files) + 1)),
+            selectmode="extended",
+        )
+        tree.heading("name", text="File")
+        tree.column("name", width=340)
+        tree.heading("type", text="File type")
+        tree.column("type", width=80, stretch=False)
+        tree.heading("printers", text="Printer Fit (max 1 cut)")
+        tree.column("printers", width=285, stretch=False)
+
+        fit_jobs = []
+        for item in files:
+            path = Path(item["stored_path"])
+            name = item["original_name"]
+            file_type = Path(name).suffix.upper().lstrip(".")
+            lower = path.name.lower()
+            if not path.is_file():
+                fit = "Missing"
+            elif not (
+                lower.endswith(".stl")
+                or (
+                    lower.endswith(".3mf")
+                    and not lower.endswith(".gcode.3mf")
+                )
+            ):
+                fit = "Sliced"
+            else:
+                try:
+                    stat = path.stat()
+                    key = (str(path), stat.st_mtime_ns, stat.st_size)
+                    fit = self._printer_fit_cache.get(key) or "Checking…"
+                except OSError:
+                    fit = "Missing"
+                if fit == "Checking…":
+                    fit_jobs.append((str(item["id"]), path, name, file_type))
+            tree.insert(
+                "",
+                "end",
+                iid=str(item["id"]),
+                values=(name, file_type, fit),
+            )
+        tree.pack(fill="both", expand=True)
+
+        def apply_fit(iid, name, file_type, result):
+            if (
+                generation != self._library_detail_generation
+                or self.current_page != "model_library"
+            ):
+                return
+            try:
+                if tree.winfo_exists() and tree.exists(iid):
+                    tree.item(iid, values=(name, file_type, result))
+            except tk.TclError:
+                return
+
+        def calculate_fits():
+            for iid, path, name, file_type in fit_jobs:
+                if generation != self._library_detail_generation:
+                    return
+                result = self._printer_fit_marker(path)
+                self.after(
+                    0,
+                    lambda iid=iid, name=name, file_type=file_type, result=result:
+                        apply_fit(iid, name, file_type, result),
+                )
+
+        if fit_jobs:
+            threading.Thread(target=calculate_fits, daemon=True).start()
+
+        file_actions = ttk.Frame(self.library_detail, style="Card.TFrame")
+        file_actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(
+            file_actions,
+            text="Open Selected in Bambu Studio",
+            command=lambda: self._open_library_sources_in_bambu_studio(
+                model_id, tree
+            ),
+        ).pack(side="left")
+        ttk.Button(
+            file_actions,
+            text="Replace Selected",
+            command=lambda: self._replace_library_source_file(model_id, tree),
+        ).pack(side="left", padx=(7, 0))
+        ttk.Button(
+            file_actions,
+            text="Print 1 for Stock",
+            style="Accent.TButton",
+            command=lambda: self._print_library_file_for_stock(model_id, tree),
+        ).pack(side="left", padx=(7, 0))
+
+        bottom = ttk.Frame(self.library_detail, style="Card.TFrame")
+        bottom.pack(fill="x", pady=(7, 0))
+        ttk.Button(
+            bottom,
+            text="Delete Selected File",
+            style="Danger.TButton",
+            command=lambda: self._delete_library_file(model_id, tree),
+        ).pack(side="left")
+        ttk.Button(
+            bottom,
+            text="Delete Product",
+            style="Danger.TButton",
+            command=lambda: self._delete_library_product(model_id),
+        ).pack(side="right")
 
     def _adjust_library_stock(self,model_id,delta):
         value=self.db.adjust_model_stock(model_id,delta)
