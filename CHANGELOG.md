@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.97
+
+- Automatically reacts when the open Marketplace conversation changes or a new buyer message arrives; Refresh Reply is no longer required.
+- Keeps English captions beneath every loaded non-English message in the conversation.
+- Added a paced translation queue so full-chat translation does not flood Google and trigger HTTP 429 errors.
+- Added a 90-second translation cooldown after rate limiting, followed by automatic retry.
+- Added offline intent detection and direct localized replies for English, Spanish, German, French, Portuguese, and Italian.
+- When online translation is unavailable, common sales questions still receive an English offline interpretation and a relevant reply.
+
+
 ## 0.7.96
 
 - Rebuilt the v0.7.95 Messenger fixes in a correctly versioned update package.
