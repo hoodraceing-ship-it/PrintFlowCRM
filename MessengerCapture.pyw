@@ -258,6 +258,184 @@ INJECT = r'''
 
   document.documentElement.appendChild(btn);
 
+  // Smart multilingual sales replies for the currently open Marketplace chat.
+  // PrintFlow prepares the reply automatically but requires one deliberate click
+  // before sending, preventing unattended spam or replies to the wrong buyer.
+  if (!document.getElementById('printflow-smart-reply')) {
+    const smartPanel = document.createElement('div');
+    smartPanel.id = 'printflow-smart-reply';
+    Object.assign(smartPanel.style, {
+      position:'fixed', top:'66px', left:'50%', transform:'translateX(-50%)',
+      zIndex:'2147483646', width:'min(620px,calc(100vw - 40px))',
+      background:'#111827', color:'#fff', border:'2px solid #3b82f6',
+      borderRadius:'10px', padding:'11px 13px',
+      font:'13px Segoe UI,Arial,sans-serif',
+      boxShadow:'0 8px 26px rgba(0,0,0,.45)'
+    });
+    smartPanel.innerHTML =
+      '<div style="display:flex;align-items:center;gap:10px;margin-bottom:7px">' +
+        '<div style="font-weight:700;color:#93c5fd;flex:1">PrintFlow Smart Sales Reply</div>' +
+        '<div id="printflow-smart-language" style="font-size:11px;color:#cbd5e1">Detecting language…</div>' +
+        '<button id="printflow-smart-close" type="button" style="border:0;background:transparent;color:#94a3b8;font-size:18px;cursor:pointer">×</button>' +
+      '</div>' +
+      '<textarea id="printflow-smart-text" rows="3" style="box-sizing:border-box;width:100%;resize:vertical;border:1px solid #475569;border-radius:7px;background:#0f172a;color:#fff;padding:8px;font:13px Segoe UI,Arial,sans-serif"></textarea>' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-top:8px">' +
+        '<div id="printflow-smart-status" style="flex:1;font-size:11px;color:#93c5fd">Opening the conversation…</div>' +
+        '<button id="printflow-smart-refresh" type="button" style="padding:7px 10px;border:1px solid #64748b;border-radius:7px;background:#1e293b;color:#fff;font-weight:600;cursor:pointer">Refresh Reply</button>' +
+        '<button id="printflow-smart-send" type="button" style="padding:7px 12px;border:1px solid #60a5fa;border-radius:7px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer">Send Smart Reply</button>' +
+      '</div>';
+    document.documentElement.appendChild(smartPanel);
+
+    const replyBox = document.getElementById('printflow-smart-text');
+    const languageBox = document.getElementById('printflow-smart-language');
+    const smartStatus = document.getElementById('printflow-smart-status');
+    const setSmartStatus = (text, color='#93c5fd') => {
+      if (smartStatus) {
+        smartStatus.textContent = text;
+        smartStatus.style.color = color;
+      }
+    };
+
+    const languageNames = {
+      en:'English', es:'Spanish', fr:'French', pt:'Portuguese',
+      de:'German', it:'Italian'
+    };
+    const replies = {
+      en:"Hi! Yes, it’s still available. Are you looking for local pickup near Aiken, SC, or would you need it shipped? I can also make custom sizes and colors.",
+      es:"¡Hola! Sí, todavía está disponible. ¿Prefieres recogerlo cerca de Aiken, Carolina del Sur, o necesitas envío? También puedo hacer tamaños y colores personalizados.",
+      fr:"Bonjour ! Oui, c’est toujours disponible. Préférez-vous le récupérer près d’Aiken, en Caroline du Sud, ou avez-vous besoin d’une livraison ? Je peux aussi faire des tailles et couleurs personnalisées.",
+      pt:"Olá! Sim, ainda está disponível. Você prefere retirar perto de Aiken, Carolina do Sul, ou precisa de envio? Também posso fazer tamanhos e cores personalizados.",
+      de:"Hallo! Ja, der Artikel ist noch verfügbar. Möchten Sie ihn in der Nähe von Aiken, South Carolina, abholen oder benötigen Sie Versand? Ich kann auch individuelle Größen und Farben anfertigen.",
+      it:"Ciao! Sì, è ancora disponibile. Preferisci il ritiro vicino ad Aiken, South Carolina, oppure hai bisogno della spedizione? Posso anche realizzare misure e colori personalizzati."
+    };
+
+    const detectLanguage = text => {
+      const value = String(text || '').toLowerCase();
+      const scores = {
+        es:['hola','sigue disponible','todavía','precio','cuánto','cuanto','envío','envio','gracias','interesado'],
+        fr:['bonjour','toujours disponible','combien','prix','livraison','merci','intéressé','interesse'],
+        pt:['olá','ola','ainda está disponível','ainda esta disponivel','preço','preco','envio','obrigado','interessado'],
+        de:['hallo','verfügbar','verfugbar','preis','versand','danke','interessiert'],
+        it:['ciao','disponibile','prezzo','spedizione','grazie','interessato']
+      };
+      let best='en', bestScore=0;
+      for (const [code, words] of Object.entries(scores)) {
+        const score = words.reduce((total, word) => total + (value.includes(word) ? 1 : 0), 0);
+        if (score > bestScore) { best=code; bestScore=score; }
+      }
+      return best;
+    };
+
+    const conversationSnapshot = () => {
+      const composer = findComposer();
+      const root = findConversationRoot(composer);
+      if (!composer || !root) return null;
+      const text = cleanConversationText(root.innerText || '');
+      return {composer, text, key:location.href + '|' + text.slice(-500)};
+    };
+
+    const prepareSmartReply = () => {
+      const snapshot = conversationSnapshot();
+      if (!snapshot || !snapshot.text) {
+        setSmartStatus('Open a buyer conversation so PrintFlow can prepare a reply.', '#fbbf24');
+        return;
+      }
+      const language = detectLanguage(snapshot.text);
+      if (languageBox) languageBox.textContent = languageNames[language] || 'English';
+      if (replyBox) {
+        replyBox.value = replies[language] || replies.en;
+        replyBox.dataset.conversationKey = snapshot.key;
+      }
+      const sentKey = localStorage.getItem('printflow-smart-last-sent') || '';
+      if (sentKey === snapshot.key) {
+        setSmartStatus('A smart reply was already sent for this visible conversation.', '#fbbf24');
+      } else {
+        setSmartStatus('Reply prepared automatically. Review or edit it, then send.');
+      }
+    };
+
+    const fillComposer = (composer, message) => {
+      composer.focus();
+      if (composer.isContentEditable) {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(composer);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('delete', false, null);
+        document.execCommand('insertText', false, message);
+      } else {
+        composer.value = message;
+        composer.dispatchEvent(new InputEvent('input', {
+          bubbles:true, inputType:'insertText', data:null
+        }));
+      }
+    };
+
+    document.getElementById('printflow-smart-close').onclick = () => smartPanel.remove();
+    document.getElementById('printflow-smart-refresh').onclick = prepareSmartReply;
+    document.getElementById('printflow-smart-send').onclick = async () => {
+      const snapshot = conversationSnapshot();
+      const message = String(replyBox ? replyBox.value : '').trim();
+      if (!snapshot) {
+        setSmartStatus('Message box not found. Open the buyer conversation again.', '#fca5a5');
+        return;
+      }
+      if (!message) {
+        setSmartStatus('The reply is empty.', '#fca5a5');
+        return;
+      }
+      const alreadySent = localStorage.getItem('printflow-smart-last-sent') || '';
+      if (alreadySent === snapshot.key) {
+        setSmartStatus('This conversation was already replied to. Edit the reply or wait for a new buyer message.', '#fbbf24');
+        return;
+      }
+      try {
+        fillComposer(snapshot.composer, message);
+      } catch (_) {
+        setSmartStatus('Could not fill the message box. Nothing was sent.', '#fca5a5');
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 450));
+      const composed = String(
+        snapshot.composer.isContentEditable ? snapshot.composer.innerText : snapshot.composer.value
+      ).replace(/\s+/g, ' ').trim();
+      const expectedMessage = message.replace(/\s+/g, ' ').trim();
+      if (composed !== expectedMessage) {
+        setSmartStatus('The reply did not fill exactly once. It was not sent.', '#fca5a5');
+        return;
+      }
+      const send = [...document.querySelectorAll('button,[role="button"]')].find(el => {
+        const r = visibleRect(el);
+        if (!r) return false;
+        const label = (
+          (el.getAttribute('aria-label') || '') + ' ' +
+          (el.title || '') + ' ' + (el.innerText || '')
+        ).trim();
+        return /^(send|press enter to send)$/i.test(label) || /send message/i.test(label);
+      });
+      if (!send) {
+        setSmartStatus('Reply filled. Review it and press Messenger’s Send button.', '#fbbf24');
+        return;
+      }
+      send.click();
+      localStorage.setItem('printflow-smart-last-sent', snapshot.key);
+      setSmartStatus('Smart reply sent ✓', '#86efac');
+    };
+
+    let lastConversation = '';
+    setInterval(() => {
+      if (!document.getElementById('printflow-smart-reply')) return;
+      const snapshot = conversationSnapshot();
+      const key = snapshot ? snapshot.key : '';
+      if (key && key !== lastConversation) {
+        lastConversation = key;
+        prepareSmartReply();
+      }
+    }, 2200);
+    setTimeout(prepareSmartReply, 900);
+  }
+
   const payment = window.__PRINTFLOW_PAYMENT_REQUEST__;
   if (payment && payment.status === 'armed' && !document.getElementById('printflow-payment-reminder')) {
     const panel = document.createElement('div');
