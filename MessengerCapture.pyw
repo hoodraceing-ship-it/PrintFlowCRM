@@ -549,24 +549,54 @@ INJECT = r'''
       node.dataset.printflowTranslatedText = original;
     };
 
-    const translateVisibleBubbles = async root => {
-      const composer = findComposer();
-      if (!composer) return;
-      const cr = composer.getBoundingClientRect();
-      const incoming = messageCandidates(root).filter(node => {
-        const r = node.getBoundingClientRect();
-        return r.left + r.width / 2 < cr.left + cr.width * 0.5;
-      });
-      const node = incoming.length ? incoming[incoming.length - 1] : null;
-      if (!node) return;
-      const original = String(node.innerText || '').replace(/\s+/g, ' ').trim();
-      if (!original || node.dataset.printflowTranslatedText === original) return;
-      node.dataset.printflowTranslatedText = original;
-      const result = await translateEnglish(original);
-      if (result.ok && result.text && result.source !== 'en') {
-        setInlineCaption(node, result.text);
+    const translationQueue = [];
+    let translationWorkerBusy = false;
+    let smartPreparing = false;
+
+    const queueConversationTranslations = (root, skipNode=null) => {
+      const now = Date.now();
+      for (const node of messageCandidates(root)) {
+        if (node === skipNode) continue;
+        const original = String(node.innerText || '').replace(/\s+/g, ' ').trim();
+        const retryAt = Number(node.dataset.printflowTranslationRetry || 0);
+        if (!original || node.dataset.printflowTranslatedText === original ||
+            node.dataset.printflowTranslationQueued === original || retryAt > now) continue;
+        node.dataset.printflowTranslationQueued = original;
+        translationQueue.push({node, original});
       }
     };
+
+    const processTranslationQueue = async () => {
+      if (translationWorkerBusy || smartPreparing || !translationQueue.length) return;
+      translationWorkerBusy = true;
+      const item = translationQueue.shift();
+      const node = item.node;
+      const original = item.original;
+      try {
+        if (!node || !node.isConnected || String(node.innerText || '').replace(/\s+/g, ' ').trim() !== original) return;
+        const result = await translateEnglish(original);
+        if (result.ok) {
+          if (result.source !== 'en' && result.text) setInlineCaption(node, result.text);
+          else node.dataset.printflowTranslatedText = original;
+          delete node.dataset.printflowTranslationRetry;
+        } else {
+          const language = detectLanguage(original);
+          const intent = detectIntent(original);
+          if (language !== 'en' && intent !== 'unknown') {
+            setInlineCaption(node, intentEnglish(intent) + ' (offline interpretation)');
+            delete node.dataset.printflowTranslatedText;
+          }
+          const cooldown = /429|cooldown|rate.limit/i.test(result.error || '') ? 95000 : 12000;
+          node.dataset.printflowTranslationRetry = String(Date.now() + cooldown);
+        }
+      } finally {
+        if (node) delete node.dataset.printflowTranslationQueued;
+        translationWorkerBusy = false;
+      }
+    };
+
+    setInterval(processTranslationQueue, 1800);
+
 
     let translationRun = 0;
     const refreshTranslations = async (snapshot, outgoingText) => {
@@ -702,8 +732,10 @@ INJECT = r'''
       setSmartStatus('Reading the buyer’s latest question…');
       if (buyerTranslation) buyerTranslation.textContent = 'Translating…';
 
+      smartPreparing = true;
       const detectedLanguage = detectLanguage(snapshot.incomingText) || 'en';
       const buyerResult = await translateEnglish(snapshot.incomingText);
+      smartPreparing = false;
       const language = (buyerResult.source || detectedLanguage || 'en').toLowerCase();
       const intent = detectIntent(snapshot.incomingText + ' ' + (buyerResult.ok ? buyerResult.text : ''));
       const listingPrice = (String(snapshot.text || '').match(/\$\s*\d+(?:\.\d{2})?/) || [])[0] || '';
@@ -721,7 +753,16 @@ INJECT = r'''
         replyBox.value = outgoingReply;
         replyBox.dataset.conversationKey = snapshot.key;
       }
-      if (snapshot.incomingNode) setInlineCaption(snapshot.incomingNode, englishMeaning);
+      if (snapshot.incomingNode) {
+        if (language !== 'en') setInlineCaption(snapshot.incomingNode, englishMeaning);
+        else snapshot.incomingNode.dataset.printflowTranslatedText = snapshot.incomingText;
+        if (!buyerResult.ok) {
+          delete snapshot.incomingNode.dataset.printflowTranslatedText;
+          const cooldown = /429|cooldown|rate.limit/i.test(buyerResult.error || '') ? 95000 : 12000;
+          snapshot.incomingNode.dataset.printflowTranslationRetry = String(Date.now() + cooldown);
+        }
+      }
+      queueConversationTranslations(snapshot.root, snapshot.incomingNode);
 
       const sentKey = localStorage.getItem('printflow-smart-last-sent') || '';
       if (sentKey === snapshot.key) {
@@ -811,7 +852,7 @@ INJECT = r'''
     };
 
     let lastConversation = '';
-    setInterval(() => {
+    const watchConversation = () => {
       if (!document.getElementById('printflow-smart-reply')) return;
       const snapshot = conversationSnapshot();
       const key = snapshot ? snapshot.key : '';
@@ -819,8 +860,10 @@ INJECT = r'''
         lastConversation = key;
         prepareSmartReply();
       }
-    }, 2200);
-    setTimeout(prepareSmartReply, 900);
+      if (snapshot) queueConversationTranslations(snapshot.root, snapshot.incomingNode);
+    };
+    setInterval(watchConversation, 650);
+    setTimeout(watchConversation, 500);
   }
 
   const payment = window.__PRINTFLOW_PAYMENT_REQUEST__;
