@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -102,6 +103,7 @@ class Bridge:
 
     _translation_cache = {}
     _translation_lock = threading.Lock()
+    _translation_blocked_until = 0.0
 
     def translate(self, text, target="en"):
         text = str(text or "").strip()
@@ -112,8 +114,15 @@ class Bridge:
         key = (text, target)
         with self._translation_lock:
             cached = self._translation_cache.get(key)
+            blocked_until = self._translation_blocked_until
         if cached:
             return cached
+        if time.time() < blocked_until:
+            wait_seconds = max(1, int(blocked_until - time.time()))
+            return {
+                "ok": False, "text": "", "source": "",
+                "error": f"Google rate-limit cooldown ({wait_seconds}s remaining)",
+            }
 
         normalized = " ".join(text.lower().replace("¿", "").replace("?", "").split())
         offline_es = {
@@ -127,6 +136,15 @@ class Bridge:
             "dónde está baño": "Where is the bathroom?",
             "donde esta bano": "Where is the bathroom?",
             "estafa es lo siento": "It is a scam, sorry.",
+            "ist das noch verfügbar": "Is this still available?",
+            "ist das noch verfugbar": "Is this still available?",
+            "noch verfügbar": "Still available?",
+            "noch verfugbar": "Still available?",
+            "est-ce toujours disponible": "Is this still available?",
+            "ainda está disponível": "Is this still available?",
+            "ainda esta disponivel": "Is this still available?",
+            "è ancora disponibile": "Is this still available?",
+            "e ancora disponibile": "Is this still available?",
         }
         if target == "en" and normalized in offline_es:
             result = {"ok": True, "text": offline_es[normalized], "source": "es", "error": ""}
@@ -161,6 +179,9 @@ class Bridge:
                 "error": "" if translated else "Google returned no translation",
             }
         except Exception as exc:
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+                with self._translation_lock:
+                    self._translation_blocked_until = time.time() + 90
             result = {
                 "ok": False, "text": "", "source": "",
                 "error": type(exc).__name__ + ": " + str(exc),
@@ -496,7 +517,7 @@ INJECT = r'''
       });
       const incomingNode = incoming.length ? incoming[incoming.length - 1] : null;
       const incomingText = incomingNode ? String(incomingNode.innerText || '').replace(/\s+/g, ' ').trim() : '';
-      return {composer, root, text, incomingText, key:location.href + '|' + (incomingText || text.slice(-500))};
+      return {composer, root, text, incomingNode, incomingText, key:location.href + '|' + (incomingText || text.slice(-500))};
     };
 
     const translateEnglish = async value => {
@@ -509,89 +530,163 @@ INJECT = r'''
       }
     };
 
+    const setInlineCaption = (node, englishText) => {
+      if (!node || !englishText) return;
+      const original = String(node.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!original || englishText.toLowerCase() === original.toLowerCase()) return;
+      let caption = node.parentElement ? node.parentElement.querySelector(':scope > .printflow-inline-translation') : null;
+      if (!caption) {
+        caption = document.createElement('div');
+        caption.className = 'printflow-inline-translation';
+        Object.assign(caption.style, {
+          margin:'3px 6px 5px', padding:'3px 7px', maxWidth:'420px',
+          borderRadius:'6px', background:'rgba(30,58,138,.35)',
+          color:'#bfdbfe', font:'11px Segoe UI,Arial,sans-serif', lineHeight:'1.3'
+        });
+        node.insertAdjacentElement('afterend', caption);
+      }
+      caption.textContent = 'English: ' + englishText;
+      node.dataset.printflowTranslatedText = original;
+    };
+
     const translateVisibleBubbles = async root => {
-      for (const node of messageCandidates(root).slice(-12)) {
-        const original = String(node.innerText || '').replace(/\s+/g, ' ').trim();
-        if (!original || node.dataset.printflowTranslatedText === original) continue;
-        node.dataset.printflowTranslatedText = original;
-        const result = await translateEnglish(original);
-        let caption = node.parentElement ? node.parentElement.querySelector(':scope > .printflow-inline-translation') : null;
-        if (!result.ok || !result.text || result.source === 'en' || result.text.toLowerCase() === original.toLowerCase()) {
-          if (caption) caption.remove();
-          continue;
-        }
-        if (!caption) {
-          caption = document.createElement('div');
-          caption.className = 'printflow-inline-translation';
-          Object.assign(caption.style, {
-            margin:'3px 6px 5px', padding:'3px 7px', maxWidth:'420px',
-            borderRadius:'6px', background:'rgba(30,58,138,.35)',
-            color:'#bfdbfe', font:'11px Segoe UI,Arial,sans-serif', lineHeight:'1.3'
-          });
-          node.insertAdjacentElement('afterend', caption);
-        }
-        caption.textContent = 'English: ' + result.text;
+      const composer = findComposer();
+      if (!composer) return;
+      const cr = composer.getBoundingClientRect();
+      const incoming = messageCandidates(root).filter(node => {
+        const r = node.getBoundingClientRect();
+        return r.left + r.width / 2 < cr.left + cr.width * 0.5;
+      });
+      const node = incoming.length ? incoming[incoming.length - 1] : null;
+      if (!node) return;
+      const original = String(node.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!original || node.dataset.printflowTranslatedText === original) return;
+      node.dataset.printflowTranslatedText = original;
+      const result = await translateEnglish(original);
+      if (result.ok && result.text && result.source !== 'en') {
+        setInlineCaption(node, result.text);
       }
     };
 
     let translationRun = 0;
     const refreshTranslations = async (snapshot, outgoingText) => {
       const run = ++translationRun;
-      if (buyerTranslation) buyerTranslation.textContent = snapshot.incomingText ? 'Translating…' : 'No buyer message detected.';
-      if (replyTranslation) replyTranslation.textContent = outgoingText ? 'Translating…' : 'No reply prepared.';
-      const results = await Promise.all([
-        translateEnglish(snapshot.incomingText),
-        translateEnglish(outgoingText)
-      ]);
+      if (replyTranslation) replyTranslation.textContent = outgoingText ? 'Translating edited reply…' : 'No reply prepared.';
+      const result = await translateEnglish(outgoingText);
       if (run !== translationRun) return;
-      if (buyerTranslation) {
-        buyerTranslation.textContent = results[0].ok
-          ? results[0].text
-          : (snapshot.incomingText ? 'Translation failed: ' + (results[0].error || 'service unavailable') : 'No buyer message detected.');
-        buyerTranslation.title = results[0].error || '';
-      }
       if (replyTranslation) {
-        replyTranslation.textContent = results[1].ok
-          ? results[1].text
-          : (outgoingText ? 'Translation failed: ' + (results[1].error || 'service unavailable') : 'No reply prepared.');
-        replyTranslation.title = results[1].error || '';
+        replyTranslation.textContent = result.ok
+          ? result.text
+          : (outgoingText ? 'Translation failed: ' + (result.error || 'service unavailable') : 'No reply prepared.');
+        replyTranslation.title = result.error || '';
       }
-      translateVisibleBubbles(snapshot.root);
     };
 
-    const buildEnglishReply = (question, conversationText) => {
+    const detectIntent = question => {
       const value = String(question || '').toLowerCase();
-      const listingPrice = (String(conversationText || '').match(/\$\s*\d+(?:\.\d{2})?/) || [])[0] || '';
-      if (/scam|fraud/.test(value)) {
-        return "I understand. This listing is for the 3D-printed item shown, and payment can be handled through the agreed Marketplace method. Let me know if you have a question about the item.";
-      }
-      if (/where|location|located|pickup|address|bathroom/.test(value)) {
-        return "I’m located near Aiken, South Carolina. I can also ship anywhere in the U.S.";
-      }
-      if (/ship|shipping|deliver|mail|postal|zip code/.test(value)) {
-        return "Yes, I can ship anywhere in the U.S. What ZIP code should I use for the shipping quote?";
-      }
-      if (/price|cost|how much|lowest|offer/.test(value)) {
-        return listingPrice
-          ? "The listed price is " + listingPrice + ". Would you need shipping or local pickup near Aiken, SC?"
-          : "What item and quantity are you interested in? I can confirm the price and shipping.";
-      }
-      if (/\b(two|2|both|pair)\b/.test(value) || /you have posted|your listings|these two/.test(value)) {
-        return "Great! Which two items would you like, and do you need shipping or local pickup near Aiken, SC?";
-      }
-      if (/include|come with|tool|battery|charger/.test(value)) {
-        return "The sale is for the 3D-printed holder or insert shown. Tools, batteries, and chargers are not included unless the listing specifically says otherwise.";
-      }
-      if (/color|size|custom|make one|different/.test(value)) {
-        return "Yes, I can make custom sizes and colors. Tell me what you need and I’ll confirm the price.";
-      }
-      if (/available|still have|still for sale|interested|hello|hi\b/.test(value)) {
-        return "Hi! Yes, it’s still available. Would you prefer local pickup near Aiken, SC, or shipping?";
-      }
-      if (/thank|gracias|merci|obrigad|danke|grazie/.test(value)) {
-        return "You’re welcome! Let me know if you’d like local pickup or shipping.";
-      }
-      return "Thanks for reaching out. Could you tell me what you’d like to know about the item?";
+      if (/scam|fraud|estafa|betrug|arnaque|fraude|truffa/.test(value)) return 'scam';
+      if (/\b(two|2|both|pair|dos|beide|deux|dois|due)\b/.test(value) || /you have posted|your listings|these two/.test(value)) return 'multi';
+      if (/where|location|located|pickup|address|bathroom|ubicaci[oó]n|d[oó]nde|recoger|wo\b|standort|abholen|adresse|o[uù]|emplacement|retirer|localiza[cç][aã]o|retirada|dove|posizione|ritiro/.test(value)) return 'location';
+      if (/ship|shipping|deliver|mail|postal|zip code|env[ií]o|enviar|versand|liefern|lieferung|livraison|exp[eé]dier|spedizione|spedire/.test(value)) return 'shipping';
+      if (/price|cost|how much|lowest|offer|precio|cu[aá]nto|preis|kosten|combien|prix|pre[cç]o|quanto|prezzo|offerta/.test(value)) return 'price';
+      if (/include|come with|tool|battery|charger|incluye|herramienta|bater[ií]a|cargador|enthalten|werkzeug|akku|ladeger[aä]t|compris|outil|batterie|chargeur|inclui|ferramenta|carregador|incluso|utensile/.test(value)) return 'included';
+      if (/color|size|custom|make one|different|tama[nñ]o|personaliz|farbe|gr[oö][sß]e|anfertigen|couleur|taille|personnalis|cor\b|tamanho|personalizado|colore|misura/.test(value)) return 'custom';
+      if (/available|still have|still for sale|interested|hello|hi\b|disponible|verf[uü]gbar|bonjour|ol[aá]|ciao/.test(value)) return 'availability';
+      if (/thank|gracias|merci|obrigad|danke|grazie/.test(value)) return 'thanks';
+      return 'unknown';
+    };
+
+    const intentEnglish = intent => ({
+      scam:'The buyer is concerned this may be a scam.',
+      multi:'The buyer is interested in two items.',
+      location:'The buyer is asking where you are located.',
+      shipping:'The buyer is asking about shipping.',
+      price:'The buyer is asking about the price.',
+      included:'The buyer is asking what is included.',
+      custom:'The buyer is asking about a custom size or color.',
+      availability:'The buyer is asking whether the item is still available.',
+      thanks:'The buyer is thanking you.',
+      unknown:'The exact meaning could not be translated.'
+    }[intent] || 'The exact meaning could not be translated.');
+
+    const localizedReply = (intent, language, listingPrice) => {
+      const price = listingPrice || '';
+      const table = {
+        en:{
+          availability:"Hi! Yes, it’s still available. Would you prefer local pickup near Aiken, SC, or shipping?",
+          location:"I’m located near Aiken, South Carolina. I can also ship anywhere in the U.S.",
+          shipping:"Yes, I can ship anywhere in the U.S. What ZIP code should I use for the shipping quote?",
+          price:price ? "The listed price is "+price+". Would you need shipping or local pickup near Aiken, SC?" : "What item and quantity are you interested in? I can confirm the price and shipping.",
+          multi:"Great! Which two items would you like, and do you need shipping or local pickup near Aiken, SC?",
+          included:"The sale is for the 3D-printed holder or insert shown. Tools, batteries, and chargers are not included unless the listing specifically says otherwise.",
+          custom:"Yes, I can make custom sizes and colors. Tell me what you need and I’ll confirm the price.",
+          thanks:"You’re welcome! Let me know if you’d like local pickup or shipping.",
+          scam:"I understand. This listing is for the 3D-printed item shown. Let me know what questions you have about the item.",
+          unknown:"Thanks for reaching out. Could you tell me what you’d like to know about the item?"
+        },
+        es:{
+          availability:"¡Hola! Sí, todavía está disponible. ¿Prefieres recogerlo cerca de Aiken, Carolina del Sur, o necesitas envío?",
+          location:"Estoy cerca de Aiken, Carolina del Sur. También puedo enviarlo a cualquier parte de EE. UU.",
+          shipping:"Sí, puedo enviarlo a cualquier parte de EE. UU. ¿Qué código postal debo usar para calcular el envío?",
+          price:price ? "El precio publicado es "+price+". ¿Necesitas envío o recogida cerca de Aiken, Carolina del Sur?" : "¿Qué artículo y cantidad te interesan? Puedo confirmar el precio y el envío.",
+          multi:"¡Perfecto! ¿Cuáles dos artículos quieres? ¿Necesitas envío o recogida cerca de Aiken, Carolina del Sur?",
+          included:"La venta incluye solamente el soporte o inserto impreso en 3D. Las herramientas, baterías y cargadores no están incluidos.",
+          custom:"Sí, puedo hacer tamaños y colores personalizados. Dime qué necesitas y confirmaré el precio.",
+          thanks:"¡De nada! Avísame si prefieres recogida local o envío.",
+          scam:"Entiendo. Este anuncio es para el artículo impreso en 3D que se muestra. Dime qué preguntas tienes.",
+          unknown:"Gracias por escribir. ¿Qué te gustaría saber sobre el artículo?"
+        },
+        de:{
+          availability:"Hallo! Ja, der Artikel ist noch verfügbar. Möchten Sie ihn in der Nähe von Aiken, South Carolina, abholen oder benötigen Sie Versand?",
+          location:"Ich befinde mich in der Nähe von Aiken, South Carolina. Ich kann auch überall in den USA versenden.",
+          shipping:"Ja, ich kann überall in den USA versenden. Welche Postleitzahl soll ich für die Versandkosten verwenden?",
+          price:price ? "Der angegebene Preis beträgt "+price+". Benötigen Sie Versand oder Abholung in der Nähe von Aiken, SC?" : "Für welchen Artikel und welche Menge interessieren Sie sich? Ich kann Preis und Versand bestätigen.",
+          multi:"Super! Welche zwei Artikel möchten Sie? Benötigen Sie Versand oder Abholung in der Nähe von Aiken, SC?",
+          included:"Der Verkauf umfasst nur den abgebildeten 3D-gedruckten Halter oder Einsatz. Werkzeuge, Akkus und Ladegeräte sind nicht enthalten.",
+          custom:"Ja, ich kann individuelle Größen und Farben anfertigen. Sagen Sie mir, was Sie benötigen, dann bestätige ich den Preis.",
+          thanks:"Gern geschehen! Sagen Sie mir, ob Sie Abholung oder Versand wünschen.",
+          scam:"Ich verstehe. Dieses Angebot gilt für den abgebildeten 3D-gedruckten Artikel. Sagen Sie mir, welche Fragen Sie haben.",
+          unknown:"Vielen Dank für Ihre Nachricht. Was möchten Sie über den Artikel wissen?"
+        },
+        fr:{
+          availability:"Bonjour ! Oui, l’article est toujours disponible. Préférez-vous le récupérer près d’Aiken, en Caroline du Sud, ou le faire expédier ?",
+          location:"Je suis près d’Aiken, en Caroline du Sud. Je peux aussi expédier partout aux États-Unis.",
+          shipping:"Oui, je peux expédier partout aux États-Unis. Quel code postal dois-je utiliser pour calculer les frais d’envoi ?",
+          price:price ? "Le prix affiché est de "+price+". Avez-vous besoin d’une livraison ou d’un retrait près d’Aiken ?" : "Quel article et quelle quantité vous intéressent ? Je peux confirmer le prix et la livraison.",
+          multi:"Parfait ! Quels sont les deux articles que vous souhaitez ? Avez-vous besoin d’une livraison ou d’un retrait près d’Aiken ?",
+          included:"La vente comprend uniquement le support ou l’insert imprimé en 3D. Les outils, batteries et chargeurs ne sont pas inclus.",
+          custom:"Oui, je peux réaliser des tailles et couleurs personnalisées. Dites-moi ce qu’il vous faut et je confirmerai le prix.",
+          thanks:"Avec plaisir ! Dites-moi si vous préférez le retrait local ou la livraison.",
+          scam:"Je comprends. Cette annonce concerne l’article imprimé en 3D présenté. Dites-moi quelles questions vous avez.",
+          unknown:"Merci pour votre message. Que souhaitez-vous savoir sur l’article ?"
+        },
+        pt:{
+          availability:"Olá! Sim, o item ainda está disponível. Você prefere retirar perto de Aiken, Carolina do Sul, ou precisa de envio?",
+          location:"Estou perto de Aiken, Carolina do Sul. Também posso enviar para qualquer lugar dos EUA.",
+          shipping:"Sim, posso enviar para qualquer lugar dos EUA. Qual CEP devo usar para calcular o frete?",
+          price:price ? "O preço anunciado é "+price+". Você precisa de envio ou retirada perto de Aiken?" : "Qual item e quantidade você deseja? Posso confirmar o preço e o envio.",
+          multi:"Ótimo! Quais dois itens você quer? Você precisa de envio ou retirada perto de Aiken?",
+          included:"A venda inclui apenas o suporte ou encaixe impresso em 3D. Ferramentas, baterias e carregadores não estão incluídos.",
+          custom:"Sim, posso fazer tamanhos e cores personalizados. Diga o que precisa e confirmarei o preço.",
+          thanks:"De nada! Avise se prefere retirada local ou envio.",
+          scam:"Entendo. Este anúncio é para o item impresso em 3D mostrado. Diga quais dúvidas você tem.",
+          unknown:"Obrigado pela mensagem. O que você gostaria de saber sobre o item?"
+        },
+        it:{
+          availability:"Ciao! Sì, l’articolo è ancora disponibile. Preferisci il ritiro vicino ad Aiken, South Carolina, oppure la spedizione?",
+          location:"Mi trovo vicino ad Aiken, South Carolina. Posso anche spedire ovunque negli Stati Uniti.",
+          shipping:"Sì, posso spedire ovunque negli Stati Uniti. Quale CAP devo usare per calcolare la spedizione?",
+          price:price ? "Il prezzo indicato è "+price+". Ti serve la spedizione o il ritiro vicino ad Aiken?" : "Quale articolo e quantità ti interessano? Posso confermare prezzo e spedizione.",
+          multi:"Perfetto! Quali due articoli desideri? Ti serve la spedizione o il ritiro vicino ad Aiken?",
+          included:"La vendita comprende solo il supporto o inserto stampato in 3D. Utensili, batterie e caricabatterie non sono inclusi.",
+          custom:"Sì, posso realizzare misure e colori personalizzati. Dimmi cosa ti serve e confermerò il prezzo.",
+          thanks:"Prego! Fammi sapere se preferisci il ritiro locale o la spedizione.",
+          scam:"Capisco. Questo annuncio riguarda l’articolo stampato in 3D mostrato. Dimmi quali domande hai.",
+          unknown:"Grazie per il messaggio. Cosa vorresti sapere sull’articolo?"
+        }
+      };
+      const languageTable = table[language] || table.en;
+      return languageTable[intent] || languageTable.unknown;
     };
 
     const prepareSmartReply = async () => {
@@ -607,30 +702,18 @@ INJECT = r'''
       setSmartStatus('Reading the buyer’s latest question…');
       if (buyerTranslation) buyerTranslation.textContent = 'Translating…';
 
+      const detectedLanguage = detectLanguage(snapshot.incomingText) || 'en';
       const buyerResult = await translateEnglish(snapshot.incomingText);
-      const language = (buyerResult.source || detectLanguage(snapshot.incomingText) || 'en').toLowerCase();
-      const englishQuestion = buyerResult.ok ? buyerResult.text : snapshot.incomingText;
-      const englishReply = buildEnglishReply(englishQuestion, snapshot.text);
-      let outgoingReply = englishReply;
-
-      if (language !== 'en') {
-        try {
-          const translatedReply = await window.pywebview.api.translate(englishReply, language);
-          if (translatedReply && translatedReply.ok && translatedReply.text) {
-            outgoingReply = translatedReply.text;
-          } else if (replies[language]) {
-            outgoingReply = replies[language];
-          }
-        } catch (_) {
-          if (replies[language]) outgoingReply = replies[language];
-        }
-      }
+      const language = (buyerResult.source || detectedLanguage || 'en').toLowerCase();
+      const intent = detectIntent(snapshot.incomingText + ' ' + (buyerResult.ok ? buyerResult.text : ''));
+      const listingPrice = (String(snapshot.text || '').match(/\$\s*\d+(?:\.\d{2})?/) || [])[0] || '';
+      const englishMeaning = buyerResult.ok ? buyerResult.text : intentEnglish(intent);
+      const englishReply = localizedReply(intent, 'en', listingPrice);
+      const outgoingReply = localizedReply(intent, language, listingPrice);
 
       if (languageBox) languageBox.textContent = languageNames[language] || language.toUpperCase();
       if (buyerTranslation) {
-        buyerTranslation.textContent = buyerResult.ok
-          ? buyerResult.text
-          : 'Translation failed: ' + (buyerResult.error || 'service unavailable');
+        buyerTranslation.textContent = buyerResult.ok ? buyerResult.text : englishMeaning + ' (offline interpretation)';
         buyerTranslation.title = buyerResult.error || '';
       }
       if (replyTranslation) replyTranslation.textContent = englishReply;
@@ -638,11 +721,13 @@ INJECT = r'''
         replyBox.value = outgoingReply;
         replyBox.dataset.conversationKey = snapshot.key;
       }
-      translateVisibleBubbles(snapshot.root);
+      if (snapshot.incomingNode) setInlineCaption(snapshot.incomingNode, englishMeaning);
 
       const sentKey = localStorage.getItem('printflow-smart-last-sent') || '';
       if (sentKey === snapshot.key) {
         setSmartStatus('A smart reply was already sent for this visible conversation.', '#fbbf24');
+      } else if (!buyerResult.ok) {
+        setSmartStatus('Google is unavailable, so PrintFlow used offline language and intent handling.', '#fbbf24');
       } else {
         setSmartStatus('Direct reply prepared from the buyer’s latest message. Review or edit it, then send.');
       }
@@ -733,8 +818,6 @@ INJECT = r'''
       if (key && key !== lastConversation) {
         lastConversation = key;
         prepareSmartReply();
-      } else if (snapshot) {
-        translateVisibleBubbles(snapshot.root);
       }
     }, 2200);
     setTimeout(prepareSmartReply, 900);
