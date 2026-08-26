@@ -3,18 +3,10 @@ name: Publish Windows Release
 on:
   push:
     branches: [main]
+    # The manifest is committed last after every release file is ready.
+    # This prevents a release ZIP from being built from a half-updated branch.
     paths:
-      - 'PrintFlowCRM.pyw'
-      - 'MessengerCapture.pyw'
-      - 'PirateShipCapture.pyw'
-      - 'TrackingCapture.pyw'
-      - 'SetupWizard.pyw'
-      - 'hood-layerworks-label.png'
-      - 'requirements.txt'
       - 'update_manifest.json'
-      - 'Install-PrintFlowCRM.ps1'
-      - 'Install PrintFlow CRM.bat'
-      - 'Run PrintFlow CRM.bat'
       - '.github/workflows/publish-release.yml'
   workflow_dispatch:
 
@@ -40,6 +32,13 @@ jobs:
           $m = Get-Content update_manifest.json -Raw | ConvertFrom-Json
           foreach ($file in $m.app_files) {
             if (-not (Test-Path $file)) { throw "Manifest file missing: $file" }
+          }
+          $source = Get-Content PrintFlowCRM.pyw -Raw
+          if ($source -notmatch 'VERSION\s*=\s*"([^"]+)"') {
+            throw 'Could not read VERSION from PrintFlowCRM.pyw.'
+          }
+          if ([string]$Matches[1] -ne [string]$m.version) {
+            throw "Version mismatch: PrintFlowCRM.pyw is $($Matches[1]) but update_manifest.json is $($m.version)."
           }
 
       - name: Read version
