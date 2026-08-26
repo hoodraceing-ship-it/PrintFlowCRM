@@ -774,6 +774,7 @@ INJECT = r'''
     let translationWorkerBusy = false;
     let smartPreparing = false;
     let aiTranslationActive = false;
+    let aiFallbackActive = false;
     let aiRequestSerial = 0;
 
     const queueConversationTranslations = (root, skipNode=null) => {
@@ -992,6 +993,7 @@ INJECT = r'''
         if (replyTranslation) replyTranslation.textContent = 'Preparing a conversation-aware reply…';
         smartPreparing = true;
         aiTranslationActive = false;
+        aiFallbackActive = false;
         translationQueue.length = 0;
         let aiResult = null;
         try {
@@ -1010,6 +1012,7 @@ INJECT = r'''
         if (aiResult && aiResult.ok && aiResult.data) {
           const data = aiResult.data;
           aiTranslationActive = true;
+          aiFallbackActive = false;
           translationQueue.length = 0;
           if (languageBox) languageBox.textContent = data.detected_language_name || String(data.detected_language_code || '').toUpperCase() || 'Detected';
           if (buyerTranslation) {
@@ -1048,6 +1051,7 @@ INJECT = r'''
           return;
         }
         aiTranslationActive = false;
+        aiFallbackActive = true;
         setSmartStatus(
           'OpenAI unavailable: ' + ((aiResult && aiResult.error) || 'unknown error') + '. Using fallback.',
           '#fbbf24'
@@ -1193,7 +1197,10 @@ INJECT = r'''
           if (stableSnapshot && stableSnapshot.key === lastConversation) prepareSmartReply();
         }, 700);
       }
-      if (snapshot && !aiTranslationActive) queueConversationTranslations(snapshot.root, snapshot.incomingNode);
+      const consent = localStorage.getItem('printflow-openai-chat-consent-v1') || '';
+      if (snapshot && !aiTranslationActive && (consent === 'denied' || aiFallbackActive)) {
+        queueConversationTranslations(snapshot.root, snapshot.incomingNode);
+      }
     };
     setInterval(watchConversation, 650);
     setTimeout(watchConversation, 350);
