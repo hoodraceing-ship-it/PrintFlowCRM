@@ -1000,7 +1000,8 @@ INJECT = r'''
           const safeMessages = (snapshot.messages || []).map((item, index) => ({
             index, role:item.role, text:item.text
           }));
-          aiResult = await window.pywebview.api.ai_analyze(safeMessages, snapshot.text);
+          const listingContext = document.title + '\n' + String(snapshot.text || '').slice(0, 1600);
+          aiResult = await window.pywebview.api.ai_analyze(safeMessages, listingContext);
         } catch (error) {
           aiResult = {ok:false, error:String(error || 'OpenAI request failed')};
         }
