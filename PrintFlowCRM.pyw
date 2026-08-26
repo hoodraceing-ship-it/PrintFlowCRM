@@ -10388,7 +10388,7 @@ class App(tk.Tk):
 
         ai = self.card(settings_inner, 12)
         ai.pack(fill="x", pady=(0, 9))
-        ttk.Label(ai, text="OpenAI — Optional AI-ranked Model Finder", style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,8))
+        ttk.Label(ai, text="OpenAI — Model Finder and Marketplace Sales Assistant", style="CardTitle.TLabel").grid(row=0,column=0,columnspan=3,sticky="w",pady=(0,8))
         self.openai_key_var=tk.StringVar(value=unprotect_secret(self.db.get_setting("openai_api_key_enc","")))
         self.openai_model_var=tk.StringVar(value=self.db.get_setting("openai_model","gpt-5.4-mini") or "gpt-5.4-mini")
         self.openai_preset_var=tk.StringVar(value=self.db.get_setting("openai_model_preset","Free Usage Preferred") or "Free Usage Preferred")
@@ -10403,7 +10403,7 @@ class App(tk.Tk):
         ttk.Combobox(ai,textvariable=self.openai_model_var,state="normal",width=52,
                      values=["gpt-5.4-mini","gpt-5.6-luna","gpt-5.4"]).grid(row=3,column=1,sticky="ew",padx=10,pady=4)
         ai.columnconfigure(1,weight=1)
-        ttk.Label(ai,text="Free Usage Preferred uses gpt-5.4-mini, which is in the complimentary-token group shown on eligible OpenAI accounts. Lowest Paid Cost uses gpt-5.6-luna. Higher Quality uses gpt-5.4. Complimentary usage depends on your OpenAI project/account settings and does not make web-search tool calls free.",style="Card.TLabel",wraplength=780,justify="left").grid(row=4,column=0,columnspan=3,sticky="w",pady=(4,7))
+        ttk.Label(ai,text="The configured OpenAI model powers AI-ranked Model Finder and, after one-time consent in Messenger, full Marketplace chat translation and context-aware sales replies. Free Usage Preferred uses gpt-5.4-mini. Lowest Paid Cost uses gpt-5.6-luna. Higher Quality uses gpt-5.4. Usage and complimentary eligibility depend on your OpenAI project/account settings.",style="Card.TLabel",wraplength=780,justify="left").grid(row=4,column=0,columnspan=3,sticky="w",pady=(4,7))
         aib=ttk.Frame(ai,style="Card.TFrame");aib.grid(row=5,column=0,columnspan=3,sticky="w")
         ttk.Button(aib,text="Save AI Settings",style="Accent.TButton",command=self.save_ai_settings).pack(side="left",padx=(0,7))
         ttk.Button(aib,text="Test OpenAI",command=self.test_openai).pack(side="left",padx=(0,7))
