@@ -1,6 +1,7 @@
 import ctypes
 import json
 import os
+import ssl
 import sys
 import tempfile
 import threading
@@ -113,15 +114,41 @@ class Bridge:
             cached = self._translation_cache.get(key)
         if cached:
             return cached
+
+        normalized = " ".join(text.lower().replace("¿", "").replace("?", "").split())
+        offline_es = {
+            "hola": "Hello",
+            "hola sigue disponible": "Hi, is it still available?",
+            "aún está disponible": "Is it still available?",
+            "aun esta disponible": "Is it still available?",
+            "sigue disponible": "Is it still available?",
+            "cuál es la ubicación": "What is the location?",
+            "cual es la ubicacion": "What is the location?",
+            "dónde está baño": "Where is the bathroom?",
+            "donde esta bano": "Where is the bathroom?",
+            "estafa es lo siento": "It is a scam, sorry.",
+        }
+        if target == "en" and normalized in offline_es:
+            result = {"ok": True, "text": offline_es[normalized], "source": "es", "error": ""}
+            with self._translation_lock:
+                self._translation_cache[key] = result
+            return result
+
         try:
             query = urllib.parse.urlencode({
                 "client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": text
             })
             request = urllib.request.Request(
                 "https://translate.googleapis.com/translate_a/single?" + query,
-                headers={"User-Agent": "PrintFlowCRM/0.7.94"},
+                headers={"User-Agent": "Mozilla/5.0 PrintFlowCRM/0.7.95"},
             )
-            with urllib.request.urlopen(request, timeout=12) as response:
+            context = ssl.create_default_context()
+            try:
+                import certifi
+                context = ssl.create_default_context(cafile=certifi.where())
+            except Exception:
+                pass
+            with urllib.request.urlopen(request, timeout=15, context=context) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             translated = "".join(
                 str(part[0] or "") for part in (payload[0] or [])
@@ -131,10 +158,13 @@ class Bridge:
                 "ok": bool(translated),
                 "text": translated,
                 "source": str(payload[2] or "") if len(payload) > 2 else "",
-                "error": "" if translated else "No translation returned",
+                "error": "" if translated else "Google returned no translation",
             }
         except Exception as exc:
-            result = {"ok": False, "text": "", "source": "", "error": str(exc)}
+            result = {
+                "ok": False, "text": "", "source": "",
+                "error": type(exc).__name__ + ": " + str(exc),
+            }
         if result["ok"]:
             with self._translation_lock:
                 if len(self._translation_cache) >= 300:
@@ -420,7 +450,7 @@ INJECT = r'''
     const detectLanguage = text => {
       const value = String(text || '').toLowerCase();
       const scores = {
-        es:['hola','sigue disponible','todavía','precio','cuánto','cuanto','envío','envio','gracias','interesado'],
+        es:['hola','sigue disponible','aún está disponible','aun esta disponible','disponible','ubicacion','ubicación','dónde','donde','baño','bano','todavía','precio','cuánto','cuanto','envío','envio','gracias','interesado'],
         fr:['bonjour','toujours disponible','combien','prix','livraison','merci','intéressé','interesse'],
         pt:['olá','ola','ainda está disponível','ainda esta disponivel','preço','preco','envio','obrigado','interessado'],
         de:['hallo','verfügbar','verfugbar','preis','versand','danke','interessiert'],
@@ -435,17 +465,21 @@ INJECT = r'''
     };
 
     const messageCandidates = root => {
-      if (!root) return [];
-      const rootRect = root.getBoundingClientRect();
-      return [...root.querySelectorAll('[dir="auto"]')].filter(el => {
+      const composer = findComposer();
+      if (!composer) return [];
+      const composerRect = composer.getBoundingClientRect();
+      const leftBound = Math.max(0, composerRect.left - 170);
+      const rightBound = Math.min(innerWidth, composerRect.right + 30);
+      return [...document.querySelectorAll('[dir="auto"]')].filter(el => {
         const r = visibleRect(el);
         if (!r || el.closest('#printflow-smart-reply') || el.closest('.printflow-inline-translation')) return false;
         if (el.isContentEditable || el.closest('[contenteditable="true"]')) return false;
+        if (r.bottom >= composerRect.top + 8 || r.right < leftBound || r.left > rightBound) return false;
         const value = String(el.innerText || '').replace(/\s+/g, ' ').trim();
         if (!value || value.length > 600 || /^\d{1,2}:\d{2}/.test(value)) return false;
         if (/^(send|like|more|search|message sent)$/i.test(value)) return false;
         if ([...el.querySelectorAll('[dir="auto"]')].some(child => String(child.innerText || '').trim())) return false;
-        return r.left >= rootRect.left && r.right <= rootRect.right + 5;
+        return true;
       }).sort((a,b) => a.getBoundingClientRect().bottom - b.getBoundingClientRect().bottom);
     };
 
@@ -454,11 +488,11 @@ INJECT = r'''
       const root = findConversationRoot(composer);
       if (!composer || !root) return null;
       const text = cleanConversationText(root.innerText || '');
-      const rootRect = root.getBoundingClientRect();
+      const composerRect = composer.getBoundingClientRect();
       const candidates = messageCandidates(root);
       const incoming = candidates.filter(el => {
         const r = el.getBoundingClientRect();
-        return r.left + r.width / 2 < rootRect.left + rootRect.width * 0.53;
+        return r.left + r.width / 2 < composerRect.left + composerRect.width * 0.5;
       });
       const incomingNode = incoming.length ? incoming[incoming.length - 1] : null;
       const incomingText = incomingNode ? String(incomingNode.innerText || '').replace(/\s+/g, ' ').trim() : '';
@@ -510,33 +544,104 @@ INJECT = r'''
         translateEnglish(outgoingText)
       ]);
       if (run !== translationRun) return;
-      if (buyerTranslation) buyerTranslation.textContent = results[0].ok
-        ? results[0].text
-        : (snapshot.incomingText ? 'Translation unavailable — original remains visible.' : 'No buyer message detected.');
-      if (replyTranslation) replyTranslation.textContent = results[1].ok
-        ? results[1].text
-        : (outgoingText ? 'Translation unavailable — review the original before sending.' : 'No reply prepared.');
+      if (buyerTranslation) {
+        buyerTranslation.textContent = results[0].ok
+          ? results[0].text
+          : (snapshot.incomingText ? 'Translation failed: ' + (results[0].error || 'service unavailable') : 'No buyer message detected.');
+        buyerTranslation.title = results[0].error || '';
+      }
+      if (replyTranslation) {
+        replyTranslation.textContent = results[1].ok
+          ? results[1].text
+          : (outgoingText ? 'Translation failed: ' + (results[1].error || 'service unavailable') : 'No reply prepared.');
+        replyTranslation.title = results[1].error || '';
+      }
       translateVisibleBubbles(snapshot.root);
     };
 
-    const prepareSmartReply = () => {
+    const buildEnglishReply = (question, conversationText) => {
+      const value = String(question || '').toLowerCase();
+      const listingPrice = (String(conversationText || '').match(/\$\s*\d+(?:\.\d{2})?/) || [])[0] || '';
+      if (/scam|fraud/.test(value)) {
+        return "I understand. This listing is for the 3D-printed item shown, and payment can be handled through the agreed Marketplace method. Let me know if you have a question about the item.";
+      }
+      if (/where|location|located|pickup|address|bathroom/.test(value)) {
+        return "I’m located near Aiken, South Carolina. I can also ship anywhere in the U.S.";
+      }
+      if (/ship|shipping|deliver|mail|postal|zip code/.test(value)) {
+        return "Yes, I can ship anywhere in the U.S. What ZIP code should I use for the shipping quote?";
+      }
+      if (/price|cost|how much|lowest|offer/.test(value)) {
+        return listingPrice
+          ? "The listed price is " + listingPrice + ". Would you need shipping or local pickup near Aiken, SC?"
+          : "What item and quantity are you interested in? I can confirm the price and shipping.";
+      }
+      if (/include|come with|tool|battery|charger/.test(value)) {
+        return "The sale is for the 3D-printed holder or insert shown. Tools, batteries, and chargers are not included unless the listing specifically says otherwise.";
+      }
+      if (/color|size|custom|make one|different/.test(value)) {
+        return "Yes, I can make custom sizes and colors. Tell me what you need and I’ll confirm the price.";
+      }
+      if (/available|still have|still for sale|interested|hello|hi\b/.test(value)) {
+        return "Hi! Yes, it’s still available. Would you prefer local pickup near Aiken, SC, or shipping?";
+      }
+      if (/thank|gracias|merci|obrigad|danke|grazie/.test(value)) {
+        return "You’re welcome! Let me know if you’d like local pickup or shipping.";
+      }
+      return "Thanks for reaching out. Could you tell me what you’d like to know about the item?";
+    };
+
+    const prepareSmartReply = async () => {
       const snapshot = conversationSnapshot();
       if (!snapshot || !snapshot.text) {
         setSmartStatus('Open a buyer conversation so PrintFlow can prepare a reply.', '#fbbf24');
         return;
       }
-      const language = detectLanguage(snapshot.incomingText || snapshot.text);
-      if (languageBox) languageBox.textContent = languageNames[language] || 'English';
+      if (!snapshot.incomingText) {
+        setSmartStatus('I can see the chat, but not the newest buyer bubble. Try Refresh.', '#fbbf24');
+        return;
+      }
+      setSmartStatus('Reading the buyer’s latest question…');
+      if (buyerTranslation) buyerTranslation.textContent = 'Translating…';
+
+      const buyerResult = await translateEnglish(snapshot.incomingText);
+      const language = (buyerResult.source || detectLanguage(snapshot.incomingText) || 'en').toLowerCase();
+      const englishQuestion = buyerResult.ok ? buyerResult.text : snapshot.incomingText;
+      const englishReply = buildEnglishReply(englishQuestion, snapshot.text);
+      let outgoingReply = englishReply;
+
+      if (language !== 'en') {
+        try {
+          const translatedReply = await window.pywebview.api.translate(englishReply, language);
+          if (translatedReply && translatedReply.ok && translatedReply.text) {
+            outgoingReply = translatedReply.text;
+          } else if (replies[language]) {
+            outgoingReply = replies[language];
+          }
+        } catch (_) {
+          if (replies[language]) outgoingReply = replies[language];
+        }
+      }
+
+      if (languageBox) languageBox.textContent = languageNames[language] || language.toUpperCase();
+      if (buyerTranslation) {
+        buyerTranslation.textContent = buyerResult.ok
+          ? buyerResult.text
+          : 'Translation failed: ' + (buyerResult.error || 'service unavailable');
+        buyerTranslation.title = buyerResult.error || '';
+      }
+      if (replyTranslation) replyTranslation.textContent = englishReply;
       if (replyBox) {
-        replyBox.value = replies[language] || replies.en;
+        replyBox.value = outgoingReply;
         replyBox.dataset.conversationKey = snapshot.key;
       }
-      refreshTranslations(snapshot, replyBox ? replyBox.value : '');
+      translateVisibleBubbles(snapshot.root);
+
       const sentKey = localStorage.getItem('printflow-smart-last-sent') || '';
       if (sentKey === snapshot.key) {
         setSmartStatus('A smart reply was already sent for this visible conversation.', '#fbbf24');
       } else {
-        setSmartStatus('Reply prepared automatically. Review or edit it, then send.');
+        setSmartStatus('Direct reply prepared from the buyer’s latest message. Review or edit it, then send.');
       }
     };
 
