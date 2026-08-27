@@ -1,5 +1,6 @@
 import base64
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -72,6 +73,8 @@ def enforce_single_instance():
 
 
 class Bridge:
+    AI_CACHE_VERSION = "marketplace-v2"
+
     def capture(self, text, url="", title=""):
         text = (text or "").strip()
         if not text:
@@ -172,14 +175,108 @@ class Bridge:
                     pieces.append(part["text"])
         return "\n".join(pieces).strip()
 
-    def ai_analyze(self, messages, listing_context=""):
-        api_key, model = self._openai_config()
-        if not api_key:
-            return {
-                "ok": False,
-                "error": "No OpenAI API key is configured in PrintFlow Settings.",
-            }
+    @staticmethod
+    def _ai_cache_key(model, conversation_id, cleaned):
+        payload = {
+            "version": Bridge.AI_CACHE_VERSION,
+            "model": str(model or ""),
+            "conversation_id": str(conversation_id or ""),
+            "messages": cleaned,
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
+    @staticmethod
+    def _read_ai_cache(cache_key):
+        db_path = data_dir() / "printflow.db"
+        if not db_path.exists():
+            return None
+        try:
+            with sqlite3.connect(db_path, timeout=10) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messenger_ai_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        result_json TEXT NOT NULL,
+                        model TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        last_used_at TEXT NOT NULL
+                    )
+                    """
+                )
+                row = conn.execute(
+                    "SELECT result_json FROM messenger_ai_cache WHERE cache_key=?",
+                    (cache_key,),
+                ).fetchone()
+                if not row:
+                    return None
+                conn.execute(
+                    "UPDATE messenger_ai_cache SET last_used_at=? WHERE cache_key=?",
+                    (datetime.now().isoformat(timespec="seconds"), cache_key),
+                )
+            parsed = json.loads(row[0])
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _write_ai_cache(cache_key, model, result):
+        db_path = data_dir() / "printflow.db"
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            with sqlite3.connect(db_path, timeout=10) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messenger_ai_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        result_json TEXT NOT NULL,
+                        model TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        last_used_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO messenger_ai_cache
+                        (cache_key, result_json, model, created_at, last_used_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        result_json=excluded.result_json,
+                        model=excluded.model,
+                        created_at=excluded.created_at,
+                        last_used_at=excluded.last_used_at
+                    """,
+                    (
+                        cache_key,
+                        json.dumps(result, ensure_ascii=False),
+                        str(model or ""),
+                        now,
+                        now,
+                    ),
+                )
+                # Keep plenty of history while preventing an unbounded database.
+                conn.execute(
+                    """
+                    DELETE FROM messenger_ai_cache
+                    WHERE cache_key IN (
+                        SELECT cache_key FROM messenger_ai_cache
+                        ORDER BY last_used_at DESC
+                        LIMIT -1 OFFSET 1000
+                    )
+                    """
+                )
+        except Exception:
+            # Caching is a cost optimization. A cache write failure must not stop
+            # the user from translating or replying.
+            pass
+
+    def ai_analyze(
+        self, messages, listing_context="", conversation_id="", force_refresh=False
+    ):
+        api_key, model = self._openai_config()
         cleaned = []
         total_chars = 0
         for index, item in enumerate(messages or []):
@@ -196,6 +293,23 @@ class Bridge:
             total_chars += len(text)
         if not cleaned:
             return {"ok": False, "error": "No Marketplace messages were detected."}
+
+        cache_key = self._ai_cache_key(model, conversation_id, cleaned)
+        if not bool(force_refresh):
+            cached = self._read_ai_cache(cache_key)
+            if cached:
+                return {
+                    "ok": True,
+                    "data": cached,
+                    "model": model,
+                    "cached": True,
+                }
+
+        if not api_key:
+            return {
+                "ok": False,
+                "error": "No OpenAI API key is configured in PrintFlow Settings.",
+            }
 
         schema = {
             "type": "object",
@@ -274,7 +388,7 @@ Listing and visible chat context:
                 "Authorization": "Bearer " + api_key,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "PrintFlowCRM-Messenger/0.7.101",
+                "User-Agent": "PrintFlowCRM-Messenger/0.7.102",
             },
             method="POST",
         )
@@ -289,7 +403,13 @@ Listing and visible chat context:
                 data = json.loads(response.read().decode("utf-8"))
             output = self._openai_output_text(data)
             parsed = json.loads(output)
-            return {"ok": True, "data": parsed, "model": model}
+            self._write_ai_cache(cache_key, model, parsed)
+            return {
+                "ok": True,
+                "data": parsed,
+                "model": model,
+                "cached": False,
+            }
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             try:
@@ -963,7 +1083,7 @@ INJECT = r'''
       return languageTable[intent] || languageTable.unknown;
     };
 
-    const prepareSmartReply = async () => {
+    const prepareSmartReply = async (forceRefresh = false) => {
       const snapshot = conversationSnapshot();
       if (!snapshot || !snapshot.text) {
         setSmartStatus('Open a buyer conversation so PrintFlow can prepare a reply.', '#fbbf24');
@@ -1001,7 +1121,9 @@ INJECT = r'''
             index, role:item.role, text:item.text
           }));
           const listingContext = document.title + '\n' + String(snapshot.text || '').slice(0, 1600);
-          aiResult = await window.pywebview.api.ai_analyze(safeMessages, listingContext);
+          aiResult = await window.pywebview.api.ai_analyze(
+            safeMessages, listingContext, location.href, Boolean(forceRefresh)
+          );
         } catch (error) {
           aiResult = {ok:false, error:String(error || 'OpenAI request failed')};
         }
@@ -1046,8 +1168,10 @@ INJECT = r'''
           const sentKey = localStorage.getItem('printflow-smart-last-sent') || '';
           if (sentKey === snapshot.key) {
             setSmartStatus('A reply was already sent for this visible conversation.', '#fbbf24');
+          } else if (aiResult.cached) {
+            setSmartStatus('Loaded saved translation and reply — no OpenAI charge.', '#86efac');
           } else {
-            setSmartStatus('Full chat translated and a conversation-aware reply prepared with OpenAI.', '#86efac');
+            setSmartStatus('Full chat translated and saved locally for free reuse.', '#86efac');
           }
           return;
         }
@@ -1125,7 +1249,7 @@ INJECT = r'''
     };
 
     document.getElementById('printflow-smart-close').onclick = () => smartPanel.remove();
-    document.getElementById('printflow-smart-refresh').onclick = prepareSmartReply;
+    document.getElementById('printflow-smart-refresh').onclick = () => prepareSmartReply(true);
     let replyTranslateTimer = 0;
     replyBox.addEventListener('input', () => {
       clearTimeout(replyTranslateTimer);

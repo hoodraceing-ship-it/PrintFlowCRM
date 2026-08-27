@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.102
+
+- Saves successful Marketplace full-chat translations and smart replies in the local PrintFlow database.
+- Reuses an exact saved conversation result after reopening or switching back to a chat, with no new OpenAI API call or charge.
+- Calls OpenAI automatically only when the thread's loaded message history changes, such as when a new message arrives.
+- Makes Refresh Reply an intentional fresh-generation action and replaces the saved result for that exact conversation state.
+- Shows whether the result was loaded from the free local cache or newly translated and saved.
+- Limits the cache to the 1,000 most recently used conversation states to prevent unbounded database growth.
+
 ## 0.7.101
 
 - Replaced the normal keyword/phrase translation path with OpenAI full-conversation translation.
