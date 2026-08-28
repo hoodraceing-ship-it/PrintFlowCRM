@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.103
+
+- Adds Import Folder to the Model Library for recursively importing an entire local model folder as one stockable item.
+- Copies source models, nested subfolders, images, documents, and other regular supporting files into PrintFlow's managed Model Library.
+- Indexes supported STL, 3MF, STEP, STP, OBJ, AMF, SCAD, and F3D files while continuing to exclude sliced G-code.
+- Hash-verifies every copied file before reporting a successful import.
+- Adds an optional Delete the original folder after verified import setting, with a second unchanged-folder check immediately before deletion.
+- Keeps the original folder when it contains sliced G-code, links, unreadable files, changes during import, or cannot be deleted safely.
+- Preserves nested imported-file paths when Model Library items or groups are renamed or moved.
+- Uses the first imported image as the product preview when available.
+
 ## 0.7.102
 
 - Saves successful Marketplace full-chat translations and smart replies in the local PrintFlow database.

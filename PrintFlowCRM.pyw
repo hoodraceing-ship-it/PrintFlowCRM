@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "PrintFlow CRM"
-VERSION = "0.7.102"
+VERSION = "0.7.103"
 MARKETPLACE_MESSENGER_URL = "https://www.messenger.com/marketplace/"
 PRINTFLOW_REPO_URL = "https://github.com/hoodraceing-ship-it/PrintFlowCRM"
 BUILD_PLATE_TYPES = (
@@ -111,6 +111,14 @@ def model_folder_name(value):
     clean=re.sub(r"[^A-Za-z0-9._ -]+"," ",str(value or "")).strip()
     clean=re.sub(r"\s+"," ",clean).rstrip(". ")
     return (clean[:90] or "Unsorted Model")
+
+
+def relocated_model_file_path(stored_path, old_folder, new_folder):
+    """Keep imported subfolders intact when a Model Library item is moved."""
+    stored=Path(stored_path)
+    try:relative=stored.relative_to(Path(old_folder))
+    except (TypeError,ValueError):relative=Path(stored.name)
+    return Path(new_folder)/relative
 
 
 def app_data_dir() -> Path:
@@ -438,7 +446,7 @@ class Database:
             if new_folder!=old_folder:
                 for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
                     c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",
-                              (str(new_folder/Path(file_row["stored_path"]).name),int(file_row["id"])))
+                              (str(relocated_model_file_path(file_row["stored_path"],old_folder,new_folder)),int(file_row["id"])))
                 image_path=new_folder/"preview.png"
                 c.execute("UPDATE model_library SET image_path=? WHERE id=?",
                           (str(image_path) if image_path.exists() else "",model_id))
@@ -693,7 +701,7 @@ class Database:
                 if new_folder!=old_folder:
                     for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(int(model["id"]),)).fetchall():
                         c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",
-                                  (str(new_folder/Path(file_row["stored_path"]).name),int(file_row["id"])))
+                                  (str(relocated_model_file_path(file_row["stored_path"],old_folder,new_folder)),int(file_row["id"])))
                     image_path=new_folder/"preview.png"
                     c.execute("UPDATE model_library SET image_path=? WHERE id=?",
                               (str(image_path) if image_path.exists() else "",int(model["id"])))
@@ -3762,6 +3770,8 @@ class App(tk.Tk):
         quick_actions=ttk.Frame(quick,style="Card.TFrame");quick_actions.grid(row=0,column=3,sticky="e",pady=(0,7))
         ttk.Button(quick_actions,text="Paste Copied Item",command=self._paste_library_product_copy).pack(side="right")
         ttk.Button(quick_actions,text="+ Add My Files",style="Accent.TButton",command=self._add_my_model_files).pack(side="right",padx=(0,7))
+        self.library_folder_btn=ttk.Button(quick_actions,text="Import Folder",style="Accent.TButton",command=self._import_model_folder)
+        self.library_folder_btn.pack(side="right",padx=(0,7))
         self.library_url_var=tk.StringVar()
         self.library_product_var=tk.StringVar()
         ttk.Label(quick,text="Model page link",style="Card.TLabel").grid(row=1,column=0,sticky="w")
@@ -3825,6 +3835,168 @@ class App(tk.Tk):
             elif choice:self._show_model_library_group_detail(self.library_group_map.get(choice[0],""))
         self.library_tree.bind("<<TreeviewSelect>>",selected)
         refill();url_entry.focus_set()
+
+    @staticmethod
+    def _scan_model_import_folder(source_root):
+        copy_files=[];excluded=[]
+        try:candidates=list(source_root.rglob("*"))
+        except Exception as exc:return [],[(source_root,f"Folder could not be scanned: {exc}")]
+        for path in candidates:
+            try:
+                relative=path.relative_to(source_root)
+                if path.is_symlink():
+                    excluded.append((relative,"link"));continue
+                if not path.is_file():continue
+                lower=path.name.lower()
+                if lower.endswith((".gcode",".bgcode")) or lower.endswith(".gcode.3mf") or ".gcode." in lower:
+                    excluded.append((relative,"sliced G-code"));continue
+                stat=path.stat()
+                copy_files.append((path,relative,int(stat.st_size),int(stat.st_mtime_ns)))
+            except Exception as exc:
+                try:relative=path.relative_to(source_root)
+                except Exception:relative=Path(path.name)
+                excluded.append((relative,str(exc)))
+        copy_files.sort(key=lambda item:str(item[1]).lower())
+        excluded.sort(key=lambda item:str(item[0]).lower())
+        return copy_files,excluded
+
+    @staticmethod
+    def _verified_file_digest(path):
+        digest=hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda:handle.read(1024*1024),b""):digest.update(chunk)
+        return digest.hexdigest()
+
+    def _import_model_folder(self):
+        selected=filedialog.askdirectory(parent=self,title="Choose a model folder to import",mustexist=True)
+        if not selected:return
+        try:source_root=Path(selected).resolve(strict=True)
+        except Exception as exc:
+            messagebox.showerror("Import Folder",f"PrintFlow could not open that folder.\n\n{exc}",parent=self);return
+        try:
+            managed=MODEL_LIBRARY_DIR.resolve()
+            if source_root==managed or source_root.is_relative_to(managed) or managed.is_relative_to(source_root):
+                messagebox.showwarning("Import Folder","Choose a folder outside PrintFlow's managed Model Library.",parent=self);return
+        except Exception:pass
+        copy_files,excluded=self._scan_model_import_folder(source_root)
+        model_files=[item for item in copy_files if self._model_source_allowed(item[1].name)]
+        if not model_files:
+            messagebox.showwarning("Import Folder","That folder does not contain any supported STL, 3MF, STEP, STP, OBJ, AMF, SCAD, or F3D source files.",parent=self);return
+
+        result={}
+        suggested=clean_model_item_name(re.sub(r"[_-]+"," ",source_root.name))
+        win=tk.Toplevel(self);win.title("Import Model Folder");win.transient(self);win.grab_set();win.resizable(False,False)
+        body=ttk.Frame(win,padding=16);body.pack(fill="both",expand=True)
+        ttk.Label(body,text=f"Import {source_root.name}",style="CardTitle.TLabel").grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,4))
+        ttk.Label(body,text=f"{len(model_files)} source model(s) • {len(copy_files)} total file(s) will be copied",style="Sub.TLabel").grid(row=1,column=0,columnspan=2,sticky="w",pady=(0,12))
+        ttk.Label(body,text="Inventory item name").grid(row=2,column=0,sticky="w",pady=5)
+        name_var=tk.StringVar(value=suggested);name_entry=ttk.Entry(body,textvariable=name_var,width=54)
+        name_entry.grid(row=2,column=1,sticky="ew",padx=(12,0),pady=5)
+        ttk.Label(body,text="Product group").grid(row=3,column=0,sticky="w",pady=5)
+        group_var=tk.StringVar(value=self._resolved_library_category(detect_model_category(suggested)))
+        ttk.Combobox(body,textvariable=group_var,values=self._library_group_choices(),width=51).grid(row=3,column=1,sticky="ew",padx=(12,0),pady=5)
+        ttk.Label(body,text="Tool / model number").grid(row=4,column=0,sticky="w",pady=5)
+        number_var=tk.StringVar(value=detect_model_number(suggested))
+        ttk.Entry(body,textvariable=number_var,width=54).grid(row=4,column=1,sticky="ew",padx=(12,0),pady=5)
+        delete_var=tk.BooleanVar(value=False)
+        delete_box=ttk.Checkbutton(body,text="Delete the original folder only after every copied file is verified",variable=delete_var)
+        delete_box.grid(row=5,column=0,columnspan=2,sticky="w",pady=(12,2))
+        if excluded:
+            delete_var.set(False);delete_box.configure(state="disabled")
+            reason=f"Original-folder deletion is disabled because {len(excluded)} sliced G-code, link, or unreadable file(s) cannot be safely imported."
+        else:
+            reason="The original remains untouched unless you check the option above. Supporting images, documents, and other regular files are preserved with the models."
+        ttk.Label(body,text=reason,style="Sub.TLabel",wraplength=570,justify="left").grid(row=6,column=0,columnspan=2,sticky="w",pady=(4,4))
+        buttons=ttk.Frame(body);buttons.grid(row=7,column=0,columnspan=2,sticky="e",pady=(12,0))
+        def accept():
+            product=clean_model_item_name(name_var.get());category=clean_model_item_name(group_var.get())
+            if not product or not category:
+                messagebox.showwarning("Import Folder","Enter an inventory item name and product group.",parent=win);return
+            result.update(product=product,category=category,model_number=(number_var.get() or "").strip()[:40],delete_original=bool(delete_var.get()));win.destroy()
+        ttk.Button(buttons,text="Cancel",command=win.destroy).pack(side="right")
+        ttk.Button(buttons,text="Import Folder",style="Accent.TButton",command=accept).pack(side="right",padx=(0,8))
+        name_entry.select_range(0,"end");name_entry.focus_set();win.bind("<Return>",lambda _e:accept());win.bind("<Escape>",lambda _e:win.destroy());win.wait_window()
+        if not result:return
+
+        self.library_folder_btn.configure(state="disabled")
+        self.library_status.configure(text=f"Copying and verifying {source_root.name}…")
+        def work():
+            outcome=None;error=None
+            try:outcome=self._copy_model_folder_into_library(source_root,result)
+            except Exception as exc:error=str(exc)
+            self.after(0,lambda:self._finish_model_folder_import(outcome,error))
+        threading.Thread(target=work,daemon=True,name="PrintFlowModelFolderImport").start()
+
+    def _copy_model_folder_into_library(self,source_root,options):
+        copy_files,excluded=self._scan_model_import_folder(source_root)
+        model_files=[item for item in copy_files if self._model_source_allowed(item[1].name)]
+        if not model_files:raise RuntimeError("No supported source models remained in the selected folder.")
+        delete_requested=bool(options.get("delete_original"))
+        category_dir=MODEL_LIBRARY_DIR/model_folder_name(options["category"]);category_dir.mkdir(parents=True,exist_ok=True)
+        destination=category_dir/model_folder_name(options["product"])
+        if destination.exists():destination=destination.with_name(destination.name+"-"+uuid.uuid4().hex[:6])
+        staging=destination.with_name(destination.name+".importing-"+uuid.uuid4().hex[:6])
+        imported_root=staging/"Imported Folder";imported_root.mkdir(parents=True,exist_ok=False)
+        indexed=[];copied=0
+        try:
+            for source,relative,initial_size,initial_mtime in copy_files:
+                before=source.stat()
+                if int(before.st_size)!=initial_size or int(before.st_mtime_ns)!=initial_mtime:
+                    raise RuntimeError(f"{relative} changed while the folder was being imported. Nothing was deleted; run Import Folder again.")
+                target=imported_root/relative;target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(source,target)
+                source_digest=self._verified_file_digest(source);target_digest=self._verified_file_digest(target)
+                if source_digest!=target_digest:raise RuntimeError(f"Verification failed for {relative}. The original folder was not deleted.")
+                copied+=1
+                if self._model_source_allowed(relative.name):indexed.append((relative,source_digest))
+            preview_source=next((imported_root/relative for _source,relative,_size,_mtime in copy_files if relative.suffix.lower() in (".png",".jpg",".jpeg",".gif",".bmp",".webp")),None)
+            if preview_source and preview_source.is_file():
+                try:
+                    from PIL import Image
+                    with Image.open(preview_source) as image:image.convert("RGB").save(staging/"preview.png","PNG")
+                except Exception:pass
+            staging.rename(destination)
+        except Exception:
+            shutil.rmtree(staging,ignore_errors=True);raise
+
+        now=datetime.now().isoformat(timespec="seconds");model_id=None
+        try:
+            with self.db.connect() as c:
+                cur=c.execute("""INSERT INTO model_library(product_name,name_manual,category,category_manual,source_key,model_number,title,source_url,image_url,image_path,folder_path,created_at,updated_at)
+                                 VALUES(?,1,?,1,?,?,?,?,?,?,?,?,?)""",
+                              (options["product"],options["category"],f"folder:{uuid.uuid4().hex}",options.get("model_number","")[:40],options["product"],"","",str(destination/"preview.png") if (destination/"preview.png").is_file() else "",str(destination),now,now))
+                model_id=int(cur.lastrowid)
+                for relative,digest in indexed:
+                    stored=destination/"Imported Folder"/relative
+                    c.execute("INSERT INTO model_library_files(model_id,stored_path,original_name,source_url,sha256,added_at) VALUES(?,?,?,?,?,?)",
+                              (model_id,str(stored),str(relative),"",digest,now))
+        except Exception:
+            shutil.rmtree(destination,ignore_errors=True);raise
+
+        deleted=False;delete_warning=""
+        if delete_requested:
+            current_files,current_excluded=self._scan_model_import_folder(source_root)
+            initial_signature=[(str(rel),size,mtime) for _path,rel,size,mtime in copy_files]
+            current_signature=[(str(rel),size,mtime) for _path,rel,size,mtime in current_files]
+            if excluded or current_excluded or current_signature!=initial_signature:
+                delete_warning="The original folder changed or contains excluded files, so PrintFlow kept it in place."
+            else:
+                try:shutil.rmtree(source_root);deleted=not source_root.exists()
+                except Exception as exc:delete_warning=f"The import is safe, but Windows could not delete the original folder: {exc}"
+        return {"model_id":model_id,"copied":copied,"indexed":len(indexed),"deleted":deleted,"delete_warning":delete_warning,"source":str(source_root)}
+
+    def _finish_model_folder_import(self,outcome,error):
+        try:self.library_folder_btn.configure(state="normal")
+        except Exception:pass
+        if error:
+            self.library_status.configure(text="Folder import failed — the original folder was not deleted.")
+            self._log_app_event("Error","Model Library","Folder import failed",error)
+            messagebox.showerror("Import Folder",f"PrintFlow could not import that folder. The original was not deleted.\n\n{error}",parent=self);return
+        note=f"Imported and verified {outcome['copied']} file(s) • {outcome['indexed']} source model(s) indexed"
+        if outcome.get("deleted"):note+=" • original folder deleted"
+        elif outcome.get("delete_warning"):
+            messagebox.showwarning("Import Folder",outcome["delete_warning"]+f"\n\nOriginal location:\n{outcome['source']}",parent=self)
+        self.status_flash(note);self.show_model_library(outcome["model_id"])
 
     def _add_my_model_files(self):
         selected=filedialog.askopenfilenames(
@@ -4260,7 +4432,7 @@ class App(tk.Tk):
                 if new_folder!=old_folder:
                     for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
                         c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",
-                                  (str(new_folder/Path(file_row["stored_path"]).name),int(file_row["id"])))
+                                  (str(relocated_model_file_path(file_row["stored_path"],old_folder,new_folder)),int(file_row["id"])))
                     image_path=new_folder/"preview.png"
                     c.execute("UPDATE model_library SET image_path=? WHERE id=?",
                               (str(image_path) if image_path.exists() else "",model_id))
@@ -4848,7 +5020,7 @@ class App(tk.Tk):
                       (value,model_number,str(new_folder),datetime.now().isoformat(timespec="seconds"),model_id))
             if new_folder!=old_folder:
                 for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
-                    c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",(str(new_folder/Path(file_row["stored_path"]).name),file_row["id"]))
+                    c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",(str(relocated_model_file_path(file_row["stored_path"],old_folder,new_folder)),file_row["id"]))
                 image_path=new_folder/"preview.png"
                 c.execute("UPDATE model_library SET image_path=? WHERE id=?",(str(image_path) if image_path.exists() else "",model_id))
         self.show_model_library(model_id)
@@ -4868,7 +5040,7 @@ class App(tk.Tk):
                       (category,str(new_folder),datetime.now().isoformat(timespec="seconds"),model_id))
             if new_folder!=old_folder:
                 for file_row in c.execute("SELECT id,stored_path FROM model_library_files WHERE model_id=?",(model_id,)).fetchall():
-                    c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",(str(new_folder/Path(file_row["stored_path"]).name),file_row["id"]))
+                    c.execute("UPDATE model_library_files SET stored_path=? WHERE id=?",(str(relocated_model_file_path(file_row["stored_path"],old_folder,new_folder)),file_row["id"]))
                 image_path=new_folder/"preview.png"
                 c.execute("UPDATE model_library SET image_path=? WHERE id=?",(str(image_path) if image_path.exists() else "",model_id))
         self.status_flash(f"Moved item to {category}");self.show_model_library(model_id)
